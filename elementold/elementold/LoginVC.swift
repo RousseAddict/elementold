@@ -1,0 +1,206 @@
+import UIKit
+
+// Login screen: homeserver URL (configurable, not hardcoded) + username/password,
+// via UIAlertView/plain UIViewController forms per the iOS6/7 cheatsheet
+// (no UIAlertController). Adapted from jellyold's ServerSetupVC.swift.
+class LoginVC: UIViewController {
+
+    private var serverField: UITextField!
+    private var usernameField: UITextField!
+    private var passwordField: UITextField!
+    private var connectButton: UIButton!
+    private var spinner: UIActivityIndicatorView!
+    private var topOffset: CGFloat = 0
+    private var didBuildUI = false
+
+    private let bgColor = UIColor(red: 0.10, green: 0.10, blue: 0.14, alpha: 1.0)
+    private let accentColor = UIColor(red: 0.13, green: 0.55, blue: 0.60, alpha: 1.0)
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "elementold"
+        view.backgroundColor = bgColor
+        registerKeyboardObservers()
+#if IOS6_TARGET
+        buildUI()
+#endif
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+#if !IOS6_TARGET
+        topOffset = navigationController?.navigationBar.frame.maxY ?? 64
+#endif
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+#if !IOS6_TARGET
+        guard !didBuildUI, topOffset > 0 else { return }
+        didBuildUI = true
+        buildUI()
+#endif
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    private func buildUI() {
+        let w = view.bounds.width
+        let top = topOffset
+
+        let logoSize: CGFloat = 110
+        let logoView = UIImageView(frame: CGRect(x: (w - logoSize) / 2, y: top + 20,
+                                                  width: logoSize, height: logoSize))
+        logoView.image = UIImage(named: "Logo@2x")
+        logoView.contentMode = .scaleAspectFit
+        logoView.backgroundColor = .clear
+        view.addSubview(logoView)
+
+        serverField = makeField("Homeserver URL  (e.g. http://matrix.example.org:8008)",
+                                y: top + 150, secure: false)
+        serverField.keyboardType = .URL
+        serverField.text = MatrixSession.homeserverURL
+        view.addSubview(serverField)
+
+        usernameField = makeField("Username", y: top + 208, secure: false)
+        view.addSubview(usernameField)
+
+        passwordField = makeField("Password", y: top + 266, secure: true)
+        view.addSubview(passwordField)
+
+        connectButton = UIButton(type: .custom)
+        connectButton.frame = CGRect(x: 20, y: top + 330, width: w - 40, height: 46)
+        connectButton.setTitle("Log In", for: .normal)
+        connectButton.setTitleColor(.white, for: .normal)
+        connectButton.setTitleColor(UIColor(white: 1.0, alpha: 0.5), for: .disabled)
+        connectButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 17)
+        connectButton.backgroundColor = accentColor
+        connectButton.layer.cornerRadius = 10
+        connectButton.addTarget(self, action: #selector(connectTapped), for: .touchUpInside)
+        view.addSubview(connectButton)
+
+        let visibleMidY = top + (view.bounds.height - top) / 2
+        spinner = UIActivityIndicatorView(style: .whiteLarge)
+        spinner.center = CGPoint(x: w / 2, y: visibleMidY)
+        spinner.hidesWhenStopped = true
+        view.addSubview(spinner)
+    }
+
+    private func makeField(_ placeholder: String, y: CGFloat, secure: Bool) -> UITextField {
+        let f = UITextField(frame: CGRect(x: 20, y: y, width: view.bounds.width - 40, height: 46))
+        f.backgroundColor = UIColor(white: 1.0, alpha: 0.08)
+        f.textColor = .white
+        f.contentVerticalAlignment = .center
+        f.layer.cornerRadius = 10
+        f.layer.borderColor = UIColor(white: 1.0, alpha: 0.15).cgColor
+        f.layer.borderWidth = 1
+        f.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 46))
+        f.leftViewMode = .always
+        f.isSecureTextEntry = secure
+        f.autocapitalizationType = .none
+        f.autocorrectionType = .no
+        f.keyboardAppearance = .dark
+        f.returnKeyType = .done
+        f.delegate = self
+        f.attributedPlaceholder = NSAttributedString(
+            string: placeholder,
+            attributes: [NSAttributedString.Key.foregroundColor: UIColor(white: 0.5, alpha: 1.0)]
+        )
+        return f
+    }
+
+    // MARK: - Keyboard avoidance
+
+    private func registerKeyboardObservers() {
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillShow(_:)),
+            name: UIResponder.keyboardWillShowNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide(_:)),
+            name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    @objc private func keyboardWillShow(_ notification: Notification) {
+        guard connectButton != nil else { return }
+        guard let keyboardFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+        let screenHeight = UIScreen.main.bounds.height
+        let visibleBottom = screenHeight - keyboardFrame.height
+        let contentBottom = connectButton.frame.maxY + 16
+        let needed = contentBottom - visibleBottom
+        guard needed > 0 else { return }
+        guard view.frame.origin.y == 0 else { return }
+        UIView.animate(withDuration: duration) { self.view.frame.origin.y = -needed }
+    }
+
+    @objc private func keyboardWillHide(_ notification: Notification) {
+        let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+        UIView.animate(withDuration: duration) { self.view.frame.origin.y = 0 }
+    }
+
+    // MARK: - Actions
+
+    @objc private func connectTapped() {
+        view.endEditing(true)
+        guard let raw = serverField.text, !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+            showAlert("Please enter the homeserver URL."); return
+        }
+        guard let user = usernameField.text, !user.trimmingCharacters(in: .whitespaces).isEmpty else {
+            showAlert("Please enter your username."); return
+        }
+        let pass = passwordField.text ?? ""
+        let homeserverURL = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
+
+        setLoading(true)
+        let client = MatrixAPIClient(homeserverBaseURL: homeserverURL)
+        let body: [String: Any] = [
+            "type": "m.login.password",
+            "identifier": ["type": "m.id.user", "user": user],
+            "password": pass,
+            "initial_device_display_name": "elementold"
+        ]
+        client.post("/_matrix/client/v3/login", body: body) { json, error in
+            self.setLoading(false)
+            if let error = error {
+                self.showAlert("\(error)")
+                return
+            }
+            guard let json = json,
+                  let accessToken = json["access_token"] as? String,
+                  let userId = json["user_id"] as? String else {
+                self.showAlert("Unexpected response from server.")
+                return
+            }
+            MatrixSession.homeserverURL = homeserverURL
+            MatrixSession.accessToken = accessToken
+            MatrixSession.deviceId = json["device_id"] as? String
+            MatrixSession.userId = userId
+            self.navigationController?.setViewControllers([RoomListVC()], animated: true)
+        }
+    }
+
+    private func setLoading(_ loading: Bool) {
+        connectButton.isEnabled = !loading
+        connectButton.alpha = loading ? 0.5 : 1.0
+        loading ? spinner.startAnimating() : spinner.stopAnimating()
+    }
+
+    private func showAlert(_ message: String) {
+#if IOS6_TARGET
+        let alert = UIAlertView()
+        alert.title = "elementold"
+        alert.message = message
+        alert.addButton(withTitle: "OK")
+        alert.show()
+#else
+        let alert = UIAlertController(title: "elementold", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+#endif
+    }
+}
+
+extension LoginVC: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        textField.resignFirstResponder()
+        return true
+    }
+}
