@@ -1120,39 +1120,18 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
-    // Persistent breadcrumb for diagnosing the voice-record freeze: the record
-    // path hangs somewhere on this legacy runtime, and an in-memory diagnostic
-    // wouldn't survive the force-quit a freeze forces. Each step is written to
-    // UserDefaults synchronously (UserDefaults writes are proven safe here — see
-    // CrashLogger) so the trail is readable in Settings → Diagnostics after
-    // reproducing. Whichever step is LAST identifies the exact hanging call.
-    private func voiceTrace(_ step: String) {
-        let key = "elementold.voiceTrace"
-        let d = UserDefaults.standard
-        var lines = d.stringArray(forKey: key) ?? []
-        lines.append(step)
-        if lines.count > 30 { lines.removeFirst(lines.count - 30) }
-        d.set(lines, forKey: key)
-        d.synchronize()
-        MediaCache.record("voice: \(step)")
-    }
-
     private func startRecording() {
-        voiceTrace("=== record tapped ===")
         // `requestRecordPermission:` is an iOS 7+ selector — guarded by
         // responds(to:) so it's never sent on iOS 6 (which has no microphone
         // permission system and needs none; we just begin directly there).
         let session = AVAudioSession.sharedInstance()
-        voiceTrace("got sharedInstance")
         let permSel = NSSelectorFromString("requestRecordPermission:")
         if session.responds(to: permSel) {
-            voiceTrace("responds YES -> requestRecordPermission")
             session.requestRecordPermission { [weak self] granted in
                 // The callback may arrive off the main thread — hop back before
                 // touching AVAudioRecorder / UIKit.
                 DispatchQueue.main.async {
                     guard let self = self else { return }
-                    self.voiceTrace("perm callback granted=\(granted)")
                     if granted {
                         self.beginRecording()
                     } else {
@@ -1162,22 +1141,16 @@ class RoomTimelineVC: UIViewController {
                 }
             }
         } else {
-            voiceTrace("responds NO -> beginRecording (iOS6)")
             beginRecording()
         }
     }
 
     private func beginRecording() {
-        voiceTrace("beginRecording enter")
         let session = AVAudioSession.sharedInstance()
         do {
-            voiceTrace("setCategory(playAndRecord)...")
             try session.setCategory(.playAndRecord)
-            voiceTrace("setCategory ok; setActive(true)...")
             try session.setActive(true)
-            voiceTrace("setActive ok")
         } catch {
-            voiceTrace("session error: \(error)")
             showSendError(MatrixAPIClient.MatrixError(errcode: "M_UNKNOWN",
                                                       error: "Could not start audio session"))
             return
@@ -1186,31 +1159,23 @@ class RoomTimelineVC: UIViewController {
         // mic-usage key on iOS 6-9 (that requirement is iOS 10+). Int64 for the
         // epoch-ms filename (32-bit Int would trap on armv7).
         let name = "elementold-voice-\(Int64(Date().timeIntervalSince1970 * 1000)).m4a"
-        voiceTrace("name ok")
         // Build the path with the pure ObjC NSString method, NOT
         // URL(fileURLWithPath:).appendingPathComponent(_:): the URL variant does a
-        // filesystem stat to decide the trailing slash, which wedges on the swapped
-        // 5.1.5 runtime (same hanging-URL-API class as Data.write(to:)). NSString's
-        // appendingPathComponent is a plain string op — no stat, safe.
+        // filesystem stat to decide the trailing slash, which wedges (hangs) on the
+        // swapped 5.1.5 runtime (same hanging-URL-API class as Data.write(to:)).
+        // NSString's appendingPathComponent is a plain string op — no stat, safe.
         let dir = NSTemporaryDirectory() as NSString
-        let fullPath = dir.appendingPathComponent(name)
-        voiceTrace("path ok")
-        let url = URL(fileURLWithPath: fullPath)
-        voiceTrace("url ok")
+        let url = URL(fileURLWithPath: dir.appendingPathComponent(name))
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 22050.0,
             AVNumberOfChannelsKey: 1,
             AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
         ]
-        voiceTrace("settings ok")
         do {
-            voiceTrace("AVAudioRecorder(url:settings:)...")
             let recorder = try AVAudioRecorder(url: url, settings: settings)
-            voiceTrace("recorder init ok; record()...")
             recorder.delegate = self
             recorder.record()
-            voiceTrace("record() returned")
             audioRecorder = recorder
             voiceRecordingURL = url
             voiceIsRecording = true
@@ -1219,9 +1184,7 @@ class RoomTimelineVC: UIViewController {
                                                     selector: #selector(voiceRecordTick),
                                                     userInfo: nil, repeats: true)
             updateVoiceRecordButton()
-            voiceTrace("RECORDING (timer scheduled)")
         } catch {
-            voiceTrace("recorder error: \(error)")
             showSendError(MatrixAPIClient.MatrixError(errcode: "M_UNKNOWN",
                                                       error: "Could not start recording"))
         }
@@ -2023,7 +1986,7 @@ private class AudioEventCell: UITableViewCell {
         bubble.layer.masksToBounds = true
         contentView.addSubview(bubble)
 
-        playButton.titleLabel?.font = UIFont.systemFont(ofSize: 22)
+        playButton.imageView?.contentMode = .scaleAspectFit
         playButton.addTarget(self, action: #selector(playTapped), for: .touchUpInside)
         bubble.addSubview(playButton)
 
@@ -2059,7 +2022,6 @@ private class AudioEventCell: UITableViewCell {
         bubble.backgroundColor = isOwn ? UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
                                         : UIColor(white: 0.85, alpha: 1.0)
         let fg: UIColor = isOwn ? .white : .black
-        playButton.setTitleColor(fg, for: .normal)
         durationLabel.textColor = fg
 
         let showAvatar = !isOwn && hasMeta
@@ -2073,7 +2035,10 @@ private class AudioEventCell: UITableViewCell {
     // Updates the play/pause glyph + the time label. Called by the VC on tap,
     // on the 0.2s progress tick, and when the player finishes.
     func setPlaybackState(playing: Bool, currentTime: TimeInterval, duration: TimeInterval) {
-        playButton.setTitle(playing ? "\u{2759}\u{2759}" : "\u{25B6}", for: .normal)
+        let iconName: String
+        if playing { iconName = isOwnMessage ? "PauseWhite" : "PauseDark" }
+        else { iconName = isOwnMessage ? "PlayWhite" : "PlayDark" }
+        playButton.setImage(UIImage(named: iconName), for: .normal)
         let total = duration > 0 ? duration : declaredDuration
         if playing {
             durationLabel.text = "\(AudioEventCell.fmt(currentTime)) / \(AudioEventCell.fmt(total))"

@@ -230,9 +230,10 @@ class MediaCache {
         ioQueue.async { [weak self] in
             guard let self = self else { return }
             if FileManager.default.fileExists(atPath: diskPath) {
+                let playable = self.playablePath(diskPath, server: server, mediaId: mediaId)
                 DispatchQueue.main.async {
                     MediaCache.record("audio disk hit \(tag)")
-                    completion(diskPath)
+                    completion(playable)
                 }
                 return
             }
@@ -255,9 +256,10 @@ class MediaCache {
                         // the 5.1.5 runtime (see image write sites).
                         (data as NSData).write(toFile: diskPath, atomically: true)
                         self.scheduleTrim()
+                        let playable = self.playablePath(diskPath, server: server, mediaId: mediaId)
                         DispatchQueue.main.async {
                             MediaCache.record("audio ok (\(data.count)B) \(tag)")
-                            completion(diskPath)
+                            completion(playable)
                         }
                     }
                 }
@@ -278,6 +280,29 @@ class MediaCache {
             (data as NSData).write(toFile: diskPath, atomically: true)
             self.scheduleTrim()
         }
+    }
+
+    // iOS 6's AVAudioPlayer can't decode Opus, and voice notes bridged from
+    // WhatsApp (via mautrix-whatsapp) are Ogg/Opus. If the cached file is an Ogg
+    // stream (magic "OggS"), transcode it ONCE to a sibling PCM WAV (via the
+    // vendored libopus/libogg C bridge) and return the WAV path; the decoded WAV
+    // is cached on disk so the decode only happens on first play. Anything that
+    // isn't Ogg (our own AAC .m4a recordings, MP3, etc.) is returned unchanged.
+    // Runs on the caller's ioQueue — a few-second voice note decodes in well
+    // under the queue-starvation danger zone, and voice taps are one-at-a-time.
+    private func playablePath(_ rawPath: String, server: String, mediaId: String) -> String {
+        let wavPath = (dir as NSString).appendingPathComponent(sanitize("\(server)_\(mediaId)_audio") + ".wav")
+        if FileManager.default.fileExists(atPath: wavPath) { return wavPath }
+        guard let data = FileManager.default.contents(atPath: rawPath), data.count >= 4 else { return rawPath }
+        let isOgg = data[0] == 0x4F && data[1] == 0x67 && data[2] == 0x67 && data[3] == 0x53
+        guard isOgg else { return rawPath }
+        let rc = opus_ogg_to_wav(rawPath, wavPath)
+        if rc == 0 {
+            MediaCache.record("opus->wav ok \(mediaId)")
+            return wavPath
+        }
+        MediaCache.record("opus->wav fail (\(rc)) \(mediaId)")
+        return rawPath
     }
 
     // MARK: - Priming (used by the sender so its own image renders immediately)

@@ -182,23 +182,10 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
-        guard section == 2 else { return nil }
-        var parts: [String] = []
-        // Voice-record breadcrumb trail (diagnosing the record freeze): persisted
-        // to UserDefaults each step so it survives the force-quit a freeze forces.
-        // The LAST line identifies the exact hanging AVFoundation call.
-        if let trace = UserDefaults.standard.stringArray(forKey: "elementold.voiceTrace"), !trace.isEmpty {
-            parts.append("Voice trace:\n" + trace.joined(separator: "\n"))
-        }
         // Surfaces the last recorded crash (if any) here rather than as a
         // launch-time popup — inspectable on demand without interrupting startup.
-        if crashExpanded, let crash = CrashLogger.lastCrash {
-            parts.append("Last crash:\n\(crash)")
-        }
-        if let media = MediaCache.lastDiagnostic {
-            parts.append("Media:\n\(media)")
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: "\n\n———\n\n")
+        guard section == 2, crashExpanded, let crash = CrashLogger.lastCrash else { return nil }
+        return "Last crash:\n\(crash)"
     }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {

@@ -19,11 +19,24 @@
 		BB200035 /* UserCircle@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200034 /* UserCircle@3x.png */; };
 		BB200033 /* UserCircle@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200032 /* UserCircle@2x.png */; };
 		BB200031 /* UserCircle.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200030 /* UserCircle.png */; };
+		BB310101 /* PlayWhite.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310001 /* PlayWhite.png */; };
+		BB310102 /* PlayWhite@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310002 /* PlayWhite@2x.png */; };
+		BB310103 /* PlayWhite@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310003 /* PlayWhite@3x.png */; };
+		BB310104 /* PlayDark.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310004 /* PlayDark.png */; };
+		BB310105 /* PlayDark@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310005 /* PlayDark@2x.png */; };
+		BB310106 /* PlayDark@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310006 /* PlayDark@3x.png */; };
+		BB310107 /* PauseWhite.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310007 /* PauseWhite.png */; };
+		BB310108 /* PauseWhite@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310008 /* PauseWhite@2x.png */; };
+		BB310109 /* PauseWhite@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310009 /* PauseWhite@3x.png */; };
+		BB310110 /* PauseDark.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310010 /* PauseDark.png */; };
+		BB310111 /* PauseDark@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310011 /* PauseDark@2x.png */; };
+		BB310112 /* PauseDark@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310012 /* PauseDark@3x.png */; };
 		BB200041 /* Users@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200040 /* Users@3x.png */; };
 		BB200043 /* Users@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200042 /* Users@2x.png */; };
 		BB200045 /* Users.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200044 /* Users.png */; };
 		BB200047 /* cacert.pem in Resources */ = {isa = PBXBuildFile; fileRef = BB200046 /* cacert.pem */; };
 		BB160002 /* curl_bridge.c in Sources */ = {isa = PBXBuildFile; fileRef = BB160001 /* curl_bridge.c */; };
+		BB300002 /* opus_bridge.c in Sources */ = {isa = PBXBuildFile; fileRef = BB300001 /* opus_bridge.c */; };
 		BB160004 /* CurlFetcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB160003 /* CurlFetcher.swift */; };
 		BB160006 /* atomic_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = BB160005 /* atomic_stubs.c */; settings = {COMPILER_FLAGS = "-fno-builtin"; }; };
 		BB160008 /* atomic_stubs.S in Sources */ = {isa = PBXBuildFile; fileRef = BB160007 /* atomic_stubs.S */; };
@@ -76,11 +89,24 @@
 		BB200034 /* UserCircle@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "UserCircle@3x.png"; sourceTree = "<group>"; };
 		BB200032 /* UserCircle@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "UserCircle@2x.png"; sourceTree = "<group>"; };
 		BB200030 /* UserCircle.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "UserCircle.png"; sourceTree = "<group>"; };
+		BB310001 /* PlayWhite.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayWhite.png"; sourceTree = "<group>"; };
+		BB310002 /* PlayWhite@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayWhite@2x.png"; sourceTree = "<group>"; };
+		BB310003 /* PlayWhite@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayWhite@3x.png"; sourceTree = "<group>"; };
+		BB310004 /* PlayDark.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayDark.png"; sourceTree = "<group>"; };
+		BB310005 /* PlayDark@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayDark@2x.png"; sourceTree = "<group>"; };
+		BB310006 /* PlayDark@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayDark@3x.png"; sourceTree = "<group>"; };
+		BB310007 /* PauseWhite.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PauseWhite.png"; sourceTree = "<group>"; };
+		BB310008 /* PauseWhite@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PauseWhite@2x.png"; sourceTree = "<group>"; };
+		BB310009 /* PauseWhite@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PauseWhite@3x.png"; sourceTree = "<group>"; };
+		BB310010 /* PauseDark.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PauseDark.png"; sourceTree = "<group>"; };
+		BB310011 /* PauseDark@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PauseDark@2x.png"; sourceTree = "<group>"; };
+		BB310012 /* PauseDark@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PauseDark@3x.png"; sourceTree = "<group>"; };
 		BB200040 /* Users@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Users@3x.png"; sourceTree = "<group>"; };
 		BB200042 /* Users@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Users@2x.png"; sourceTree = "<group>"; };
 		BB200044 /* Users.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Users.png"; sourceTree = "<group>"; };
 		BB200046 /* cacert.pem */ = {isa = PBXFileReference; lastKnownFileType = text; path = cacert.pem; sourceTree = "<group>"; };
 		BB160001 /* curl_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = curl_bridge.c; sourceTree = "<group>"; };
+		BB300001 /* opus_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = opus_bridge.c; sourceTree = "<group>"; };
 		BB160003 /* CurlFetcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CurlFetcher.swift; sourceTree = "<group>"; };
 		BB160005 /* atomic_stubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = atomic_stubs.c; sourceTree = "<group>"; };
 		BB160007 /* atomic_stubs.S */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.asm; path = atomic_stubs.S; sourceTree = "<group>"; };
@@ -169,11 +195,24 @@
 				BB160005 /* atomic_stubs.c */,
 				BB160003 /* CurlFetcher.swift */,
 				BB160001 /* curl_bridge.c */,
+				BB300001 /* opus_bridge.c */,
 				A34363002FD764270064ADE1 /* Default-568h@2x.png */,
 				BB150001 /* Logo@2x.png */,
 				BB200034 /* UserCircle@3x.png */,
 				BB200032 /* UserCircle@2x.png */,
 				BB200030 /* UserCircle.png */,
+				BB310001 /* PlayWhite.png */,
+				BB310002 /* PlayWhite@2x.png */,
+				BB310003 /* PlayWhite@3x.png */,
+				BB310004 /* PlayDark.png */,
+				BB310005 /* PlayDark@2x.png */,
+				BB310006 /* PlayDark@3x.png */,
+				BB310007 /* PauseWhite.png */,
+				BB310008 /* PauseWhite@2x.png */,
+				BB310009 /* PauseWhite@3x.png */,
+				BB310010 /* PauseDark.png */,
+				BB310011 /* PauseDark@2x.png */,
+				BB310012 /* PauseDark@3x.png */,
 				BB200040 /* Users@3x.png */,
 				BB200042 /* Users@2x.png */,
 				BB200044 /* Users.png */,
@@ -310,6 +349,18 @@
 				BB200035 /* UserCircle@3x.png in Resources */,
 				BB200033 /* UserCircle@2x.png in Resources */,
 				BB200031 /* UserCircle.png in Resources */,
+				BB310101 /* PlayWhite.png in Resources */,
+				BB310102 /* PlayWhite@2x.png in Resources */,
+				BB310103 /* PlayWhite@3x.png in Resources */,
+				BB310104 /* PlayDark.png in Resources */,
+				BB310105 /* PlayDark@2x.png in Resources */,
+				BB310106 /* PlayDark@3x.png in Resources */,
+				BB310107 /* PauseWhite.png in Resources */,
+				BB310108 /* PauseWhite@2x.png in Resources */,
+				BB310109 /* PauseWhite@3x.png in Resources */,
+				BB310110 /* PauseDark.png in Resources */,
+				BB310111 /* PauseDark@2x.png in Resources */,
+				BB310112 /* PauseDark@3x.png in Resources */,
 				BB200041 /* Users@3x.png in Resources */,
 				BB200043 /* Users@2x.png in Resources */,
 				BB200045 /* Users.png in Resources */,
@@ -344,6 +395,7 @@
 				BB160006 /* atomic_stubs.c in Sources */,
 				BB160004 /* CurlFetcher.swift in Sources */,
 				BB160002 /* curl_bridge.c in Sources */,
+				BB300002 /* opus_bridge.c in Sources */,
 				A34362FF2FD764260064ADE1 /* AppDelegate.swift in Sources */,
 				BB200002 /* MatrixAPIClient.swift in Sources */,
 				BB200004 /* SyncEngine.swift in Sources */,
@@ -526,9 +578,15 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/ThirdParty/curl/include";
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/ThirdParty/curl/lib";
-				OTHER_LDFLAGS = "-lcurl -lssl -lcrypto -lz";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/ThirdParty/curl/include",
+					"$(SRCROOT)/ThirdParty/opus/include",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/ThirdParty/curl/lib",
+					"$(SRCROOT)/ThirdParty/opus/lib",
+				);
+				OTHER_LDFLAGS = "-lcurl -lssl -lcrypto -lz -lopus -logg";
 				SWIFT_OBJC_BRIDGING_HEADER = "elementold/elementold-Bridging-Header.h";
 				PRODUCT_BUNDLE_IDENTIFIER = rousseaddict.elementold;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -553,9 +611,15 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/ThirdParty/curl/include";
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/ThirdParty/curl/lib";
-				OTHER_LDFLAGS = "-lcurl -lssl -lcrypto -lz";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/ThirdParty/curl/include",
+					"$(SRCROOT)/ThirdParty/opus/include",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/ThirdParty/curl/lib",
+					"$(SRCROOT)/ThirdParty/opus/lib",
+				);
+				OTHER_LDFLAGS = "-lcurl -lssl -lcrypto -lz -lopus -logg";
 				SWIFT_OBJC_BRIDGING_HEADER = "elementold/elementold-Bridging-Header.h";
 				PRODUCT_BUNDLE_IDENTIFIER = rousseaddict.elementold;
 				PRODUCT_NAME = "$(TARGET_NAME)";
