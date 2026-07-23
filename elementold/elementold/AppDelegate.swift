@@ -11,6 +11,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // on demand, in Settings → Diagnostics instead (CrashLogger.lastCrash).
         CrashLogger.install()
 
+        // No-op on the iOS 6/7 build and when the notifications kill switch is
+        // off; only registers UILocalNotification settings on the iOS 8+ target.
+        NotificationManager.shared.registerSettingsIfNeeded()
+
         // Light status bar text throughout the app
         UIApplication.shared.statusBarStyle = .lightContent
         // White navigation bar title

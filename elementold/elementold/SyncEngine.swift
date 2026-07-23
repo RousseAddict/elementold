@@ -102,7 +102,11 @@ class SyncEngine {
     }
 
     @objc private func appDidEnterBackground() {
-        stop()
+        // Keep the long-poll running in the background ONLY when background
+        // notifications are switched on; the NotificationManager holds a
+        // UIBackgroundTask + VoIP keep-alive to keep the process alive to
+        // service it. When the switch is OFF this stops exactly as before.
+        if !NotificationManager.isEnabled { stop() }
     }
 
     func start() {

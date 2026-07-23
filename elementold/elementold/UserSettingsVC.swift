@@ -53,10 +53,13 @@ class UserSettingsVC: UIViewController {
 
     private func reloadCacheRow() {
         guard isViewLoaded else { return }
-        // Storage is section 1 (section 0 is Account/display name). Reloading
-        // (0,0) here was the bug that left "Cache used" stuck showing "…": the
-        // usage loaded fine but the wrong row was refreshed.
-        tableView.reloadRows(at: [IndexPath(row: 0, section: 1)], with: .none)
+        // Storage is section 2 (0 = Account, 1 = Notifications). Reloading the
+        // wrong row here previously left "Cache used" stuck showing "…".
+        tableView.reloadRows(at: [IndexPath(row: 0, section: 2)], with: .none)
+    }
+
+    @objc private func notificationsToggled(_ sw: UISwitch) {
+        NotificationManager.shared.setEnabled(sw.isOn)
     }
 
     // Bytes -> "1.2 MB" / "834 KB". Hand-rolled (no ByteCountFormatter, whose
@@ -170,28 +173,35 @@ class UserSettingsVC: UIViewController {
 }
 
 extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
-    // Section 0 = Account (display name), 1 = Storage (cache), 2 = Diagnostics.
-    func numberOfSections(in tableView: UITableView) -> Int { return 3 }
+    // 0 = Account (display name), 1 = Notifications (kill switch), 2 = Storage
+    // (cache), 3 = Diagnostics.
+    func numberOfSections(in tableView: UITableView) -> Int { return 4 }
 
     func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
         switch section {
         case 0: return "Account"
-        case 1: return "Storage"
+        case 1: return "Notifications"
+        case 2: return "Storage"
         default: return "Diagnostics"
         }
     }
 
     func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+        if section == 1 {
+            return "Keeps syncing in the background to alert you of new messages. "
+                 + "Off by default; turning it off stops all background activity."
+        }
         // Surfaces the last recorded crash (if any) here rather than as a
         // launch-time popup — inspectable on demand without interrupting startup.
-        guard section == 2, crashExpanded, let crash = CrashLogger.lastCrash else { return nil }
+        guard section == 3, crashExpanded, let crash = CrashLogger.lastCrash else { return nil }
         return "Last crash:\n\(crash)"
     }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch section {
         case 0: return 1                     // display name
-        case 1: return 2                     // cache usage + reset
+        case 1: return 1                     // notifications toggle
+        case 2: return 2                     // cache usage + reset
         default:
             // Diagnostics: crash-log toggle row (+ a copy row when expanded),
             // only when a crash was actually recorded.
@@ -216,8 +226,23 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             return cell
         }
 
-        // Section 1: Storage.
+        // Section 1: Notifications — the master kill switch (UISwitch, iOS 5+).
         if indexPath.section == 1 {
+            let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "SW") ??
+                UITableViewCell(style: .default, reuseIdentifier: cellId + "SW")
+            cell.textLabel?.text = "Background notifications"
+            cell.textLabel?.textColor = .black
+            cell.textLabel?.textAlignment = .left
+            cell.selectionStyle = .none
+            let sw = UISwitch()
+            sw.isOn = NotificationManager.isEnabled
+            sw.addTarget(self, action: #selector(notificationsToggled(_:)), for: .valueChanged)
+            cell.accessoryView = sw
+            return cell
+        }
+
+        // Section 2: Storage.
+        if indexPath.section == 2 {
             if indexPath.row == 0 {
                 let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
                     UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
@@ -241,7 +266,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             return cell
         }
 
-        // Section 2: Diagnostics — crash-log toggle + copy.
+        // Section 3: Diagnostics — crash-log toggle + copy.
         if indexPath.row == 0 {
             let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
                 UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
@@ -269,11 +294,13 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         case 0:
             promptEditDisplayName()
         case 1:
+            break                                   // toggle handled by the switch
+        case 2:
             if indexPath.row == 1 { confirmClearCache() }
         default:
             if indexPath.row == 0 {
                 crashExpanded.toggle()
-                tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+                tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
             } else {
                 copyCrashLog()
             }

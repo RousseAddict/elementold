@@ -46,6 +46,7 @@
 		BB20000A /* LoginVC.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB200009 /* LoginVC.swift */; };
 		BB20000C /* Room.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB20000B /* Room.swift */; };
 		BB20000E /* RoomEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB20000D /* RoomEvent.swift */; };
+		BB200037 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB200036 /* NotificationManager.swift */; };
 		BB200029 /* UserSettingsVC.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB200028 /* UserSettingsVC.swift */; };
 		BB200027 /* ImageViewerVC.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB200026 /* ImageViewerVC.swift */; };
 		BB200025 /* MediaCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB200024 /* MediaCache.swift */; };
@@ -116,6 +117,7 @@
 		BB200009 /* LoginVC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoginVC.swift; sourceTree = "<group>"; };
 		BB20000B /* Room.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Room.swift; sourceTree = "<group>"; };
 		BB20000D /* RoomEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoomEvent.swift; sourceTree = "<group>"; };
+		BB200036 /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
 		BB200028 /* UserSettingsVC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserSettingsVC.swift; sourceTree = "<group>"; };
 		BB200026 /* ImageViewerVC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageViewerVC.swift; sourceTree = "<group>"; };
 		BB200024 /* MediaCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaCache.swift; sourceTree = "<group>"; };
@@ -182,6 +184,7 @@
 				BB200009 /* LoginVC.swift */,
 				BB20000B /* Room.swift */,
 				BB20000D /* RoomEvent.swift */,
+				BB200036 /* NotificationManager.swift */,
 				BB200028 /* UserSettingsVC.swift */,
 				BB200026 /* ImageViewerVC.swift */,
 				BB200024 /* MediaCache.swift */,
@@ -403,6 +406,7 @@
 				BB20000A /* LoginVC.swift in Sources */,
 				BB20000C /* Room.swift in Sources */,
 				BB20000E /* RoomEvent.swift in Sources */,
+				BB200037 /* NotificationManager.swift in Sources */,
 				BB200029 /* UserSettingsVC.swift in Sources */,
 				BB200027 /* ImageViewerVC.swift in Sources */,
 				BB200025 /* MediaCache.swift in Sources */,

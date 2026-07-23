@@ -101,6 +101,14 @@ class RoomListVC: UIViewController {
         syncEngine.addErrorListener { [weak self] error in
             self?.handleSyncError(error)
         }
+
+        // Background notifications (gated by the Settings kill switch; off by
+        // default → this listener is a no-op and no background work is taken).
+        NotificationManager.shared.syncEngine = syncEngine
+        syncEngine.addUpdateListener { json, isInitial in
+            NotificationManager.shared.handleSync(json, isInitial: isInitial)
+        }
+
         syncEngine.start()
 
         // Diagnostic: if this ticker itself stalls, the main thread is deadlocked
