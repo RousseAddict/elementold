@@ -40,6 +40,26 @@ struct Room {
     // /sync to reflect it.
     var unreadCount: Int = 0
 
+    // Room type from m.room.create `content.type` (e.g. "m.space"). nil for an
+    // ordinary room. Spaces are grouping containers with no timeline — they
+    // should be hidden from the room list and used as filter buckets instead.
+    // Set once from state on join; carried across incremental syncs (which omit
+    // state) via `existing`.
+    var roomType: String?
+    // For a space room (roomType == "m.space"): the set of child room IDs it
+    // groups, from `m.space.child` state events (state_key = child room id). Per
+    // spec a child link is "present" only while its content is non-empty, so an
+    // `m.space.child` with empty content removes the child. Merged across syncs.
+    var spaceChildren: Set<String> = []
+    // Bridge info (uk.half-shot.bridge / MSC2346): the bridged network's label +
+    // icon when this room is a bridge portal, used to group/label rooms by their
+    // origin network (Discord/WhatsApp/…). nil for a native Matrix room.
+    var bridgeNetwork: String?      // protocol.displayname ?? protocol.id
+    var bridgeAvatarMxc: String?    // protocol.avatar_url (mxc://)
+
+    // Convenience: this room is a Matrix space (grouping container, no timeline).
+    var isSpace: Bool { return roomType == "m.space" }
+
     private static let maxBufferedEvents = 50
 
     static func parse(roomId: String, json: [String: Any], existing: Room?, selfUserId: String?,
@@ -53,6 +73,10 @@ struct Room {
         var avatarMxc = existing?.avatarMxc
         var memberNames = existing?.memberNames ?? [:]
         var memberAvatars = existing?.memberAvatars ?? [:]
+        var roomType = existing?.roomType
+        var spaceChildren = existing?.spaceChildren ?? []
+        var bridgeNetwork = existing?.bridgeNetwork
+        var bridgeAvatarMxc = existing?.bridgeAvatarMxc
         var explicitAvatarFound = existing?.avatarMxc != nil
         var fallbackMemberName: String?
         var fallbackMemberAvatar: String?
@@ -67,6 +91,25 @@ struct Room {
             } else if type == "m.room.avatar", let url = content["url"] as? String, url.hasPrefix("mxc://") {
                 avatarMxc = url
                 explicitAvatarFound = true
+            } else if type == "m.room.create" {
+                // Space detection: m.room.create carries the room's type.
+                if let t = content["type"] as? String, !t.isEmpty { roomType = t }
+            } else if type == "m.space.child" {
+                // state_key = the child room id. Non-empty content = link present;
+                // empty content = link removed.
+                if let childId = event["state_key"] as? String, !childId.isEmpty {
+                    if content.isEmpty { spaceChildren.remove(childId) }
+                    else { spaceChildren.insert(childId) }
+                }
+            } else if type == "uk.half-shot.bridge" {
+                // Bridge portal metadata. Take the protocol network label + icon.
+                if let proto = content["protocol"] as? [String: Any] {
+                    bridgeNetwork = (proto["displayname"] as? String)
+                        ?? (proto["id"] as? String) ?? bridgeNetwork
+                    if let av = proto["avatar_url"] as? String, av.hasPrefix("mxc://") {
+                        bridgeAvatarMxc = av
+                    }
+                }
             } else if type == "m.room.member",
                       content["membership"] as? String == "join",
                       let sender = event["sender"] as? String {
@@ -146,6 +189,8 @@ struct Room {
                     lastMessageTimestamp: lastTimestamp, prevBatch: prevBatch,
                     timelineEvents: timelineEvents,
                     avatarMxc: avatarMxc, memberNames: memberNames, memberAvatars: memberAvatars,
-                    unreadCount: unreadCount)
+                    unreadCount: unreadCount,
+                    roomType: roomType, spaceChildren: spaceChildren,
+                    bridgeNetwork: bridgeNetwork, bridgeAvatarMxc: bridgeAvatarMxc)
     }
 }

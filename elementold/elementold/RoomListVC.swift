@@ -28,6 +28,18 @@ class RoomListVC: UIViewController {
     private var searchBar: UISearchBar!
     private var searchText: String = ""
 
+    // Bridge/space grouping. A "bucket" is one space (its child rooms) or one
+    // bridged network (its portal rooms). Built after each /sync from roomsById;
+    // `selectedFilterId == nil` means "All conversations". The filter is applied
+    // on top of the space-room exclusion + search text in `displayedRooms`.
+    private struct RoomFilter { let id: String; let label: String; let roomIds: Set<String> }
+    private var filters: [RoomFilter] = []
+    private var selectedFilterId: String?
+    private var filterItem: UIBarButtonItem!
+    // Options captured for the iOS 6 UIActionSheet delegate (index -> filter id).
+    private var pendingFilterOptions: [(label: String, id: String?)] = []
+    private let filterSheetTag = 91
+
     private let client: MatrixAPIClient
     private let syncEngine: SyncEngine
 
@@ -57,6 +69,12 @@ class RoomListVC: UIViewController {
         let accountItem = UIBarButtonItem(image: UIImage(named: "UserCircle"),
                                           style: .plain, target: self, action: #selector(accountTapped))
         navigationItem.leftBarButtonItem = accountItem
+
+        // Filter button (bridge/space buckets). Hidden until at least one bucket
+        // is discovered from /sync (updateFilterButton).
+        filterItem = UIBarButtonItem(title: "Filter", style: .plain,
+                                     target: self, action: #selector(filterTapped))
+        updateFilterButton()
 
         tableView = UITableView(frame: view.bounds, style: .plain)
         tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -149,11 +167,25 @@ class RoomListVC: UIViewController {
             sortedRooms = roomsById.values.sorted { $0.lastMessageTimestamp > $1.lastMessageTimestamp }
         }
 
+        // Rebuild the bridge/space filter buckets from the (just-updated) rooms.
+        rebuildFilters()
+
         hasSyncedOnce = true
+        // Total unread across all joined rooms, mirrored on the app icon badge.
+        // Computed here (off-main, right after the roomsById mutation) so the
+        // main-thread block below only reads a captured Int, never roomsById.
+        let totalUnread = totalUnreadCount()
         DispatchQueue.main.async { [weak self] in
             self?.tableView.reloadData()
             self?.updateStatusLabel()
+            self?.updateFilterButton()
+            UIApplication.shared.applicationIconBadgeNumber = totalUnread
         }
+    }
+
+    // Sum of every joined room's unread count — drives the app icon badge.
+    private func totalUnreadCount() -> Int {
+        return roomsById.values.reduce(0) { $0 + $1.unreadCount }
     }
 
     // Maintains the pending-invite map from a /sync `rooms` object: upserts
@@ -252,6 +284,8 @@ class RoomListVC: UIViewController {
 
     private func performLogout() {
         syncEngine.stop()
+        // Clear the app icon badge so the next account doesn't inherit a stale count.
+        UIApplication.shared.applicationIconBadgeNumber = 0
         MatrixSession.clear()
         // Drop cached media too, so a different account signing in on this
         // device doesn't inherit the previous user's downloaded images.
@@ -261,12 +295,113 @@ class RoomListVC: UIViewController {
 
     // MARK: - Search / filter
 
-    // Rooms shown in the list, filtered by the search bar text (client-side:
-    // Matrix has no "search my joined rooms" endpoint, so filtering the already-
-    // synced list by name is the correct approach). Empty query → all rooms.
+    // Rooms shown in the list. Three filters stacked, in order:
+    //   1. Space rooms (isSpace) are never shown — they're grouping containers
+    //      with no timeline, surfaced only as filter buckets.
+    //   2. The selected bridge/space bucket, if any (selectedFilterId != nil).
+    //   3. The search bar text (client-side: Matrix has no "search my joined
+    //      rooms" endpoint, so filtering the synced list by name is correct).
     private var displayedRooms: [Room] {
-        guard !searchText.isEmpty else { return sortedRooms }
-        return sortedRooms.filter { RoomListVC.nameMatches($0.name, query: searchText) }
+        var rooms = sortedRooms.filter { !$0.isSpace }
+        if let id = selectedFilterId,
+           let bucket = filters.first(where: { $0.id == id }) {
+            rooms = rooms.filter { bucket.roomIds.contains($0.roomId) }
+        }
+        if !searchText.isEmpty {
+            rooms = rooms.filter { RoomListVC.nameMatches($0.name, query: searchText) }
+        }
+        return rooms
+    }
+
+    // Rebuilds the filter buckets from roomsById. Called off-main after every
+    // /sync (only mutates our own filter state, never UIKit).
+    //   Spaces first: one bucket per joined space room, containing the joined,
+    //   non-space rooms it lists via m.space.child (spaceChildren).
+    //   Bridges second: for every bridged room (bridgeNetwork != nil) not already
+    //   claimed by a space bucket, one bucket per distinct network label.
+    // Buckets with no currently-joined member rooms are dropped.
+    private func rebuildFilters() {
+        let joinedNonSpace = Set(roomsById.values.filter { !$0.isSpace }.map { $0.roomId })
+        var built: [RoomFilter] = []
+        var claimed = Set<String>()
+
+        // 1. Spaces.
+        let spaces = roomsById.values.filter { $0.isSpace }
+            .sorted { $0.name.lowercased() < $1.name.lowercased() }
+        for space in spaces {
+            let members = space.spaceChildren.intersection(joinedNonSpace)
+            guard !members.isEmpty else { continue }
+            built.append(RoomFilter(id: "space:\(space.roomId)", label: space.name, roomIds: members))
+            claimed.formUnion(members)
+        }
+
+        // 2. Bridged rooms not already in a space bucket, grouped by network label.
+        var byNetwork: [String: Set<String>] = [:]
+        for room in roomsById.values where !room.isSpace {
+            guard let net = room.bridgeNetwork, !claimed.contains(room.roomId) else { continue }
+            byNetwork[net, default: []].insert(room.roomId)
+        }
+        for net in byNetwork.keys.sorted(by: { $0.lowercased() < $1.lowercased() }) {
+            guard let ids = byNetwork[net], !ids.isEmpty else { continue }
+            built.append(RoomFilter(id: "bridge:\(net)", label: net, roomIds: ids))
+        }
+
+        filters = built
+        // Drop a stale selection if its bucket disappeared.
+        if let sel = selectedFilterId, !filters.contains(where: { $0.id == sel }) {
+            selectedFilterId = nil
+        }
+    }
+
+    // MARK: - Bridge/space filter UI (main thread only)
+
+    @objc private func filterTapped() {
+        // index 0 = "All conversations", then one per bucket.
+        var options: [(label: String, id: String?)] = [("All conversations", nil)]
+        for f in filters { options.append((f.label, f.id)) }
+        pendingFilterOptions = options
+#if IOS6_TARGET
+        let sheet = UIActionSheet()
+        sheet.tag = filterSheetTag
+        for opt in options { sheet.addButton(withTitle: opt.label) }
+        sheet.addButton(withTitle: "Cancel")
+        sheet.cancelButtonIndex = options.count
+        sheet.delegate = self
+        sheet.show(from: filterItem, animated: true)
+#else
+        let sheet = UIAlertController(title: "Filter conversations", message: nil, preferredStyle: .actionSheet)
+        for opt in options {
+            sheet.addAction(UIAlertAction(title: opt.label, style: .default) { [weak self] _ in
+                self?.applyFilter(opt.id)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        sheet.popoverPresentationController?.barButtonItem = filterItem
+        present(sheet, animated: true)
+#endif
+    }
+
+    private func applyFilter(_ id: String?) {
+        selectedFilterId = id
+        updateFilterButton()
+        tableView.reloadData()
+    }
+
+    // Shows the filter button only when at least one bucket exists; its title
+    // reflects the current selection ("Filter" when showing all).
+    private func updateFilterButton() {
+        guard filterItem != nil else { return }
+        if filters.isEmpty {
+            navigationItem.rightBarButtonItem = nil
+            return
+        }
+        navigationItem.rightBarButtonItem = filterItem
+        if let sel = selectedFilterId,
+           let f = filters.first(where: { $0.id == sel }) {
+            filterItem.title = f.label
+        } else {
+            filterItem.title = "Filter"
+        }
     }
 
     // Pure-Swift case-insensitive substring test. Avoids Foundation's
@@ -290,6 +425,14 @@ class RoomListVC: UIViewController {
 #if IOS6_TARGET
 extension RoomListVC: UIActionSheetDelegate, UIAlertViewDelegate {
     func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
+        if actionSheet.tag == filterSheetTag {
+            // Filter sheet: buttons map 1:1 to pendingFilterOptions; the trailing
+            // Cancel button is out of range and ignored.
+            if buttonIndex >= 0 && buttonIndex < pendingFilterOptions.count {
+                applyFilter(pendingFilterOptions[buttonIndex].id)
+            }
+            return
+        }
         switch buttonIndex {
         case 0: openUserSettings()
         case 1: confirmLogout()
@@ -372,6 +515,9 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
         if let idx = displayedRooms.firstIndex(where: { $0.roomId == roomId }) {
             tableView.reloadRows(at: [IndexPath(row: idx, section: roomSection)], with: .none)
         }
+        // Opening a room clears its badge locally — reflect that on the icon
+        // immediately (already on the main thread here).
+        UIApplication.shared.applicationIconBadgeNumber = totalUnreadCount()
     }
 }
 
