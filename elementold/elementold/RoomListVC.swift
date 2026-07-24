@@ -24,9 +24,14 @@ class RoomListVC: UIViewController {
     // that room's timeline, and markRoomRead zeroes the badge on selection.
     private var openRoomId: String?
 
-    // Search bar (table header) + current filter text.
+    // Search bar (table header) + current filter text. The search bar sits in a
+    // header container alongside a real funnel button (see filterButton) so the
+    // funnel doesn't overlap the search field.
     private var searchBar: UISearchBar!
     private var searchText: String = ""
+    private var listHeaderContainer: UIView!
+    private var filterButton: UIButton!
+    private let filterButtonWidth: CGFloat = 44
 
     // Bridge/space grouping. A "bucket" is one space (its child rooms) or one
     // bridged network (its portal rooms). Built after each /sync from roomsById;
@@ -35,7 +40,6 @@ class RoomListVC: UIViewController {
     private struct RoomFilter { let id: String; let label: String; let roomIds: Set<String> }
     private var filters: [RoomFilter] = []
     private var selectedFilterId: String?
-    private var filterItem: UIBarButtonItem!
     // Options captured for the iOS 6 UIActionSheet delegate (index -> filter id).
     private var pendingFilterOptions: [(label: String, id: String?)] = []
     private let filterSheetTag = 91
@@ -70,11 +74,17 @@ class RoomListVC: UIViewController {
                                           style: .plain, target: self, action: #selector(accountTapped))
         navigationItem.leftBarButtonItem = accountItem
 
-        // Filter button (bridge/space buckets). Hidden until at least one bucket
-        // is discovered from /sync (updateFilterButton).
-        filterItem = UIBarButtonItem(title: "Filter", style: .plain,
-                                     target: self, action: #selector(filterTapped))
-        updateFilterButton()
+        // Compose (new conversation) button — same white-icon bar-button style as
+        // the account button. Falls back to a "+" title if the image is missing.
+        let composeItem: UIBarButtonItem
+        if let plus = UIImage(named: "Plus") {
+            composeItem = UIBarButtonItem(image: plus, style: .plain,
+                                          target: self, action: #selector(composeTapped))
+        } else {
+            composeItem = UIBarButtonItem(title: "+", style: .plain,
+                                          target: self, action: #selector(composeTapped))
+        }
+        navigationItem.rightBarButtonItem = composeItem
 
         tableView = UITableView(frame: view.bounds, style: .plain)
         tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -93,7 +103,34 @@ class RoomListVC: UIViewController {
         searchBar.barStyle = .black
         searchBar.tintColor = UIColor(red: 0.13, green: 0.55, blue: 0.60, alpha: 1.0)
         searchBar.sizeToFit()
-        tableView.tableHeaderView = searchBar
+
+        // Host the search bar in a header container beside a real funnel button.
+        // A UISearchBar bookmark button overlapped the field on this runtime, so
+        // the filter gets its own tappable button on a teal background (matching
+        // the bar) that keeps the white funnel icon visible.
+        let barH = searchBar.frame.height
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: barH))
+        container.autoresizingMask = [.flexibleWidth]
+        searchBar.frame = container.bounds
+        searchBar.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(searchBar)
+
+        filterButton = UIButton(type: .custom)
+        filterButton.frame = CGRect(x: container.bounds.width - filterButtonWidth, y: 0,
+                                    width: filterButtonWidth, height: barH)
+        filterButton.autoresizingMask = [.flexibleLeftMargin, .flexibleHeight]
+        filterButton.backgroundColor = UIColor(red: 0.13, green: 0.55, blue: 0.60, alpha: 1.0)
+        filterButton.imageView?.contentMode = .scaleAspectFit
+        filterButton.addTarget(self, action: #selector(filterButtonTapped), for: .touchUpInside)
+        container.addSubview(filterButton)
+
+        listHeaderContainer = container
+        tableView.tableHeaderView = container
+
+        // The funnel button opens the filter sheet, becoming a funnel-x (clear)
+        // while a filter is active. Hidden (search bar full width) until at least
+        // one bucket exists.
+        updateFilterControl()
 
         // Compact, centred status label (not a full-bounds one — that read as a
         // big "box" on screen). Fixed size, centred via flexible margins on all
@@ -178,7 +215,7 @@ class RoomListVC: UIViewController {
         DispatchQueue.main.async { [weak self] in
             self?.tableView.reloadData()
             self?.updateStatusLabel()
-            self?.updateFilterButton()
+            self?.updateFilterControl()
             UIApplication.shared.applicationIconBadgeNumber = totalUnread
         }
     }
@@ -367,7 +404,7 @@ class RoomListVC: UIViewController {
         sheet.addButton(withTitle: "Cancel")
         sheet.cancelButtonIndex = options.count
         sheet.delegate = self
-        sheet.show(from: filterItem, animated: true)
+        sheet.show(in: view)
 #else
         let sheet = UIAlertController(title: "Filter conversations", message: nil, preferredStyle: .actionSheet)
         for opt in options {
@@ -376,32 +413,73 @@ class RoomListVC: UIViewController {
             })
         }
         sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        sheet.popoverPresentationController?.barButtonItem = filterItem
+        sheet.popoverPresentationController?.sourceView = filterButton
+        sheet.popoverPresentationController?.sourceRect = filterButton.bounds
         present(sheet, animated: true)
 #endif
     }
 
     private func applyFilter(_ id: String?) {
         selectedFilterId = id
-        updateFilterButton()
+        updateFilterControl()
         tableView.reloadData()
     }
 
-    // Shows the filter button only when at least one bucket exists; its title
-    // reflects the current selection ("Filter" when showing all).
-    private func updateFilterButton() {
-        guard filterItem != nil else { return }
+    // Filter control = the funnel button beside the search bar. Only shown when
+    // at least one bucket exists (otherwise the search bar spans the full width).
+    // Icon is the funnel normally; while a filter is active it becomes funnel-x,
+    // and tapping then clears the filter (see filterButtonTapped).
+    private func updateFilterControl() {
+        guard searchBar != nil, filterButton != nil, listHeaderContainer != nil else { return }
+        let full = listHeaderContainer.bounds
         if filters.isEmpty {
-            navigationItem.rightBarButtonItem = nil
+            filterButton.isHidden = true
+            searchBar.frame = full
             return
         }
-        navigationItem.rightBarButtonItem = filterItem
-        if let sel = selectedFilterId,
-           let f = filters.first(where: { $0.id == sel }) {
-            filterItem.title = f.label
-        } else {
-            filterItem.title = "Filter"
+        filterButton.isHidden = false
+        searchBar.frame = CGRect(x: 0, y: 0,
+                                 width: full.width - filterButtonWidth, height: full.height)
+        let active = selectedFilterId != nil
+        if let img = UIImage(named: active ? "FunnelX" : "Funnel") {
+            filterButton.setImage(img, for: .normal)
         }
+    }
+
+    @objc private func filterButtonTapped() {
+        if selectedFilterId != nil {
+            applyFilter(nil)
+        } else {
+            filterTapped()
+        }
+    }
+
+    // MARK: - New conversation
+
+    @objc private func composeTapped() {
+        let vc = NewConversationVC(client: client) { [weak self] roomId, displayName in
+            self?.openCreatedRoom(roomId: roomId, displayName: displayName)
+        }
+        let nav = navigationController
+        nav?.pushViewController(vc, animated: true)
+    }
+
+    // Called after createRoom succeeds. The room isn't in roomsById yet (it lands
+    // on the next /sync), so seed a minimal Room so we can open its timeline right
+    // away; /sync fills in the real state/name/members shortly after.
+    private func openCreatedRoom(roomId: String, displayName: String) {
+        let room = roomsById[roomId] ?? Room(roomId: roomId, name: displayName, lastMessage: "",
+                                             lastMessageTimestamp: Date().timeIntervalSince1970 * 1000,
+                                             prevBatch: nil, timelineEvents: [],
+                                             avatarMxc: nil, memberNames: [:], memberAvatars: [:],
+                                             unreadCount: 0, roomType: nil, spaceChildren: [],
+                                             bridgeNetwork: nil, bridgeAvatarMxc: nil)
+        if roomsById[roomId] == nil { roomsById[roomId] = room }
+        openRoomId = roomId
+        // Pop the compose screen, then push the new room's timeline.
+        navigationController?.popToRootViewController(animated: false)
+        let vc = RoomTimelineVC(room: room, client: client, syncEngine: syncEngine)
+        navigationController?.pushViewController(vc, animated: true)
     }
 
     // Pure-Swift case-insensitive substring test. Avoids Foundation's
@@ -653,5 +731,309 @@ private class RoomCell: UITableViewCell {
         }
 
         if !badgeBackground.isHidden { contentView.bringSubviewToFront(badgeBackground) }
+    }
+}
+
+// MARK: - New Conversation
+
+// Start a direct message or create a group room. Appended here (not a separate
+// file) to avoid a project.pbxproj round-trip — same trick as MemberListVC in
+// RoomTimelineVC.swift.
+//
+// Direct mode: search the user directory (or type a raw @user:server) and tap a
+// result to create a DM (createRoom is_direct + trusted_private_chat preset).
+// Group mode: enter a room name, tap users to select them, then Create.
+//
+// iOS 6-safe: no #available / topLayoutGuide (controls live in the table header
+// so UIKit positions them under the nav bar automatically); dual-target alerts;
+// all inputs travel in JSON request bodies, never in a URL, so no percent-encoding.
+class NewConversationVC: UIViewController {
+
+    enum Mode { case direct, group }
+
+    private let client: MatrixAPIClient
+    private let onCreated: (_ roomId: String, _ displayName: String) -> Void
+
+    private var mode: Mode = .direct
+    private var results: [(userId: String, name: String, avatarMxc: String?)] = []
+    private var selected: [String: String] = [:]   // userId -> display name (group mode)
+    private var creating = false
+    private var searchToken = 0
+
+    private var tableView: UITableView!
+    private var headerContainer: UIView!
+    private var segmented: UISegmentedControl!
+    private var nameField: UITextField!
+    private var searchField: UITextField!
+    private var createItem: UIBarButtonItem!
+
+    private let cellId = "UserResultCell"
+
+    init(client: MatrixAPIClient, onCreated: @escaping (String, String) -> Void) {
+        self.client = client
+        self.onCreated = onCreated
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "New Conversation"
+        view.backgroundColor = .white
+
+        tableView = UITableView(frame: view.bounds, style: .plain)
+        tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.rowHeight = 58
+        view.addSubview(tableView)
+
+        buildHeader()
+
+        createItem = UIBarButtonItem(title: "Create", style: .done,
+                                     target: self, action: #selector(createGroupTapped))
+        updateCreateButton()
+    }
+
+    // MARK: header
+
+    private func buildHeader() {
+        let width = view.bounds.width
+        headerContainer = UIView(frame: CGRect(x: 0, y: 0, width: width, height: 10))
+        headerContainer.autoresizingMask = [.flexibleWidth]
+
+        segmented = UISegmentedControl(items: ["Direct", "Group"])
+        segmented.selectedSegmentIndex = 0
+        segmented.addTarget(self, action: #selector(modeChanged), for: .valueChanged)
+        headerContainer.addSubview(segmented)
+
+        nameField = makeField(placeholder: "Group name")
+        nameField.addTarget(self, action: #selector(nameEditingChanged), for: .editingChanged)
+        headerContainer.addSubview(nameField)
+
+        searchField = makeField(placeholder: "Search users or @user:server")
+        searchField.autocapitalizationType = .none
+        searchField.autocorrectionType = .no
+        searchField.returnKeyType = .search
+        searchField.addTarget(self, action: #selector(searchEditingChanged), for: .editingChanged)
+        searchField.delegate = self
+        headerContainer.addSubview(searchField)
+
+        layoutHeader()
+    }
+
+    private func makeField(placeholder: String) -> UITextField {
+        let f = UITextField()
+        // Match RoomTimelineVC's chat input: no bezel, white rounded field with a
+        // thin grey border, and a small left inset spacer for the text.
+        f.borderStyle = .none
+        f.backgroundColor = .white
+        f.layer.cornerRadius = 8
+        f.layer.masksToBounds = true
+        f.layer.borderWidth = 0.5
+        f.layer.borderColor = UIColor(white: 0.8, alpha: 1.0).cgColor
+        f.font = UIFont.systemFont(ofSize: 16)
+        f.contentVerticalAlignment = .center
+        f.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 10, height: 1))
+        f.leftViewMode = .always
+        f.placeholder = placeholder
+        f.clearButtonMode = .whileEditing
+        return f
+    }
+
+    // Recomputes the header layout for the current mode and (re)assigns it so the
+    // table picks up the new height. The group-name field only exists in group mode.
+    private func layoutHeader() {
+        let width = view.bounds.width
+        let pad: CGFloat = 12
+        let fieldH: CGFloat = 34
+        segmented.frame = CGRect(x: pad, y: pad, width: width - pad * 2, height: 30)
+
+        var y = segmented.frame.maxY + 10
+        if mode == .group {
+            nameField.isHidden = false
+            nameField.frame = CGRect(x: pad, y: y, width: width - pad * 2, height: fieldH)
+            y = nameField.frame.maxY + 8
+        } else {
+            nameField.isHidden = true
+        }
+        searchField.frame = CGRect(x: pad, y: y, width: width - pad * 2, height: fieldH)
+        y = searchField.frame.maxY + pad
+
+        headerContainer.frame = CGRect(x: 0, y: 0, width: width, height: y)
+        tableView.tableHeaderView = headerContainer
+    }
+
+    @objc private func modeChanged() {
+        mode = segmented.selectedSegmentIndex == 0 ? .direct : .group
+        selected.removeAll()
+        layoutHeader()
+        updateCreateButton()
+        tableView.reloadData()
+    }
+
+    // Group mode shows a "Create" button, enabled once a name + at least one
+    // member are set. Direct mode has no button (tapping a user starts the DM).
+    private func updateCreateButton() {
+        if mode == .group {
+            navigationItem.rightBarButtonItem = createItem
+            let name = (nameField.text ?? "").trimmed()
+            createItem.isEnabled = !name.isEmpty && !selected.isEmpty && !creating
+        } else {
+            navigationItem.rightBarButtonItem = nil
+        }
+    }
+
+    // MARK: search
+
+    @objc private func searchEditingChanged() {
+        performSearch()
+    }
+
+    @objc private func nameEditingChanged() {
+        updateCreateButton()
+    }
+
+    private func performSearch() {
+        let term = (searchField.text ?? "").trimmed()
+        // Always offer a raw-MXID row when the text looks like a user id, even if
+        // the directory search is disabled or returns nothing.
+        let mxidRow: [(String, String, String?)] = NewConversationVC.looksLikeMXID(term) ? [(term, term, nil)] : []
+        guard term.count >= 2 else {
+            results = mxidRow.map { (userId: $0.0, name: $0.1, avatarMxc: $0.2) }
+            tableView.reloadData()
+            return
+        }
+        searchToken += 1
+        let token = searchToken
+        client.post("/_matrix/client/v3/user_directory/search",
+                    body: ["search_term": term, "limit": 20]) { [weak self] json, _ in
+            DispatchQueue.main.async {
+                guard let self = self, token == self.searchToken else { return }
+                var found: [(userId: String, name: String, avatarMxc: String?)] = []
+                if let arr = json?["results"] as? [[String: Any]] {
+                    for r in arr {
+                        guard let uid = r["user_id"] as? String else { continue }
+                        let dn = (r["display_name"] as? String) ?? uid
+                        found.append((userId: uid, name: dn, avatarMxc: r["avatar_url"] as? String))
+                    }
+                }
+                // Prepend the raw-MXID row if it isn't already in the results.
+                for m in mxidRow where !found.contains(where: { $0.userId == m.0 }) {
+                    found.insert((userId: m.0, name: m.1, avatarMxc: m.2), at: 0)
+                }
+                self.results = found
+                self.tableView.reloadData()
+            }
+        }
+    }
+
+    private static func looksLikeMXID(_ s: String) -> Bool {
+        return s.hasPrefix("@") && s.firstIndex(of: ":") != nil && s.count >= 4
+    }
+
+    // MARK: create
+
+    private func startDirect(userId: String, name: String) {
+        guard !creating else { return }
+        createRoom(body: ["is_direct": true,
+                          "preset": "trusted_private_chat",
+                          "invite": [userId]],
+                   displayName: name)
+    }
+
+    @objc private func createGroupTapped() {
+        guard mode == .group, !creating else { return }
+        let name = (nameField.text ?? "").trimmed()
+        guard !name.isEmpty, !selected.isEmpty else { return }
+        let invites = Array(selected.keys)
+        createRoom(body: ["preset": "private_chat", "name": name, "invite": invites],
+                   displayName: name)
+    }
+
+    private func createRoom(body: [String: Any], displayName: String) {
+        creating = true
+        updateCreateButton()
+        view.endEditing(true)
+        client.post("/_matrix/client/v3/createRoom", body: body) { [weak self] json, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.creating = false
+                self.updateCreateButton()
+                if let roomId = json?["room_id"] as? String {
+                    self.onCreated(roomId, displayName)
+                } else {
+                    self.showError("Couldn't create conversation", "\(error.map { "\($0)" } ?? "Unknown error")")
+                }
+            }
+        }
+    }
+
+    private func showError(_ title: String, _ message: String) {
+#if IOS6_TARGET
+        let alert = UIAlertView()
+        alert.title = title
+        alert.message = message
+        alert.addButton(withTitle: "OK")
+        alert.show()
+#else
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+#endif
+    }
+}
+
+extension NewConversationVC: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        textField.resignFirstResponder()
+        if textField === searchField { performSearch() }
+        return true
+    }
+}
+
+extension NewConversationVC: UITableViewDataSource, UITableViewDelegate {
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        return results.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: cellId)
+            ?? UITableViewCell(style: .subtitle, reuseIdentifier: cellId)
+        let r = results[indexPath.row]
+        cell.textLabel?.text = r.name
+        cell.detailTextLabel?.text = r.userId
+        cell.detailTextLabel?.textColor = .gray
+        if mode == .group {
+            cell.accessoryType = (selected[r.userId] != nil) ? .checkmark : .none
+        } else {
+            cell.accessoryType = .disclosureIndicator
+        }
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        let r = results[indexPath.row]
+        if mode == .group {
+            if selected[r.userId] != nil { selected[r.userId] = nil }
+            else { selected[r.userId] = r.name }
+            tableView.reloadRows(at: [indexPath], with: .none)
+            updateCreateButton()
+        } else {
+            startDirect(userId: r.userId, name: r.name)
+        }
+    }
+}
+
+private extension String {
+    // Pure-Swift whitespace trim (no Foundation CharacterSet — iOS-6-safe rule).
+    func trimmed() -> String {
+        let ws: Set<Character> = [" ", "\t", "\n", "\r"]
+        var chars = Array(self)
+        while let f = chars.first, ws.contains(f) { chars.removeFirst() }
+        while let l = chars.last, ws.contains(l) { chars.removeLast() }
+        return String(chars)
     }
 }

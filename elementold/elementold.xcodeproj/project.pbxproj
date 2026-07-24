@@ -18,6 +18,15 @@
 		BB150002 /* Logo@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB150001 /* Logo@2x.png */; };
 		BB200035 /* UserCircle@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200034 /* UserCircle@3x.png */; };
 		BB200033 /* UserCircle@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200032 /* UserCircle@2x.png */; };
+		BB320001 /* Funnel.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320000 /* Funnel.png */; };
+		BB320003 /* Funnel@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320002 /* Funnel@2x.png */; };
+		BB320005 /* Funnel@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320004 /* Funnel@3x.png */; };
+		BB320011 /* FunnelX.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320010 /* FunnelX.png */; };
+		BB320013 /* FunnelX@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320012 /* FunnelX@2x.png */; };
+		BB320015 /* FunnelX@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320014 /* FunnelX@3x.png */; };
+		BB320021 /* Plus.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320020 /* Plus.png */; };
+		BB320023 /* Plus@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320022 /* Plus@2x.png */; };
+		BB320025 /* Plus@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB320024 /* Plus@3x.png */; };
 		BB200031 /* UserCircle.png in Resources */ = {isa = PBXBuildFile; fileRef = BB200030 /* UserCircle.png */; };
 		BB310101 /* PlayWhite.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310001 /* PlayWhite.png */; };
 		BB310102 /* PlayWhite@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = BB310002 /* PlayWhite@2x.png */; };
@@ -89,6 +98,15 @@
 		BB150001 /* Logo@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Logo@2x.png"; sourceTree = "<group>"; };
 		BB200034 /* UserCircle@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "UserCircle@3x.png"; sourceTree = "<group>"; };
 		BB200032 /* UserCircle@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "UserCircle@2x.png"; sourceTree = "<group>"; };
+		BB320000 /* Funnel.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Funnel.png"; sourceTree = "<group>"; };
+		BB320002 /* Funnel@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Funnel@2x.png"; sourceTree = "<group>"; };
+		BB320004 /* Funnel@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Funnel@3x.png"; sourceTree = "<group>"; };
+		BB320010 /* FunnelX.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "FunnelX.png"; sourceTree = "<group>"; };
+		BB320012 /* FunnelX@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "FunnelX@2x.png"; sourceTree = "<group>"; };
+		BB320014 /* FunnelX@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "FunnelX@3x.png"; sourceTree = "<group>"; };
+		BB320020 /* Plus.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Plus.png"; sourceTree = "<group>"; };
+		BB320022 /* Plus@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Plus@2x.png"; sourceTree = "<group>"; };
+		BB320024 /* Plus@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Plus@3x.png"; sourceTree = "<group>"; };
 		BB200030 /* UserCircle.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "UserCircle.png"; sourceTree = "<group>"; };
 		BB310001 /* PlayWhite.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayWhite.png"; sourceTree = "<group>"; };
 		BB310002 /* PlayWhite@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "PlayWhite@2x.png"; sourceTree = "<group>"; };
@@ -203,6 +221,15 @@
 				BB150001 /* Logo@2x.png */,
 				BB200034 /* UserCircle@3x.png */,
 				BB200032 /* UserCircle@2x.png */,
+				BB320000 /* Funnel.png */,
+				BB320002 /* Funnel@2x.png */,
+				BB320004 /* Funnel@3x.png */,
+				BB320010 /* FunnelX.png */,
+				BB320012 /* FunnelX@2x.png */,
+				BB320014 /* FunnelX@3x.png */,
+				BB320020 /* Plus.png */,
+				BB320022 /* Plus@2x.png */,
+				BB320024 /* Plus@3x.png */,
 				BB200030 /* UserCircle.png */,
 				BB310001 /* PlayWhite.png */,
 				BB310002 /* PlayWhite@2x.png */,
@@ -351,6 +378,15 @@
 				BB150002 /* Logo@2x.png in Resources */,
 				BB200035 /* UserCircle@3x.png in Resources */,
 				BB200033 /* UserCircle@2x.png in Resources */,
+				BB320001 /* Funnel.png in Resources */,
+				BB320003 /* Funnel@2x.png in Resources */,
+				BB320005 /* Funnel@3x.png in Resources */,
+				BB320011 /* FunnelX.png in Resources */,
+				BB320013 /* FunnelX@2x.png in Resources */,
+				BB320015 /* FunnelX@3x.png in Resources */,
+				BB320021 /* Plus.png in Resources */,
+				BB320023 /* Plus@2x.png in Resources */,
+				BB320025 /* Plus@3x.png in Resources */,
 				BB200031 /* UserCircle.png in Resources */,
 				BB310101 /* PlayWhite.png in Resources */,
 				BB310102 /* PlayWhite@2x.png in Resources */,
