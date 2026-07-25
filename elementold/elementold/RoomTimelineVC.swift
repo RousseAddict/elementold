@@ -106,6 +106,10 @@ class RoomTimelineVC: UIViewController {
     private var playingAudioMxc: String?
     private var audioProgressTimer: Timer?
     private let audioCellId = "AudioEventCell"
+    private let fileCellId = "FileEventCell"
+    // In-flight attachment downloads (mxc -> 0...1), so a recycled or scrolled-in
+    // cell can show the current progress.
+    private var fileProgress: [String: Float] = [:]
     // mxc URIs we've already kicked a thumbnail prefetch for, so we prime each
     // image exactly once (on first appearance in `events`) rather than re-hitting
     // the cache — and re-logging a diagnostic line — on every table reload.
@@ -355,6 +359,7 @@ class RoomTimelineVC: UIViewController {
         case .message(_, let body, _): return body
         case .image(_, let caption, _, _, _): return caption.isEmpty ? nil : caption
         case .audio(_, _, _, let caption): return caption.isEmpty ? nil : caption
+        case .file(_, _, let filename, _, _): return filename
         case .membership(let description): return description
         }
     }
@@ -393,6 +398,7 @@ class RoomTimelineVC: UIViewController {
             (cell as? EventCell)?.setRevealOffset(offset)
             (cell as? ImageEventCell)?.setRevealOffset(offset)
             (cell as? AudioEventCell)?.setRevealOffset(offset)
+            (cell as? FileEventCell)?.setRevealOffset(offset)
         }
     }
 
@@ -851,6 +857,7 @@ class RoomTimelineVC: UIViewController {
         case .message(let sender, _, _): return sender
         case .image(let sender, _, _, _, _): return sender
         case .audio(let sender, _, _, _): return sender
+        case .file(let sender, _, _, _, _): return sender
         case .membership: return nil
         }
     }
@@ -1388,6 +1395,60 @@ class RoomTimelineVC: UIViewController {
         return result
     }
 
+    // MARK: - Attachment downloads
+
+    private func handleFileTap(mxc: String, filename: String, mimeType: String) {
+        if let path = MediaCache.shared.downloadedFilePath(mxc: mxc, filename: filename, mimeType: mimeType) {
+            showFileAlert(title: "Saved", message: "\(filename)\n\n\(path)")
+            return
+        }
+        guard fileProgress[mxc] == nil else { return }   // already downloading
+
+        fileProgress[mxc] = 0
+        visibleFileCell(for: mxc)?.setProgress(0)
+        MediaCache.shared.downloadFile(mxc: mxc, filename: filename, mimeType: mimeType,
+                                       progress: { [weak self] fraction in
+            guard let self = self else { return }
+            // Only repaint on a whole-percent change — curl reports progress far
+            // more often than the label can meaningfully change.
+            let previous = self.fileProgress[mxc] ?? -1
+            guard Int(fraction * 100) != Int(previous * 100) else { return }
+            self.fileProgress[mxc] = fraction
+            self.visibleFileCell(for: mxc)?.setProgress(fraction)
+        }) { [weak self] path in
+            guard let self = self else { return }
+            self.fileProgress.removeValue(forKey: mxc)
+            let cell = self.visibleFileCell(for: mxc)
+            if path != nil {
+                cell?.markDownloaded()
+            } else {
+                cell?.setProgress(nil)
+                self.showFileAlert(title: "Download failed", message: filename)
+            }
+        }
+    }
+
+    private func visibleFileCell(for mxc: String) -> FileEventCell? {
+        for cell in tableView.visibleCells {
+            if let fileCell = cell as? FileEventCell, fileCell.mxc == mxc { return fileCell }
+        }
+        return nil
+    }
+
+    private func showFileAlert(title: String, message: String) {
+#if IOS6_TARGET
+        let alert = UIAlertView()
+        alert.title = title
+        alert.message = message
+        alert.addButton(withTitle: "OK")
+        alert.show()
+#else
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+        present(alert, animated: true)
+#endif
+    }
+
     private func openImageViewer(mxc: String, placeholder: UIImage?) {
         let viewer = ImageViewerVC(mxc: mxc, placeholder: placeholder)
         navigationController?.pushViewController(viewer, animated: true)
@@ -1481,6 +1542,10 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 let metaBlock: CGFloat = eventRow.showMeta ? EventCell.metaHeight + EventCell.metaGap : 0
                 let topMargin = eventRow.showMeta ? EventCell.topMargin : EventCell.groupedTopMargin
                 return topMargin + metaBlock + AudioEventCell.bubbleHeight + EventCell.bottomMargin
+            case .file:
+                let metaBlock: CGFloat = eventRow.showMeta ? EventCell.metaHeight + EventCell.metaGap : 0
+                let topMargin = eventRow.showMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+                return topMargin + metaBlock + FileEventCell.bubbleHeight + EventCell.bottomMargin
             case .membership:
                 return 30
             }
@@ -1584,6 +1649,25 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 cell.setPlaybackState(playing: playing,
                                       currentTime: playing ? (audioPlayer?.currentTime ?? 0) : 0,
                                       duration: audioPlayer?.duration ?? (Double(durationMs) / 1000.0))
+                return cell
+
+            case .file(let sender, let mxc, let filename, let mimeType, let sizeBytes):
+                let cell = (tableView.dequeueReusableCell(withIdentifier: fileCellId) as? FileEventCell) ??
+                    FileEventCell(style: .default, reuseIdentifier: fileCellId)
+                let isOwn = sender == MatrixSession.userId
+                let time = TimeFormat.shortTime(msSinceEpoch: eventRow.event.timestamp)
+                let meta = eventRow.showMeta ? metaText(sender: sender, isOwn: isOwn, isEmote: false) : nil
+                let downloaded = MediaCache.shared.downloadedFilePath(mxc: mxc, filename: filename,
+                                                                      mimeType: mimeType) != nil
+                cell.configure(meta: meta, mxc: mxc, filename: filename, mimeType: mimeType,
+                               sizeBytes: sizeBytes, downloaded: downloaded, time: time, isOwn: isOwn,
+                               avatarMxc: memberAvatars[sender], senderName: memberNames[sender] ?? sender)
+                // Reflect an in-flight download onto this (possibly recycled) cell.
+                cell.setProgress(fileProgress[mxc])
+                cell.setRevealOffset(revealOffset)
+                cell.onTap = { [weak self] in
+                    self?.handleFileTap(mxc: mxc, filename: filename, mimeType: mimeType)
+                }
                 return cell
 
             case .membership(let description):
@@ -2085,6 +2169,231 @@ private class AudioEventCell: UITableViewCell {
         playButton.frame = CGRect(x: pad, y: (bh - btn) / 2, width: btn, height: btn)
         let labelX = pad + btn + 8
         durationLabel.frame = CGRect(x: labelX, y: 0, width: max(0, bw - labelX - pad), height: bh)
+
+        if !avatarView.isHidden {
+            let ax = EventCell.outerMargin - revealOffset
+            let ay = bubble.frame.maxY - EventCell.avatarSize
+            avatarView.frame = CGRect(x: ax, y: ay, width: EventCell.avatarSize, height: EventCell.avatarSize)
+        }
+
+        revealTimeLabel.frame = CGRect(x: contentView.bounds.width - EventCell.maxReveal + 2,
+                                        y: bubble.frame.minY, width: EventCell.maxReveal - 8,
+                                        height: bubble.frame.height)
+        revealTimeLabel.isHidden = revealOffset <= 0.5
+    }
+}
+
+// An m.file / m.video attachment bubble: a file-type "chip" (the uppercase
+// extension) next to the filename and a "PDF · 2.4 MB" subtitle. Display only
+// for now — downloading and opening the attachment comes later.
+private class FileEventCell: UITableViewCell {
+    static let bubbleHeight: CGFloat = 58
+    static let bubbleMaxWidth: CGFloat = 250
+
+    private let bubble = UIView()
+    private let metaLabel = UILabel()
+    private let avatarView = AvatarView()
+    private let revealTimeLabel = UILabel()
+    private let chip = UIView()
+    private let chipLabel = UILabel()
+    private let nameLabel = UILabel()
+    private let detailLabel = UILabel()
+    private let progressView = UIProgressView(progressViewStyle: .default)
+    private var isOwnMessage = false
+    private var hasMeta = false
+    private var revealOffset: CGFloat = 0
+
+    // Download state, kept on the cell so a progress tick doesn't have to re-stat
+    // the disk. `sizeText` is the pre-formatted attachment size (empty if the
+    // sender omitted it).
+    private var isDownloaded = false
+    private var sizeText = ""
+
+    // Which attachment this cell shows — the VC matches progress updates against it.
+    var mxc: String?
+    var onTap: (() -> Void)?
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+
+        // iOS 6: UILabel defaults to an opaque white background — every label
+        // over the bubble must be cleared explicitly.
+        metaLabel.backgroundColor = .clear
+        metaLabel.font = UIFont.systemFont(ofSize: 11)
+        metaLabel.textColor = .gray
+        contentView.addSubview(metaLabel)
+
+        avatarView.isHidden = true
+        contentView.addSubview(avatarView)
+
+        bubble.layer.cornerRadius = 12
+        bubble.layer.masksToBounds = true
+        contentView.addSubview(bubble)
+
+        chip.layer.cornerRadius = 6
+        chip.layer.masksToBounds = true
+        bubble.addSubview(chip)
+
+        chipLabel.backgroundColor = .clear
+        chipLabel.font = UIFont.boldSystemFont(ofSize: 11)
+        chipLabel.textAlignment = .center
+        chipLabel.adjustsFontSizeToFitWidth = true
+        chip.addSubview(chipLabel)
+
+        nameLabel.backgroundColor = .clear
+        nameLabel.font = UIFont.boldSystemFont(ofSize: 14)
+        nameLabel.lineBreakMode = .byTruncatingMiddle
+        bubble.addSubview(nameLabel)
+
+        detailLabel.backgroundColor = .clear
+        detailLabel.font = UIFont.systemFont(ofSize: 11)
+        bubble.addSubview(detailLabel)
+
+        progressView.isHidden = true
+        bubble.addSubview(progressView)
+
+        revealTimeLabel.backgroundColor = .clear
+        revealTimeLabel.font = UIFont.systemFont(ofSize: 11)
+        revealTimeLabel.textColor = .gray
+        revealTimeLabel.textAlignment = .right
+        revealTimeLabel.isHidden = true
+        contentView.addSubview(revealTimeLabel)
+
+        bubble.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(bubbleTapped)))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    @objc private func bubbleTapped() { onTap?() }
+
+    func configure(meta: String?, mxc: String, filename: String, mimeType: String, sizeBytes: Int,
+                   downloaded: Bool, time: String, isOwn: Bool, avatarMxc: String?, senderName: String) {
+        isOwnMessage = isOwn
+        hasMeta = meta != nil
+        metaLabel.isHidden = !hasMeta
+        metaLabel.text = meta
+        metaLabel.textAlignment = isOwn ? .right : .left
+        revealTimeLabel.text = time
+
+        self.mxc = mxc
+        isDownloaded = downloaded
+        sizeText = sizeBytes > 0 ? FileEventCell.humanSize(sizeBytes) : ""
+        nameLabel.text = filename
+        chipLabel.text = FileEventCell.typeTag(filename: filename, mimeType: mimeType)
+        setProgress(nil)
+
+        bubble.backgroundColor = isOwn ? UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
+                                        : UIColor(white: 0.85, alpha: 1.0)
+        nameLabel.textColor = isOwn ? .white : .black
+        detailLabel.textColor = isOwn ? UIColor(white: 1.0, alpha: 0.75) : .darkGray
+        chip.backgroundColor = isOwn ? UIColor(white: 1.0, alpha: 0.22) : .white
+        chipLabel.textColor = isOwn ? .white : UIColor(white: 0.3, alpha: 1.0)
+        progressView.progressTintColor = isOwn ? .white : UIColor(white: 0.35, alpha: 1.0)
+
+        let showAvatar = !isOwn && hasMeta
+        avatarView.isHidden = !showAvatar
+        if showAvatar { avatarView.setAvatar(mxc: avatarMxc, name: senderName) }
+
+        setNeedsLayout()
+    }
+
+    // `progress` nil means "not downloading" — the subtitle then reflects whether
+    // the attachment is already on disk.
+    func setProgress(_ progress: Float?) {
+        if let progress = progress {
+            progressView.isHidden = false
+            progressView.progress = progress
+            detailLabel.text = "Downloading\u{2026} \(Int(progress * 100))%"
+            return
+        }
+        progressView.isHidden = true
+        let lead = isDownloaded ? "Saved" : "Tap to download"
+        detailLabel.text = sizeText.isEmpty ? lead : "\(lead) \u{00B7} \(sizeText)"
+    }
+
+    func markDownloaded() {
+        isDownloaded = true
+        setProgress(nil)
+    }
+
+    // Uppercase file-type tag: the filename's extension when it has one, else
+    // the mime subtype, else "FILE". Pure Swift scalar work — no Foundation
+    // string convenience APIs (several are unsafe on this legacy runtime).
+    private static func typeTag(filename: String, mimeType: String) -> String {
+        var candidate = ""
+        if let dot = filename.lastIndex(of: "."), dot < filename.index(before: filename.endIndex) {
+            candidate = String(filename[filename.index(after: dot)...])
+        }
+        if candidate.isEmpty, let slash = mimeType.lastIndex(of: "/"),
+           slash < mimeType.index(before: mimeType.endIndex) {
+            candidate = String(mimeType[mimeType.index(after: slash)...])
+        }
+        if candidate.isEmpty { return "FILE" }
+        return asciiUppercased(String(candidate.prefix(4)))
+    }
+
+    private static func asciiUppercased(_ s: String) -> String {
+        var out = String.UnicodeScalarView()
+        for scalar in s.unicodeScalars {
+            if scalar.value >= 97, scalar.value <= 122, let up = UnicodeScalar(scalar.value - 32) {
+                out.append(up)
+            } else {
+                out.append(scalar)
+            }
+        }
+        return String(out)
+    }
+
+    // Hand-rolled byte formatting (ByteCountFormatter is avoided project-wide).
+    private static func humanSize(_ bytes: Int) -> String {
+        let b = Double(bytes)
+        if b >= 1024 * 1024 * 1024 { return String(format: "%.1f GB", b / (1024 * 1024 * 1024)) }
+        if b >= 1024 * 1024 { return String(format: "%.1f MB", b / (1024 * 1024)) }
+        if b >= 1024 { return String(format: "%.0f KB", b / 1024) }
+        return "\(bytes) B"
+    }
+
+    func setRevealOffset(_ offset: CGFloat) {
+        guard offset != revealOffset else { return }
+        revealOffset = offset
+        setNeedsLayout()
+        layoutIfNeeded()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let maxBubbleWidth = contentView.bounds.width * EventCell.bubbleWidthFraction
+        let bw = min(FileEventCell.bubbleMaxWidth, maxBubbleWidth)
+        let bh = FileEventCell.bubbleHeight
+
+        let leftEdge = EventCell.outerMargin + (isOwnMessage ? 0 : EventCell.senderGutter)
+
+        var y: CGFloat = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+        if hasMeta {
+            let metaX = isOwnMessage ? contentView.bounds.width - EventCell.outerMargin - maxBubbleWidth
+                                     : leftEdge
+            metaLabel.frame = CGRect(x: metaX - revealOffset, y: y,
+                                      width: maxBubbleWidth, height: EventCell.metaHeight)
+            y += EventCell.metaHeight + EventCell.metaGap
+        }
+
+        let bubbleX = isOwnMessage ? contentView.bounds.width - bw - EventCell.outerMargin
+                                    : leftEdge
+        bubble.frame = CGRect(x: bubbleX - revealOffset, y: y, width: bw, height: bh)
+
+        let pad: CGFloat = 8
+        let chipSize: CGFloat = 38
+        chip.frame = CGRect(x: pad, y: (bh - chipSize) / 2, width: chipSize, height: chipSize)
+        chipLabel.frame = chip.bounds.insetBy(dx: 2, dy: 0)
+
+        let textX = pad + chipSize + 8
+        let textW = max(0, bw - textX - pad)
+        nameLabel.frame = CGRect(x: textX, y: 9, width: textW, height: 18)
+        detailLabel.frame = CGRect(x: textX, y: 28, width: textW, height: 14)
+        progressView.frame = CGRect(x: textX, y: 46, width: textW, height: 2)
 
         if !avatarView.isHidden {
             let ax = EventCell.outerMargin - revealOffset

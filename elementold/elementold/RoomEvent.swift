@@ -83,6 +83,10 @@ struct RoomEvent {
         // `durationMs` is info.duration in milliseconds (0 if the sender omitted
         // it), `caption` is the body text ("Voice message · m:ss").
         case audio(sender: String, mxc: String, durationMs: Int, caption: String)
+        // An m.file / m.video attachment: `mxc` is the content URI, `filename`
+        // is the body (the original filename), `mimeType`/`sizeBytes` come from
+        // `info` (empty/0 when the sender omitted them).
+        case file(sender: String, mxc: String, filename: String, mimeType: String, sizeBytes: Int)
         case membership(description: String)
     }
 
@@ -121,6 +125,20 @@ struct RoomEvent {
                 let dur = (info?["duration"] as? NSNumber)?.intValue ?? 0
                 return RoomEvent(eventId: eventId,
                                   kind: .audio(sender: sender, mxc: mxc, durationMs: dur, caption: body),
+                                  timestamp: timestamp)
+            }
+            // m.file / m.video render as an attachment bubble (filename, type,
+            // size). Encrypted attachments carry a `file` object instead of
+            // `url` and fall through to the text branch, same as images/audio.
+            if msgtype == "m.file" || msgtype == "m.video",
+               let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
+                let info = content["info"] as? [String: Any]
+                let mime = info?["mimetype"] as? String ?? ""
+                let size = (info?["size"] as? NSNumber)?.intValue ?? 0
+                let name = RoomEvent.isBlank(body) ? "Attachment" : body
+                return RoomEvent(eventId: eventId,
+                                  kind: .file(sender: sender, mxc: mxc, filename: name,
+                                              mimeType: mime, sizeBytes: size),
                                   timestamp: timestamp)
             }
             let isEmote = msgtype == "m.emote"

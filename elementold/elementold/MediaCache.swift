@@ -89,11 +89,25 @@ class MediaCache {
     // touched on trimQueue.
     private var trimScheduled = false
 
+    // Downloaded attachments live under Documents, NOT the Caches media dir:
+    // they're deliberate user downloads, so they must survive both the 100MB
+    // oldest-first trim and iOS's own eviction of Caches under disk pressure.
+    // Sized and cleared separately from the image cache.
+    private let filesDir: String
+
+    // Coalesces concurrent requests for the same attachment (double taps, cell
+    // reuse). Main thread only, like `inFlight`.
+    private var fileWaiters: [String: [(progress: ((Float) -> Void)?, completion: (String?) -> Void)]] = [:]
+
     private init() {
         let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
             ?? NSTemporaryDirectory()
         dir = (caches as NSString).appendingPathComponent("elementold-media")
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
+        let documents = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
+            ?? NSTemporaryDirectory()
+        filesDir = (documents as NSString).appendingPathComponent("elementold-files")
+        try? FileManager.default.createDirectory(atPath: filesDir, withIntermediateDirectories: true, attributes: nil)
         // Trim once at launch to reclaim space left by previous runs.
         trimQueue.async { [weak self] in self?.trimDiskCache() }
     }
@@ -338,6 +352,127 @@ class MediaCache {
             // download-write site above for the full explanation).
             (data as NSData).write(toFile: diskPath, atomically: true)
             self.scheduleTrim()
+        }
+    }
+
+    // MARK: - Attachments (m.file / m.video)
+
+    // Local path for an already-downloaded attachment, nil when it isn't on disk
+    // yet. One stat call — cheap enough for cellForRowAt.
+    func downloadedFilePath(mxc: String, filename: String, mimeType: String) -> String? {
+        guard let path = filePath(mxc: mxc, filename: filename, mimeType: mimeType) else { return nil }
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    // Streams an attachment straight to disk instead of buffering the whole body
+    // in memory the way fetchData does — a large attachment would otherwise be
+    // fatal on a 512MB device. Downloads land on a ".part" file and are renamed
+    // on success, so a kill mid-transfer can't leave a truncated file that later
+    // looks complete. progress and completion both arrive on the main thread.
+    func downloadFile(mxc: String, filename: String, mimeType: String,
+                      progress: ((Float) -> Void)?,
+                      completion: @escaping (String?) -> Void) {
+        guard let (server, mediaId) = parseMxc(mxc),
+              let path = filePath(mxc: mxc, filename: filename, mimeType: mimeType) else {
+            MediaCache.record("bad mxc (file): \(mxc)")
+            completion(nil)
+            return
+        }
+        if FileManager.default.fileExists(atPath: path) {
+            completion(path)
+            return
+        }
+        if fileWaiters[path] != nil {
+            fileWaiters[path]?.append((progress, completion))
+            return
+        }
+        guard let base = MatrixSession.homeserverURL, let token = MatrixSession.accessToken else {
+            MediaCache.record("no session (file) \(mediaId)")
+            completion(nil)
+            return
+        }
+        fileWaiters[path] = [(progress, completion)]
+
+        let partPath = path + ".part"
+        let url = base + "/_matrix/client/v1/media/download/\(server)/\(mediaId)"
+        CurlFetcher.downloadToFile(url: url,
+                                   headers: ["Authorization": "Bearer \(token)"],
+                                   outputPath: partPath,
+                                   progress: { [weak self] fraction in
+                                       for waiter in self?.fileWaiters[path] ?? [] {
+                                           waiter.progress?(fraction)
+                                       }
+                                   }) { [weak self] ok in
+            guard let self = self else { return }
+            let fm = FileManager.default
+            var succeeded = ok
+            if ok {
+                try? fm.removeItem(atPath: path)
+                do { try fm.moveItem(atPath: partPath, toPath: path) } catch { succeeded = false }
+            } else {
+                try? fm.removeItem(atPath: partPath)
+            }
+            MediaCache.record(succeeded ? "file ok \(mediaId)" : "file failed \(mediaId)")
+            let waiters = self.fileWaiters.removeValue(forKey: path) ?? []
+            for waiter in waiters { waiter.completion(succeeded ? path : nil) }
+        }
+    }
+
+    // Disk name is "<server>_<mediaId>.<ext>": unique per media, with the real
+    // extension preserved because the preview/open-in machinery infers the file
+    // type from it. The sender-supplied filename is untrusted and never used as
+    // a path component — only its extension, sanitized.
+    private func filePath(mxc: String, filename: String, mimeType: String) -> String? {
+        guard let (server, mediaId) = parseMxc(mxc) else { return nil }
+        let ext = fileExtension(filename: filename, mimeType: mimeType)
+        let name = sanitize("\(server)_\(mediaId)") + "." + ext
+        return (filesDir as NSString).appendingPathComponent(name)
+    }
+
+    // Extension for the on-disk copy: the original filename's, else the mime
+    // subtype when it's a plain short token ("pdf", "jpeg", "mp4"), else "bin".
+    private func fileExtension(filename: String, mimeType: String) -> String {
+        if let dot = filename.lastIndex(of: "."), dot < filename.index(before: filename.endIndex) {
+            let candidate = String(filename[filename.index(after: dot)...])
+            return sanitize(String(candidate.prefix(8)))
+        }
+        if let slash = mimeType.lastIndex(of: "/"), slash < mimeType.index(before: mimeType.endIndex) {
+            let subtype = String(mimeType[mimeType.index(after: slash)...])
+            let isPlain = subtype.count <= 8 && subtype.allSatisfy { $0.isLetter || $0.isNumber }
+            if isPlain { return sanitize(subtype) }
+        }
+        return "bin"
+    }
+
+    // Total bytes + file count of downloaded attachments (Documents), separate
+    // from the image cache. Computed on trimQueue; completion on the main thread.
+    func filesUsage(completion: @escaping (_ bytes: UInt64, _ files: Int) -> Void) {
+        trimQueue.async {
+            let fm = FileManager.default
+            var total: UInt64 = 0
+            var count = 0
+            if let names = try? fm.contentsOfDirectory(atPath: self.filesDir) {
+                for name in names {
+                    let path = (self.filesDir as NSString).appendingPathComponent(name)
+                    guard let attrs = try? fm.attributesOfItem(atPath: path) else { continue }
+                    total += (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+                    count += 1
+                }
+            }
+            DispatchQueue.main.async { completion(total, count) }
+        }
+    }
+
+    // Deletes every downloaded attachment. completion on the main thread.
+    func clearFiles(completion: @escaping () -> Void) {
+        trimQueue.async {
+            let fm = FileManager.default
+            if let names = try? fm.contentsOfDirectory(atPath: self.filesDir) {
+                for name in names {
+                    try? fm.removeItem(atPath: (self.filesDir as NSString).appendingPathComponent(name))
+                }
+            }
+            DispatchQueue.main.async { completion() }
         }
     }
 

@@ -146,13 +146,15 @@ class CurlFetcher {
     // Download url -> local file with progress, on the dedicated download queue;
     // completion on the main thread. Used by DownloadManager.
     static func downloadToFile(url: String,
+                               headers: [String: String] = [:],
                                outputPath: String,
                                progress: ((Float) -> Void)?,
                                completion: @escaping (Bool) -> Void) {
         let fetcher = CurlFetcher()
         retain(fetcher)
         CurlFetcher.downloadQueue.async {
-            let ok = fetcher.syncDownload(url: url, outputPath: outputPath, progress: progress)
+            let ok = fetcher.syncDownload(url: url, headers: headers,
+                                          outputPath: outputPath, progress: progress)
             DispatchQueue.main.async {
                 release(fetcher)
                 completion(ok)
@@ -279,7 +281,8 @@ class CurlFetcher {
 
     // No CURLOPT_TIMEOUT (secs: 0 = unbounded) — movie downloads can run far longer
     // than an API call, and a total-time cap would abort a large file mid-transfer.
-    private func syncDownload(url: String, outputPath: String, progress: ((Float) -> Void)?) -> Bool {
+    private func syncDownload(url: String, headers: [String: String],
+                              outputPath: String, progress: ((Float) -> Void)?) -> Bool {
         _ = CurlFetcher.curlGlobalInit
         let h = curl_bridge_init()
         defer { curl_bridge_cleanup(h) }
@@ -297,6 +300,13 @@ class CurlFetcher {
         curl_bridge_set_timeout(h, 0)
         curl_bridge_set_write_fn(h, curlFileWriteCallback, boxPtr)
         if progress != nil { curl_bridge_set_progress_fn(h, curlProgressCallback, boxPtr) }
+
+        var headerList: UnsafeMutableRawPointer?
+        for (k, v) in headers {
+            "\(k): \(v)".withCString { headerList = curl_bridge_headers_append(headerList, $0) }
+        }
+        if headerList != nil { curl_bridge_set_headers(h, headerList) }
+        defer { if headerList != nil { curl_bridge_headers_free(headerList) } }
 
         let rc = curl_bridge_perform(h)
         fh.closeFile()

@@ -13,6 +13,17 @@ class UserSettingsVC: UIViewController {
     private var cacheFiles: Int = 0
     private var cacheLoading = true
 
+    // Same, for downloaded attachments (Documents/elementold-files), which are
+    // kept outside the media cache so they survive its automatic trimming.
+    private var filesBytes: UInt64 = 0
+    private var filesCount: Int = 0
+    private var filesLoading = true
+
+    // Tags distinguishing the two confirmation sheets on the iOS 6 path, where
+    // a single UIActionSheetDelegate handles both.
+    private let cacheSheetTag = 81
+    private let filesSheetTag = 82
+
     // Matrix client for the profile (display name) API, plus the current
     // display name once fetched.
     private let client = MatrixSession.makeAPIClient()
@@ -49,6 +60,15 @@ class UserSettingsVC: UIViewController {
             self.cacheLoading = false
             self.reloadCacheRow()
         }
+        filesLoading = true
+        reloadFilesRow()
+        MediaCache.shared.filesUsage { [weak self] bytes, files in
+            guard let self = self else { return }
+            self.filesBytes = bytes
+            self.filesCount = files
+            self.filesLoading = false
+            self.reloadFilesRow()
+        }
     }
 
     private func reloadCacheRow() {
@@ -56,6 +76,11 @@ class UserSettingsVC: UIViewController {
         // Storage is section 2 (0 = Account, 1 = Notifications). Reloading the
         // wrong row here previously left "Cache used" stuck showing "…".
         tableView.reloadRows(at: [IndexPath(row: 0, section: 2)], with: .none)
+    }
+
+    private func reloadFilesRow() {
+        guard isViewLoaded else { return }
+        tableView.reloadRows(at: [IndexPath(row: 1, section: 2)], with: .none)
     }
 
     @objc private func notificationsToggled(_ sw: UISwitch) {
@@ -86,6 +111,7 @@ class UserSettingsVC: UIViewController {
         sheet.addButton(withTitle: "Cancel")         // index 1
         sheet.destructiveButtonIndex = 0
         sheet.cancelButtonIndex = 1
+        sheet.tag = cacheSheetTag
         sheet.delegate = self
         sheet.show(in: view)
         _ = title
@@ -101,6 +127,36 @@ class UserSettingsVC: UIViewController {
 
     private func performClearCache() {
         MediaCache.shared.clear { [weak self] in
+            self?.refreshUsage()
+        }
+    }
+
+    private func confirmClearDownloads() {
+        let title = "Delete downloads?"
+        let message = "This deletes every attachment you've downloaded. They can be downloaded again."
+#if IOS6_TARGET
+        let sheet = UIActionSheet()
+        sheet.title = message
+        sheet.addButton(withTitle: "Delete Downloads")   // index 0 (destructive)
+        sheet.addButton(withTitle: "Cancel")             // index 1
+        sheet.destructiveButtonIndex = 0
+        sheet.cancelButtonIndex = 1
+        sheet.tag = filesSheetTag
+        sheet.delegate = self
+        sheet.show(in: view)
+        _ = title
+#else
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Delete Downloads", style: .destructive) { [weak self] _ in
+            self?.performClearDownloads()
+        })
+        present(alert, animated: true)
+#endif
+    }
+
+    private func performClearDownloads() {
+        MediaCache.shared.clearFiles { [weak self] in
             self?.refreshUsage()
         }
     }
@@ -201,7 +257,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         switch section {
         case 0: return 1                     // display name
         case 1: return 1                     // notifications toggle
-        case 2: return 2                     // cache usage + reset
+        case 2: return 4                     // cache usage, downloads usage, reset, delete
         default:
             // Diagnostics: crash-log toggle row (+ a copy row when expanded),
             // only when a crash was actually recorded.
@@ -241,24 +297,28 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             return cell
         }
 
-        // Section 2: Storage.
+        // Section 2: Storage — cache usage, downloads usage, then their actions.
         if indexPath.section == 2 {
-            if indexPath.row == 0 {
+            if indexPath.row <= 1 {
+                let isCache = indexPath.row == 0
                 let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
                     UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
-                cell.textLabel?.text = "Cache used"
+                cell.textLabel?.text = isCache ? "Cache used" : "Downloads"
                 cell.textLabel?.textColor = .black
                 cell.textLabel?.textAlignment = .left
-                cell.detailTextLabel?.text = cacheLoading
+                let loading = isCache ? cacheLoading : filesLoading
+                let bytes = isCache ? cacheBytes : filesBytes
+                let count = isCache ? cacheFiles : filesCount
+                cell.detailTextLabel?.text = loading
                     ? "\u{2026}"
-                    : "\(humanSize(cacheBytes)) (\(cacheFiles) file\(cacheFiles == 1 ? "" : "s"))"
+                    : "\(humanSize(bytes)) (\(count) file\(count == 1 ? "" : "s"))"
                 cell.selectionStyle = .none
                 cell.accessoryType = .none
                 return cell
             }
             let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
                 UITableViewCell(style: .default, reuseIdentifier: cellId)
-            cell.textLabel?.text = "Reset Cache"
+            cell.textLabel?.text = indexPath.row == 2 ? "Reset Cache" : "Delete Downloads"
             cell.textLabel?.textColor = UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
             cell.textLabel?.textAlignment = .center
             cell.selectionStyle = .default
@@ -296,7 +356,8 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         case 1:
             break                                   // toggle handled by the switch
         case 2:
-            if indexPath.row == 1 { confirmClearCache() }
+            if indexPath.row == 2 { confirmClearCache() }
+            if indexPath.row == 3 { confirmClearDownloads() }
         default:
             if indexPath.row == 0 {
                 crashExpanded.toggle()
@@ -311,7 +372,10 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
 #if IOS6_TARGET
 extension UserSettingsVC: UIActionSheetDelegate {
     func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
-        if buttonIndex == actionSheet.destructiveButtonIndex {
+        guard buttonIndex == actionSheet.destructiveButtonIndex else { return }
+        if actionSheet.tag == filesSheetTag {
+            performClearDownloads()
+        } else {
             performClearCache()
         }
     }
