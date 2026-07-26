@@ -1,4 +1,5 @@
 import UIKit
+import ImageIO
 
 // Downloads + caches Matrix media (mxc:// URIs) for inline image display.
 //
@@ -137,12 +138,16 @@ class MediaCache {
         }
         let key = sanitize("\(server)_\(mediaId)_full")
         let path = "/_matrix/client/v1/media/download/\(server)/\(mediaId)"
-        load(key: key, urlPath: path, timeout: 60, completion: completion)
+        // Only the full download carries the original bytes, so it's the only
+        // place a GIF can be animated — the thumbnail endpoint returns a single
+        // flattened frame whatever the source was.
+        load(key: key, urlPath: path, timeout: 60, animated: true, completion: completion)
     }
 
     // MARK: - Shared load path (memory → disk → network)
 
-    private func load(key: String, urlPath: String, timeout: Int, completion: @escaping (UIImage?) -> Void) {
+    private func load(key: String, urlPath: String, timeout: Int, animated: Bool = false,
+                      completion: @escaping (UIImage?) -> Void) {
         // Compact identifier for the diagnostic log: drop the long common endpoint
         // prefix so each line reads just "thumbnail/server/id?wxh". Recorded for
         // EVERY source (mem/disk/network) so the "Diagnostics" row shows one line
@@ -157,8 +162,10 @@ class MediaCache {
         let diskPath = (dir as NSString).appendingPathComponent(key)
         ioQueue.async { [weak self] in
             guard let self = self else { return }
-            if let data = FileManager.default.contents(atPath: diskPath), let img = UIImage(data: data) {
-                self.memory.setObject(img, forKey: key as NSString, cost: data.count)
+            if let data = FileManager.default.contents(atPath: diskPath),
+               let img = MediaCache.decode(data, animated: animated) {
+                self.memory.setObject(img, forKey: key as NSString,
+                                      cost: MediaCache.memoryCost(img, dataCount: data.count))
                 DispatchQueue.main.async {
                     MediaCache.record("disk hit (\(data.count)B \(MediaCache.dims(img))) \(tag)")
                     completion(img)
@@ -189,7 +196,7 @@ class MediaCache {
                     guard let self = self else { return }
                     // Hand the one result to every completion that coalesced onto this key.
                     let waiters = self.inFlight.removeValue(forKey: key) ?? []
-                    guard let data = data, let img = UIImage(data: data) else {
+                    guard let data = data, let img = MediaCache.decode(data, animated: animated) else {
                         // Record WHY this failed so the user-settings "Diagnostics" row can
                         // show it on a device with no attached console. nil data == the
                         // transport itself failed (connect/TLS/timeout); non-nil-but-not-an-
@@ -205,7 +212,8 @@ class MediaCache {
                         return
                     }
                     MediaCache.record("ok (\(data.count)B \(MediaCache.dims(img))) \(tag)")
-                    self.memory.setObject(img, forKey: key as NSString, cost: data.count)
+                    self.memory.setObject(img, forKey: key as NSString,
+                                          cost: MediaCache.memoryCost(img, dataCount: data.count))
                     self.ioQueue.async {
                         // Path-based NSData write. The Swift `Data.write(to: URL)`
                         // overlay HANGS indefinitely on the swapped 5.1.5 runtime
@@ -221,6 +229,87 @@ class MediaCache {
                 }
             }
         }
+    }
+
+    // MARK: - Decoding (incl. animated GIF)
+
+    // An animated GIF costs one decoded bitmap PER FRAME, so it has to be
+    // bounded: a 480x270 clip at 100 frames is ~52 MB in memory (against a 20 MB
+    // cache budget) even though it's a couple of MB on the wire. Past these
+    // limits we keep the frames decoded so far and drop the rest — a truncated
+    // loop is a far better outcome than an out-of-memory kill on a 4S.
+    private static let maxGifFrames = 120
+    private static let maxGifPixels = 12 * 1024 * 1024
+
+    // UIImage(data:) only ever yields the FIRST frame of a GIF, which is why
+    // these render frozen. `animated` is set only for the full-size download
+    // (the viewer); everywhere else we deliberately keep the cheap static path.
+    private static func decode(_ data: Data, animated: Bool) -> UIImage? {
+        if animated, isGIF(data), let gif = animatedGIF(data) { return gif }
+        return UIImage(data: data)
+    }
+
+    // Sniff the GIF87a/GIF89a magic rather than trusting the sender-supplied
+    // info.mimetype, which is arbitrary text from another client.
+    private static func isGIF(_ data: Data) -> Bool {
+        guard data.count >= 6 else { return false }
+        let magic = [UInt8](data.prefix(3))
+        return magic == [0x47, 0x49, 0x46]   // "GIF"
+    }
+
+    // ImageIO (iOS 4+) is the only GIF frame decoder available to us;
+    // UIImage.animatedImage(with:duration:) is iOS 5+. A UIImageView plays such
+    // an image on its own the moment it's assigned, so no timer is needed and
+    // the viewer needs no changes.
+    private static func animatedGIF(_ data: Data) -> UIImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let count = CGImageSourceGetCount(source)
+        // A single-frame GIF is just an image — let the normal path handle it.
+        guard count > 1 else { return nil }
+
+        var frames: [UIImage] = []
+        var duration: Double = 0
+        var pixels = 0
+        for i in 0..<min(count, maxGifFrames) {
+            guard let cg = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
+            pixels += cg.width * cg.height
+            if pixels > maxGifPixels && !frames.isEmpty { break }
+            frames.append(UIImage(cgImage: cg))
+            duration += frameDelay(source: source, index: i)
+        }
+        guard frames.count > 1 else { return nil }
+        // Some GIFs declare no delay at all; ~10 fps is the usual browser default.
+        if duration <= 0 { duration = Double(frames.count) * 0.1 }
+        return UIImage.animatedImage(with: frames, duration: duration)
+    }
+
+    // Per-frame delay in seconds. The unclamped value is the file's real intent;
+    // the clamped one is what browsers enforce, and is all some encoders write.
+    // Numbers out of a bridged dictionary must go through NSNumber — `as? Double`
+    // silently fails on this runtime.
+    private static func frameDelay(source: CGImageSource, index: Int) -> Double {
+        guard let props = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [String: Any],
+              let gif = props[kCGImagePropertyGIFDictionary as String] as? [String: Any] else {
+            return 0.1
+        }
+        var delay = (gif[kCGImagePropertyGIFUnclampedDelayTime as String] as? NSNumber)?.doubleValue ?? 0
+        if delay <= 0 {
+            delay = (gif[kCGImagePropertyGIFDelayTime as String] as? NSNumber)?.doubleValue ?? 0
+        }
+        // A 0/1-hundredth delay means "as fast as possible", which every renderer
+        // reads as ~10 fps rather than a busy loop.
+        return delay < 0.02 ? 0.1 : delay
+    }
+
+    // What an entry really occupies in the NSCache budget. Charging the
+    // compressed byte count is close enough for a still, but under-bills an
+    // animation by ~25x — enough of them would sit in a 20 MB cache to exhaust
+    // the device's RAM instead.
+    private static func memoryCost(_ image: UIImage, dataCount: Int) -> Int {
+        guard let frames = image.images, !frames.isEmpty else { return dataCount }
+        let scale = image.scale
+        let perFrame = Int(image.size.width * scale * image.size.height * scale) * 4
+        return max(dataCount, perFrame * frames.count)
     }
 
     // MARK: - Audio (voice messages)
