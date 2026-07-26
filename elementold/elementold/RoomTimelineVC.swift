@@ -1,6 +1,7 @@
 import UIKit
 import AVFoundation
 import AudioToolbox
+import MediaPlayer
 
 // Room timeline: renders m.room.message + membership events, backfills older
 // history on scroll-up, sends new messages via PUT .../send/m.room.message/{txnId}.
@@ -110,6 +111,11 @@ class RoomTimelineVC: UIViewController {
     // In-flight attachment downloads (mxc -> 0...1), so a recycled or scrolled-in
     // cell can show the current progress.
     private var fileProgress: [String: Float] = [:]
+    // Retained for the duration of a preview / open-in menu: UIDocumentInteractionController
+    // is not held by the system while it presents, so a local `let` would be
+    // deallocated before the preview appears. Same for the movie player.
+    private var docController: UIDocumentInteractionController?
+    private var moviePlayerVC: MPMoviePlayerViewController?
     // mxc URIs we've already kicked a thumbnail prefetch for, so we prime each
     // image exactly once (on first appearance in `events`) rather than re-hitting
     // the cache — and re-logging a diagnostic line — on every table reload.
@@ -1399,7 +1405,7 @@ class RoomTimelineVC: UIViewController {
 
     private func handleFileTap(mxc: String, filename: String, mimeType: String) {
         if let path = MediaCache.shared.downloadedFilePath(mxc: mxc, filename: filename, mimeType: mimeType) {
-            showFileAlert(title: "Saved", message: "\(filename)\n\n\(path)")
+            openDownloadedFile(path: path, filename: filename, mimeType: mimeType)
             return
         }
         guard fileProgress[mxc] == nil else { return }   // already downloading
@@ -1419,13 +1425,82 @@ class RoomTimelineVC: UIViewController {
             guard let self = self else { return }
             self.fileProgress.removeValue(forKey: mxc)
             let cell = self.visibleFileCell(for: mxc)
-            if path != nil {
+            if let path = path {
                 cell?.markDownloaded()
+                // The download was started by an explicit tap, so open it right
+                // away — unless the timeline has since been dismissed, in which
+                // case presenting anything would be presenting off-screen.
+                if self.view.window != nil {
+                    self.openDownloadedFile(path: path, filename: filename, mimeType: mimeType)
+                }
             } else {
                 cell?.setProgress(nil)
                 self.showFileAlert(title: "Download failed", message: filename)
             }
         }
+    }
+
+    // MARK: - Opening a downloaded attachment
+
+    private func openDownloadedFile(path: String, filename: String, mimeType: String) {
+        if isVideo(filename: filename, mimeType: mimeType) {
+            playVideo(path: path)
+            return
+        }
+        // Quick Look renders plain text unreliably on this OS — it can sit on a
+        // spinner forever instead of failing — so show text ourselves.
+        if isText(filename: filename, mimeType: mimeType) {
+            let viewer = TextFileViewerVC(path: path, filename: filename)
+            navigationController?.pushViewController(viewer, animated: true)
+            return
+        }
+        // UIDocumentInteractionController (iOS 3.2+) gives us Quick Look preview
+        // for the formats iOS knows (PDF, images, text, iWork/Office docs) and an
+        // "Open in…" hand-off to another app for everything else.
+        let controller = UIDocumentInteractionController(url: URL(fileURLWithPath: path))
+        controller.delegate = self
+        controller.name = filename          // preview title shows the real filename
+        docController = controller
+        if controller.presentPreview(animated: true) { return }
+        if controller.presentOpenInMenu(from: view.bounds, in: view, animated: true) { return }
+        docController = nil
+        showFileAlert(title: "Can't open",
+                      message: "No app on this device can open \(filename). It's saved at:\n\n\(path)")
+    }
+
+    private func playVideo(path: String) {
+        // MPMoviePlayerViewController is the only full-screen player available on
+        // iOS 6 (AVPlayerViewController is iOS 8+).
+        guard let player = MPMoviePlayerViewController(contentURL: URL(fileURLWithPath: path)) else { return }
+        moviePlayerVC = player
+        present(player, animated: true, completion: nil)
+    }
+
+    // Quick Look can stumble on video, and a movie is better served by a real
+    // player anyway, so route it away from the preview path. Falls back to the
+    // filename extension when the sender omitted `info.mimetype`.
+    private func isVideo(filename: String, mimeType: String) -> Bool {
+        if mimeType.hasPrefix("video/") { return true }
+        guard mimeType.isEmpty else { return false }
+        let ext = RoomTimelineVC.fileExtension(of: filename)
+        return ext == "mp4" || ext == "mov" || ext == "m4v" || ext == "3gp" || ext == "avi"
+    }
+
+    private func isText(filename: String, mimeType: String) -> Bool {
+        // text/html is deliberately excluded: Quick Look renders it as a page,
+        // which is more useful than showing the markup.
+        if mimeType.hasPrefix("text/") && mimeType != "text/html" { return true }
+        if mimeType == "application/json" || mimeType == "application/xml" { return true }
+        guard mimeType.isEmpty else { return false }
+        let ext = RoomTimelineVC.fileExtension(of: filename)
+        return ext == "txt" || ext == "log" || ext == "md" || ext == "csv"
+            || ext == "json" || ext == "xml"
+    }
+
+    private static func fileExtension(of filename: String) -> String {
+        guard let dot = filename.lastIndex(of: "."),
+              dot < filename.index(before: filename.endIndex) else { return "" }
+        return String(filename[filename.index(after: dot)...]).lowercased()
     }
 
     private func visibleFileCell(for mxc: String) -> FileEventCell? {
@@ -2458,6 +2533,71 @@ extension RoomTimelineVC: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         stopAudioPlayback()
         refreshAudioCells()
+    }
+}
+
+extension RoomTimelineVC: UIDocumentInteractionControllerDelegate {
+    func documentInteractionControllerViewControllerForPreview(
+        _ controller: UIDocumentInteractionController) -> UIViewController {
+        return self
+    }
+
+    func documentInteractionControllerDidEndPreview(_ controller: UIDocumentInteractionController) {
+        docController = nil
+    }
+
+    func documentInteractionControllerDidDismissOpenInMenu(_ controller: UIDocumentInteractionController) {
+        docController = nil
+    }
+}
+
+// MARK: - Text attachment viewer
+
+// Shows a downloaded text attachment in a plain read-only UITextView. Exists
+// because Quick Look (UIDocumentInteractionController) hangs on a spinner for
+// text files on this runtime. Kept in this file to avoid a pbxproj round-trip.
+class TextFileViewerVC: UIViewController {
+
+    // Text attachments are usually tiny, but a multi-megabyte log would take a
+    // UITextView down with it — read a bounded prefix and say so.
+    private static let maxBytes = 512 * 1024
+
+    private let path: String
+
+    init(path: String, filename: String) {
+        self.path = path
+        super.init(nibName: nil, bundle: nil)
+        title = filename
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .white
+
+        let textView = UITextView(frame: view.bounds)
+        textView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        textView.isEditable = false
+        textView.font = UIFont.systemFont(ofSize: 14)
+        textView.text = TextFileViewerVC.readText(path: path)
+        view.addSubview(textView)
+    }
+
+    // FileManager.contents(atPath:) rather than Data(contentsOf:) — the URL-based
+    // read hangs on the 5.1.5 runtime.
+    private static func readText(path: String) -> String {
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return "Couldn't read this file."
+        }
+        let truncated = data.count > maxBytes
+        let slice = truncated ? data.subdata(in: 0..<maxBytes) : data
+        // Latin-1 never fails, so it's a safe last resort for a file that isn't
+        // valid UTF-8 (a Windows-authored .txt, say).
+        let text = String(data: slice, encoding: .utf8)
+            ?? String(data: slice, encoding: .isoLatin1)
+            ?? ""
+        if text.isEmpty { return "This file has no readable text." }
+        return truncated ? text + "\n\n\u{2026} (truncated)" : text
     }
 }
 

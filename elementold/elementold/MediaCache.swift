@@ -429,13 +429,38 @@ class MediaCache {
         return (filesDir as NSString).appendingPathComponent(name)
     }
 
-    // Extension for the on-disk copy: the original filename's, else the mime
-    // subtype when it's a plain short token ("pdf", "jpeg", "mp4"), else "bin".
+    // Mime types whose subtype isn't a usable extension. Getting this right
+    // matters: the preview machinery infers the file type from the extension,
+    // and an unknown one ("…​.plain") leaves Quick Look spinning forever.
+    private static let mimeExtensions: [String: String] = [
+        "text/plain": "txt",
+        "text/markdown": "md",
+        "text/csv": "csv",
+        "text/html": "html",
+        "application/json": "json",
+        "application/xml": "xml",
+        "text/xml": "xml",
+        "image/jpeg": "jpg",
+        "image/svg+xml": "svg",
+        "audio/mpeg": "mp3",
+        "audio/mp4": "m4a",
+        "video/quicktime": "mov",
+        "application/msword": "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "application/vnd.ms-excel": "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+        "application/zip": "zip",
+    ]
+
+    // Extension for the on-disk copy: the original filename's, else a known
+    // mapping for the mime type, else the mime subtype when it's a plain short
+    // token ("pdf", "mp4"), else "bin".
     private func fileExtension(filename: String, mimeType: String) -> String {
         if let dot = filename.lastIndex(of: "."), dot < filename.index(before: filename.endIndex) {
             let candidate = String(filename[filename.index(after: dot)...])
             return sanitize(String(candidate.prefix(8)))
         }
+        if let mapped = MediaCache.mimeExtensions[mimeType.lowercased()] { return mapped }
         if let slash = mimeType.lastIndex(of: "/"), slash < mimeType.index(before: mimeType.endIndex) {
             let subtype = String(mimeType[mimeType.index(after: slash)...])
             let isPlain = subtype.count <= 8 && subtype.allSatisfy { $0.isLetter || $0.isNumber }
