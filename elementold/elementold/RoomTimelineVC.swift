@@ -96,6 +96,10 @@ class RoomTimelineVC: UIViewController {
     // Event the long-press → "React" action will annotate (nil for rows that
     // can't carry a reaction: date separators, receipts, membership notices).
     private var pendingReactionEventId: String?
+    // Event the long-press → "Delete" action will redact. Only ever our own
+    // messages: redacting someone else's needs a moderator power level, which
+    // we neither check nor expose.
+    private var pendingDeleteEventId: String?
 
     // Voice-message recording. The input bar swaps between a text mode and a
     // voice mode (Cancel / Record-Stop / Send). AVAudioRecorder + AVAudioSession
@@ -179,9 +183,10 @@ class RoomTimelineVC: UIViewController {
     private let dateCellId = "DateCell"
     private let reactionsCellId = "ReactionsCell"
 
-    // Tags the emoji picker on the iOS 6 path, where one UIActionSheetDelegate
-    // serves both it and the "+" attach sheet.
+    // Tags the emoji picker and the delete confirmation on the iOS 6 path, where
+    // one UIActionSheetDelegate serves them and the "+" attach sheet.
     private let reactionSheetTag = 93
+    private let deleteSheetTag = 94
 
     // Offered by the long-press "React" menu item. All Unicode 6.0, so they
     // exist in the Apple Color Emoji font shipped with iOS 6.
@@ -373,7 +378,7 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
-    // MARK: - Long-press menu (Copy / React)
+    // MARK: - Long-press menu (Copy / React / Delete)
 
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began else { return }
@@ -383,6 +388,7 @@ class RoomTimelineVC: UIViewController {
         let row = rows[indexPath.row]
         pendingCopyText = copyText(for: row)
         pendingReactionEventId = reactableEventId(for: row)
+        pendingDeleteEventId = deletableEventId(for: row)
         // Nothing to offer for a date/receipt separator.
         guard pendingCopyText != nil || pendingReactionEventId != nil else { return }
 
@@ -390,9 +396,15 @@ class RoomTimelineVC: UIViewController {
         becomeFirstResponder()
         let menu = UIMenuController.shared
         // menuItems is global state, so set it every time rather than once —
-        // otherwise "React" lingers on a row that can't be reacted to.
-        menu.menuItems = pendingReactionEventId == nil ? nil
-            : [UIMenuItem(title: "React", action: #selector(reactMenuTapped(_:)))]
+        // otherwise "React"/"Delete" linger on a row that can't take them.
+        var items: [UIMenuItem] = []
+        if pendingReactionEventId != nil {
+            items.append(UIMenuItem(title: "React", action: #selector(reactMenuTapped(_:))))
+        }
+        if pendingDeleteEventId != nil {
+            items.append(UIMenuItem(title: "Delete", action: #selector(deleteMenuTapped(_:))))
+        }
+        menu.menuItems = items.isEmpty ? nil : items
         let cellRect = tableView.rectForRow(at: indexPath)
         menu.setTargetRect(tableView.convert(cellRect, to: view), in: view)
         menu.setMenuVisible(true, animated: true)
@@ -406,6 +418,15 @@ class RoomTimelineVC: UIViewController {
         case .message, .image, .audio, .file: return eventRow.event.eventId
         case .membership, .reaction, .redaction: return nil
         }
+    }
+
+    // Our own message in this row, if any — the only thing we offer to delete.
+    // Redacting anyone else's message requires a moderator power level; rather
+    // than fetch and interpret m.room.power_levels, we simply don't offer it.
+    private func deletableEventId(for row: Row) -> String? {
+        guard case .event(let eventRow) = row,
+              RoomTimelineVC.senderOf(eventRow.event) == MatrixSession.userId else { return nil }
+        return eventRow.event.eventId
     }
 
     // Copyable text for a row (message body, image caption, or membership line);
@@ -429,11 +450,52 @@ class RoomTimelineVC: UIViewController {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        // Only Copy / React — no cut/paste/etc. in this menu, and each only when
-        // the long-pressed row actually supports it.
+        // Only Copy / React / Delete — no cut/paste/etc. in this menu, and each
+        // only when the long-pressed row actually supports it.
         if action == #selector(UIResponder.copy(_:)) { return pendingCopyText != nil }
         if action == #selector(reactMenuTapped(_:)) { return pendingReactionEventId != nil }
+        if action == #selector(deleteMenuTapped(_:)) { return pendingDeleteEventId != nil }
         return false
+    }
+
+    // MARK: - Delete own message
+
+    @objc private func deleteMenuTapped(_ sender: Any?) {
+        guard pendingDeleteEventId != nil else { return }
+        UIMenuController.shared.setMenuVisible(false, animated: true)
+        #if IOS6_TARGET
+        let sheet = UIActionSheet()
+        sheet.title = "Delete this message?"
+        sheet.delegate = self
+        sheet.tag = deleteSheetTag
+        sheet.destructiveButtonIndex = sheet.addButton(withTitle: "Delete")
+        sheet.cancelButtonIndex = sheet.addButton(withTitle: "Cancel")
+        sheet.show(in: view)
+        #else
+        let sheet = UIAlertController(title: "Delete this message?", message: nil,
+                                      preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            self?.deleteConfirmed()
+        })
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+        sheet.popoverPresentationController?.sourceView = view
+        sheet.popoverPresentationController?.sourceRect = view.bounds
+        present(sheet, animated: true, completion: nil)
+        #endif
+    }
+
+    // Deleting a message in Matrix means redacting it: the server strips the
+    // content and echoes an m.room.redaction back through /sync, which
+    // rebuildRows() then drops from the timeline. No local echo here either —
+    // the message disappears once that redaction arrives.
+    private func deleteConfirmed() {
+        guard let eventId = pendingDeleteEventId else { return }
+        let path = "/_matrix/client/v3/rooms/\(room.roomId)/redact/\(eventId)/\(newTxnId())"
+        client.put(path, body: [:]) { [weak self] _, error in
+            if let error = error {
+                self?.showAlert(title: "Delete failed", message: "\(error)")
+            }
+        }
     }
 
     // MARK: - Reactions
@@ -929,13 +991,18 @@ class RoomTimelineVC: UIViewController {
         var lastDayKey: String?
         var prevEvent: RoomEvent?
 
-        // Reactions annotate other events rather than occupying a row, so fold
-        // them up front: which keys were used on each target, in first-seen
-        // order, how many people used each, and which one is ours.
+        // Everything a redaction took back — a deleted message as much as an
+        // un-done reaction. (A message already redacted before we fetched it
+        // arrives with empty content and is dropped at ingestion by
+        // RoomEvent.parse; this covers the ones redacted while we're watching.)
         var redacted = Set<String>()
         for event in events {
             if case .redaction(let target) = event.kind { redacted.insert(target) }
         }
+
+        // Reactions annotate other events rather than occupying a row, so fold
+        // them up front: which keys were used on each target, in first-seen
+        // order, how many people used each, and which one is ours.
         var keyOrder: [String: [String]] = [:]
         var keyCounts: [String: [String: Int]] = [:]
         var mine: [String: [String: String]] = [:]
@@ -971,6 +1038,9 @@ class RoomTimelineVC: UIViewController {
             case .reaction, .redaction: continue
             default: break
             }
+            // A message deleted (redacted) since we loaded it leaves the
+            // timeline entirely, along with any reactions that hung off it.
+            if redacted.contains(event.eventId) { continue }
             var dayChanged = false
             if event.timestamp > 0 {
                 let key = TimeFormat.dayKey(msSinceEpoch: event.timestamp)
@@ -1589,7 +1659,7 @@ class RoomTimelineVC: UIViewController {
                 }
             } else {
                 cell?.setProgress(nil)
-                self.showFileAlert(title: "Download failed", message: filename)
+                self.showAlert(title: "Download failed", message: filename)
             }
         }
     }
@@ -1618,7 +1688,7 @@ class RoomTimelineVC: UIViewController {
         if controller.presentPreview(animated: true) { return }
         if controller.presentOpenInMenu(from: view.bounds, in: view, animated: true) { return }
         docController = nil
-        showFileAlert(title: "Can't open",
+        showAlert(title: "Can't open",
                       message: "No app on this device can open \(filename). It's saved at:\n\n\(path)")
     }
 
@@ -1664,7 +1734,7 @@ class RoomTimelineVC: UIViewController {
         return nil
     }
 
-    private func showFileAlert(title: String, message: String) {
+    private func showAlert(title: String, message: String) {
 #if IOS6_TARGET
         let alert = UIAlertView()
         alert.title = title
@@ -2711,6 +2781,10 @@ extension RoomTimelineVC: UIActionSheetDelegate {
                   let key = actionSheet.buttonTitle(at: buttonIndex),
                   let target = pendingReactionEventId else { return }
             toggleReaction(target: target, key: key)
+            return
+        }
+        if actionSheet.tag == deleteSheetTag {
+            if buttonIndex == actionSheet.destructiveButtonIndex { deleteConfirmed() }
             return
         }
         // Map by title, not index: the button set is dynamic (camera row is
