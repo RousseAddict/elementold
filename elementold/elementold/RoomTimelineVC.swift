@@ -1760,22 +1760,26 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
                 let bodyHeight = textHeight(text, font: UIFont.systemFont(ofSize: 15), width: bodyWidth)
                 let bubbleHeight = bodyHeight + EventCell.innerPadding * 2
-                let metaBlock: CGFloat = eventRow.showMeta ? EventCell.metaHeight + EventCell.metaGap : 0
-                let topMargin = eventRow.showMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+                let hasMeta = hasMetaHeader(eventRow)
+                let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
+                let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
                 return topMargin + metaBlock + bubbleHeight + EventCell.bottomMargin
             case .image(_, _, _, let w, let h):
                 let maxBubbleWidth = width * EventCell.bubbleWidthFraction
                 let imageSize = ImageEventCell.displaySize(imageWidth: w, imageHeight: h, maxWidth: maxBubbleWidth)
-                let metaBlock: CGFloat = eventRow.showMeta ? EventCell.metaHeight + EventCell.metaGap : 0
-                let topMargin = eventRow.showMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+                let hasMeta = hasMetaHeader(eventRow)
+                let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
+                let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
                 return topMargin + metaBlock + imageSize.height + EventCell.bottomMargin
             case .audio:
-                let metaBlock: CGFloat = eventRow.showMeta ? EventCell.metaHeight + EventCell.metaGap : 0
-                let topMargin = eventRow.showMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+                let hasMeta = hasMetaHeader(eventRow)
+                let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
+                let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
                 return topMargin + metaBlock + AudioEventCell.bubbleHeight + EventCell.bottomMargin
             case .file:
-                let metaBlock: CGFloat = eventRow.showMeta ? EventCell.metaHeight + EventCell.metaGap : 0
-                let topMargin = eventRow.showMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+                let hasMeta = hasMetaHeader(eventRow)
+                let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
+                let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
                 return topMargin + metaBlock + FileEventCell.bubbleHeight + EventCell.bottomMargin
             case .membership:
                 return 30
@@ -1799,6 +1803,27 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         // ID ("@alice:server" -> "alice") when we have no display name yet —
         // never the raw Matrix identifier.
         return memberNames[sender] ?? shortName(sender)
+    }
+
+    // Whether the row actually draws a meta header. The cells lay themselves out
+    // from `meta != nil`, not from showMeta, and metaText returns nil for own
+    // messages and emotes — so a height computed off showMeta alone reserved
+    // metaHeight + metaGap (plus the taller group-start top margin) for a header
+    // that never got drawn, leaving an empty gap above every own group-start.
+    private func hasMetaHeader(_ eventRow: EventRow) -> Bool {
+        guard eventRow.showMeta else { return false }
+        switch eventRow.event.kind {
+        case .message(let sender, _, let isEmote):
+            return metaText(sender: sender, isOwn: sender == MatrixSession.userId,
+                            isEmote: isEmote) != nil
+        case .image(let sender, _, _, _, _),
+             .audio(let sender, _, _, _),
+             .file(let sender, _, _, _, _):
+            return metaText(sender: sender, isOwn: sender == MatrixSession.userId,
+                            isEmote: false) != nil
+        case .membership, .reaction, .redaction:
+            return false
+        }
     }
 
     private func textHeight(_ text: String, font: UIFont, width: CGFloat) -> CGFloat {
