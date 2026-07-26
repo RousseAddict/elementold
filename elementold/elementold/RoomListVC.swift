@@ -160,6 +160,14 @@ class RoomListVC: UIViewController {
         // Background notifications (gated by the Settings kill switch; off by
         // default → this listener is a no-op and no background work is taken).
         NotificationManager.shared.syncEngine = syncEngine
+        // Let notifications name senders the way the timeline does, and name the
+        // room the way this list does, from the state we've already merged. Safe
+        // to read here: this listener is registered after ours, so handleSync
+        // above has already run for the same response on the same thread.
+        NotificationManager.shared.contextResolver = { [weak self] roomId, userId in
+            guard let room = self?.roomsById[roomId] else { return (nil, nil) }
+            return (room.memberNames[userId], room.name)
+        }
         syncEngine.addUpdateListener { json, isInitial in
             NotificationManager.shared.handleSync(json, isInitial: isInitial)
         }

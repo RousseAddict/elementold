@@ -33,6 +33,19 @@ final class NotificationManager {
     // expires, so the OS doesn't kill us for overrunning.
     weak var syncEngine: SyncEngine?
 
+    // How a message should be labelled: the sender's display name within the
+    // room, and the room's own name. Set by RoomListVC so we reuse the very
+    // state the room list and timeline already hold (Room.memberNames /
+    // Room.name, merged across syncs) instead of re-parsing membership here — an
+    // incremental sync usually carries no member state at all, so parsing only
+    // the current response would leave us with nothing to resolve. Both come
+    // from one Room lookup.
+    //
+    // Called on the /sync thread, right after RoomListVC has merged this
+    // response into its rooms: its update listener is registered before ours and
+    // they run in order on the same thread, so the names are already current.
+    var contextResolver: ((_ roomId: String, _ userId: String) -> (sender: String?, room: String?))?
+
     private var bgTask: UIBackgroundTaskIdentifier = UIBackgroundTaskIdentifier.invalid
     private var isBackground = false
 
@@ -136,8 +149,8 @@ final class NotificationManager {
         guard let rooms = json["rooms"] as? [String: Any],
               let join = rooms["join"] as? [String: Any] else { return }
 
-        var pending: [(name: String, body: String)] = []
-        for (_, rawRoom) in join {
+        var pending: [(name: String, room: String?, body: String)] = []
+        for (roomId, rawRoom) in join {
             if pending.count >= maxPerSync { break }
             guard let roomJSON = rawRoom as? [String: Any],
                   let timeline = roomJSON["timeline"] as? [String: Any],
@@ -149,7 +162,16 @@ final class NotificationManager {
                 if let selfId = selfId, sender == selfId { continue }   // skip own messages
                 let content = ev["content"] as? [String: Any]
                 let body = (content?["body"] as? String) ?? "New message"
-                pending.append((NotificationManager.localpart(sender), body))
+                // Display name when we know one, the Matrix ID's localpart
+                // otherwise — never the raw "@alice:server.tld".
+                var name = NotificationManager.localpart(sender)
+                var roomName: String?
+                if let sender = sender {
+                    let context = contextResolver?(roomId, sender)
+                    if let resolved = context?.sender, !resolved.isEmpty { name = resolved }
+                    roomName = context?.room
+                }
+                pending.append((name, roomName, body))
             }
         }
         guard !pending.isEmpty else { return }
@@ -157,16 +179,32 @@ final class NotificationManager {
         DispatchQueue.main.async { [weak self] in
             guard let self = self, NotificationManager.isEnabled, self.isBackground else { return }
             guard UIApplication.shared.applicationState != .active else { return }
-            for msg in pending { self.postNotification(name: msg.name, body: msg.body) }
+            for msg in pending {
+                self.postNotification(name: msg.name, room: msg.room, body: msg.body)
+            }
         }
     }
 
     // Must be called on the main thread only (see handleSync).
-    private func postNotification(name: String, body: String) {
+    private func postNotification(name: String, room: String?, body: String) {
         let note = UILocalNotification()
-        note.alertBody = name.isEmpty ? body : "\(name): \(body)"
+        note.alertBody = NotificationManager.alertBody(name: name, room: room, body: body)
         note.soundName = UILocalNotificationDefaultSoundName
         UIApplication.shared.presentLocalNotificationNow(note)
+    }
+
+    // "Alice · Standup: on my way" in a named room, plain "Alice: on my way" in a
+    // DM. The room name is dropped when it just repeats the sender (Room.parse
+    // names a DM after the other member, so it would read "Alice · Alice") and
+    // when it's still the fallback room id (an unnamed room we've seen no
+    // m.room.name for), which would be noise. A banner only shows about a line
+    // before truncating, so anything that doesn't disambiguate is worth omitting.
+    private static func alertBody(name: String, room: String?, body: String) -> String {
+        var title = name
+        if let room = room, !room.isEmpty, room != name, !room.hasPrefix("!") {
+            title = title.isEmpty ? room : "\(name) \u{00B7} \(room)"
+        }
+        return title.isEmpty ? body : "\(title): \(body)"
     }
 
     // "@alice:server.tld" -> "alice". Pure Swift (no NSString range selectors,
