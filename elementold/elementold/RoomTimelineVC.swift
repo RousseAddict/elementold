@@ -3,6 +3,15 @@ import AVFoundation
 import AudioToolbox
 import MediaPlayer
 
+// One reaction chip: an emoji, how many people sent it, and — when we're one of
+// them — the event id of our own m.reaction, which a redaction needs to take it
+// back. File scope rather than nested so ReactionsCell can see it too.
+private struct ReactionItem {
+    let key: String
+    let count: Int
+    let mineEventId: String?
+}
+
 // Room timeline: renders m.room.message + membership events, backfills older
 // history on scroll-up, sends new messages via PUT .../send/m.room.message/{txnId}.
 // No optimistic local echo: a sent message appears once the next /sync response
@@ -84,6 +93,9 @@ class RoomTimelineVC: UIViewController {
 
     // Text queued for copying by the long-press → UIMenuController "Copy" action.
     private var pendingCopyText: String?
+    // Event the long-press → "React" action will annotate (nil for rows that
+    // can't carry a reaction: date separators, receipts, membership notices).
+    private var pendingReactionEventId: String?
 
     // Voice-message recording. The input bar swaps between a text mode and a
     // voice mode (Cancel / Record-Stop / Send). AVAudioRecorder + AVAudioSession
@@ -146,13 +158,35 @@ class RoomTimelineVC: UIViewController {
         // A right-aligned "Seen" marker placed under the latest own message a
         // peer has read.
         case receipt(String)
+        // A strip of reaction chips under the message they annotate.
+        case reactions(ReactionRow)
+    }
+    private struct ReactionRow {
+        let targetEventId: String
+        let items: [ReactionItem]
+        let isOwn: Bool
     }
     private var rows: [Row] = []
+
+    // target event id -> reaction key -> OUR reaction's event id, rebuilt with
+    // the rows. Lets a tap tell "add" from "take back" (which needs the event
+    // id to redact) without re-scanning `events`.
+    private var myReactions: [String: [String: String]] = [:]
 
     private let cellId = "EventCell"
     private let imageCellId = "ImageEventCell"
     private let membershipCellId = "MembershipCell"
     private let dateCellId = "DateCell"
+    private let reactionsCellId = "ReactionsCell"
+
+    // Tags the emoji picker on the iOS 6 path, where one UIActionSheetDelegate
+    // serves both it and the "+" attach sheet.
+    private let reactionSheetTag = 93
+
+    // Offered by the long-press "React" menu item. All Unicode 6.0, so they
+    // exist in the Apple Color Emoji font shipped with iOS 6.
+    fileprivate static let quickReactions = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}",
+                                             "\u{1F62E}", "\u{1F622}", "\u{1F389}"]
 
     init(room: Room, client: MatrixAPIClient, syncEngine: SyncEngine) {
         self.room = room
@@ -339,22 +373,39 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
-    // MARK: - Long-press to copy
+    // MARK: - Long-press menu (Copy / React)
 
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began else { return }
         let point = gesture.location(in: tableView)
         guard let indexPath = tableView.indexPathForRow(at: point) else { return }
         guard indexPath.row < rows.count else { return }
-        guard let text = copyText(for: rows[indexPath.row]) else { return }
-        pendingCopyText = text
+        let row = rows[indexPath.row]
+        pendingCopyText = copyText(for: row)
+        pendingReactionEventId = reactableEventId(for: row)
+        // Nothing to offer for a date/receipt separator.
+        guard pendingCopyText != nil || pendingReactionEventId != nil else { return }
 
-        // A UIMenuController needs a first responder to route the copy action to.
+        // A UIMenuController needs a first responder to route its actions to.
         becomeFirstResponder()
         let menu = UIMenuController.shared
+        // menuItems is global state, so set it every time rather than once —
+        // otherwise "React" lingers on a row that can't be reacted to.
+        menu.menuItems = pendingReactionEventId == nil ? nil
+            : [UIMenuItem(title: "React", action: #selector(reactMenuTapped(_:)))]
         let cellRect = tableView.rectForRow(at: indexPath)
         menu.setTargetRect(tableView.convert(cellRect, to: view), in: view)
         menu.setMenuVisible(true, animated: true)
+    }
+
+    // Reactions attach to real messages only — not to membership lines or the
+    // date/receipt separators.
+    private func reactableEventId(for row: Row) -> String? {
+        guard case .event(let eventRow) = row else { return nil }
+        switch eventRow.event.kind {
+        case .message, .image, .audio, .file: return eventRow.event.eventId
+        case .membership, .reaction, .redaction: return nil
+        }
     }
 
     // Copyable text for a row (message body, image caption, or membership line);
@@ -367,6 +418,7 @@ class RoomTimelineVC: UIViewController {
         case .audio(_, _, _, let caption): return caption.isEmpty ? nil : caption
         case .file(_, _, let filename, _, _): return filename
         case .membership(let description): return description
+        case .reaction, .redaction: return nil
         }
     }
 
@@ -377,8 +429,55 @@ class RoomTimelineVC: UIViewController {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        // Only "Copy" — no cut/paste/etc. in this menu.
-        return action == #selector(UIResponder.copy(_:))
+        // Only Copy / React — no cut/paste/etc. in this menu, and each only when
+        // the long-pressed row actually supports it.
+        if action == #selector(UIResponder.copy(_:)) { return pendingCopyText != nil }
+        if action == #selector(reactMenuTapped(_:)) { return pendingReactionEventId != nil }
+        return false
+    }
+
+    // MARK: - Reactions
+
+    @objc private func reactMenuTapped(_ sender: Any?) {
+        guard let target = pendingReactionEventId else { return }
+        UIMenuController.shared.setMenuVisible(false, animated: true)
+        #if IOS6_TARGET
+        let sheet = UIActionSheet()
+        sheet.title = "React"
+        sheet.delegate = self
+        sheet.tag = reactionSheetTag
+        for key in RoomTimelineVC.quickReactions { sheet.addButton(withTitle: key) }
+        sheet.cancelButtonIndex = sheet.addButton(withTitle: "Cancel")
+        sheet.show(in: view)
+        #else
+        let sheet = UIAlertController(title: "React", message: nil, preferredStyle: .actionSheet)
+        for key in RoomTimelineVC.quickReactions {
+            sheet.addAction(UIAlertAction(title: key, style: .default) { [weak self] _ in
+                self?.toggleReaction(target: target, key: key)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+        sheet.popoverPresentationController?.sourceView = view
+        sheet.popoverPresentationController?.sourceRect = view.bounds
+        present(sheet, animated: true, completion: nil)
+        #endif
+    }
+
+    // Add the reaction, or take ours back if we already sent this one. Matrix has
+    // no "unreact" event: removing a reaction means redacting the m.reaction we
+    // sent. As everywhere else here there's no local echo — the chip updates when
+    // the next /sync carries the event back.
+    private func toggleReaction(target: String, key: String) {
+        if let mine = myReactions[target]?[key] {
+            let path = "/_matrix/client/v3/rooms/\(room.roomId)/redact/\(mine)/\(newTxnId())"
+            client.put(path, body: [:]) { _, _ in }
+        } else {
+            let path = "/_matrix/client/v3/rooms/\(room.roomId)/send/m.reaction/\(newTxnId())"
+            let body: [String: Any] = ["m.relates_to": ["rel_type": "m.annotation",
+                                                        "event_id": target,
+                                                        "key": key]]
+            client.put(path, body: body) { _, _ in }
+        }
     }
 
     // MARK: - Swipe-to-reveal timestamps
@@ -405,6 +504,7 @@ class RoomTimelineVC: UIViewController {
             (cell as? ImageEventCell)?.setRevealOffset(offset)
             (cell as? AudioEventCell)?.setRevealOffset(offset)
             (cell as? FileEventCell)?.setRevealOffset(offset)
+            (cell as? ReactionsCell)?.setRevealOffset(offset)
         }
     }
 
@@ -759,7 +859,14 @@ class RoomTimelineVC: UIViewController {
         }
 
         let tableChanged = !newOnes.isEmpty || receiptsChanged
-        let hasNewMessages = !newOnes.isEmpty
+        // Annotations redraw the chips but shouldn't yank the view to the bottom
+        // or move our read marker onto a reaction event.
+        let hasNewMessages = newOnes.contains { event in
+            switch event.kind {
+            case .reaction, .redaction: return false
+            default: return true
+            }
+        }
         if tableChanged || typingChanged {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -771,7 +878,12 @@ class RoomTimelineVC: UIViewController {
                 if typingChanged { self.updateTypingIndicator() }
             }
         }
-        if hasNewMessages, let latest = events.last {
+        if hasNewMessages, let latest = events.last(where: { event in
+            switch event.kind {
+            case .reaction, .redaction: return false
+            default: return true
+            }
+        }) {
             sendReadReceipt(for: latest.eventId)
         }
     }
@@ -816,6 +928,30 @@ class RoomTimelineVC: UIViewController {
         var result: [Row] = []
         var lastDayKey: String?
         var prevEvent: RoomEvent?
+
+        // Reactions annotate other events rather than occupying a row, so fold
+        // them up front: which keys were used on each target, in first-seen
+        // order, how many people used each, and which one is ours.
+        var redacted = Set<String>()
+        for event in events {
+            if case .redaction(let target) = event.kind { redacted.insert(target) }
+        }
+        var keyOrder: [String: [String]] = [:]
+        var keyCounts: [String: [String: Int]] = [:]
+        var mine: [String: [String: String]] = [:]
+        for event in events {
+            guard case .reaction(let sender, let target, let key) = event.kind,
+                  !redacted.contains(event.eventId) else { continue }
+            if keyCounts[target]?[key] == nil {
+                keyOrder[target] = (keyOrder[target] ?? []) + [key]
+            }
+            keyCounts[target, default: [:]][key, default: 0] += 1
+            if sender == MatrixSession.userId {
+                mine[target, default: [:]][key] = event.eventId
+            }
+        }
+        myReactions = mine
+
         // The most recent of OUR own messages that a peer has read — a single
         // "Seen" marker goes under it.
         var seenEventId: String?
@@ -827,6 +963,14 @@ class RoomTimelineVC: UIViewController {
             // (Content-less/blank messages are already dropped at ingestion in
             // RoomEvent.parse, so they never reach here to create empty-bubble
             // gaps or break same-sender grouping.)
+            //
+            // Annotations were folded above; skipping them before any of the
+            // day-separator / grouping bookkeeping keeps them from splitting a
+            // same-sender run or emitting a stray date header.
+            switch event.kind {
+            case .reaction, .redaction: continue
+            default: break
+            }
             var dayChanged = false
             if event.timestamp > 0 {
                 let key = TimeFormat.dayKey(msSinceEpoch: event.timestamp)
@@ -848,6 +992,15 @@ class RoomTimelineVC: UIViewController {
                 }
             }
             result.append(.event(EventRow(event: event, showMeta: showMeta)))
+            if let keys = keyOrder[event.eventId] {
+                let items = keys.map {
+                    ReactionItem(key: $0,
+                                 count: keyCounts[event.eventId]?[$0] ?? 0,
+                                 mineEventId: mine[event.eventId]?[$0])
+                }
+                result.append(.reactions(ReactionRow(targetEventId: event.eventId, items: items,
+                                                     isOwn: RoomTimelineVC.senderOf(event) == MatrixSession.userId)))
+            }
             if event.eventId == seenEventId {
                 result.append(.receipt("Seen"))
             }
@@ -864,7 +1017,8 @@ class RoomTimelineVC: UIViewController {
         case .image(let sender, _, _, _, _): return sender
         case .audio(let sender, _, _, _): return sender
         case .file(let sender, _, _, _, _): return sender
-        case .membership: return nil
+        // Annotations never become rows, so they have no grouping sender.
+        case .membership, .reaction, .redaction: return nil
         }
     }
 
@@ -1596,6 +1750,8 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
             return EventCell.dateRowHeight
         case .receipt:
             return 18
+        case .reactions(let reactionRow):
+            return ReactionsCell.height(items: reactionRow.items, width: width)
         case .event(let eventRow):
             switch eventRow.event.kind {
             case .message(let sender, let body, let isEmote):
@@ -1623,6 +1779,10 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 return topMargin + metaBlock + FileEventCell.bubbleHeight + EventCell.bottomMargin
             case .membership:
                 return 30
+            case .reaction, .redaction:
+                // Folded into a .reactions row / consumed by rebuildRows; never
+                // reaches the table as an event row.
+                return 0
             }
         }
     }
@@ -1677,6 +1837,15 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
             cell.textLabel?.textAlignment = .right
             // Sit clear of the swipe-reveal timestamp gutter on the right edge.
             cell.textLabel?.text = text + "   "
+            return cell
+
+        case .reactions(let reactionRow):
+            let cell = (tableView.dequeueReusableCell(withIdentifier: reactionsCellId) as? ReactionsCell) ??
+                ReactionsCell(style: .default, reuseIdentifier: reactionsCellId)
+            cell.configure(items: reactionRow.items, isOwn: reactionRow.isOwn)
+            cell.setRevealOffset(revealOffset)
+            let target = reactionRow.targetEventId
+            cell.onTapKey = { [weak self] key in self?.toggleReaction(target: target, key: key) }
             return cell
 
         case .event(let eventRow):
@@ -1757,6 +1926,11 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 cell.textLabel?.textAlignment = .center
                 cell.textLabel?.text = description
                 return cell
+
+            case .reaction, .redaction:
+                // Never emitted as an event row (see rebuildRows) — satisfy the
+                // switch without inventing a cell for it.
+                return UITableViewCell(style: .default, reuseIdentifier: nil)
             }
         }
     }
@@ -2507,6 +2681,13 @@ extension RoomTimelineVC: UIImagePickerControllerDelegate, UINavigationControlle
 #if IOS6_TARGET
 extension RoomTimelineVC: UIActionSheetDelegate {
     func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
+        if actionSheet.tag == reactionSheetTag {
+            guard buttonIndex != actionSheet.cancelButtonIndex,
+                  let key = actionSheet.buttonTitle(at: buttonIndex),
+                  let target = pendingReactionEventId else { return }
+            toggleReaction(target: target, key: key)
+            return
+        }
         // Map by title, not index: the button set is dynamic (camera row is
         // conditional) so a fixed index would break when Voice Message shifted it.
         switch actionSheet.buttonTitle(at: buttonIndex) {
@@ -2548,6 +2729,143 @@ extension RoomTimelineVC: UIDocumentInteractionControllerDelegate {
 
     func documentInteractionControllerDidDismissOpenInMenu(_ controller: UIDocumentInteractionController) {
         docController = nil
+    }
+}
+
+// MARK: - Reaction chips
+
+// A strip of reaction chips ("👍 3") sitting under the message they annotate,
+// aligned with that message's bubble. Tapping a chip adds our reaction, or takes
+// it back when we already sent that key.
+private class ReactionsCell: UITableViewCell {
+    static let chipHeight: CGFloat = 22
+    static let chipGap: CGFloat = 4          // between chips on the same line
+    static let rowGap: CGFloat = 2           // between wrapped lines
+    static let topGap: CGFloat = 1           // above the strip (bubble sits right there)
+    static let bottomGap: CGFloat = 4
+    static let chipHPadding: CGFloat = 8
+    static let font = UIFont.systemFont(ofSize: 13)
+
+    private var chips: [UIButton] = []
+    private var items: [ReactionItem] = []
+    private var isOwnMessage = false
+    private var revealOffset: CGFloat = 0
+
+    var onTapKey: ((String) -> Void)?
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(items: [ReactionItem], isOwn: Bool) {
+        self.items = items
+        isOwnMessage = isOwn
+        // Rebuild the buttons: the chip set changes with every reaction, so
+        // recycling individual buttons buys nothing but bookkeeping.
+        chips.forEach { $0.removeFromSuperview() }
+        chips = items.enumerated().map { index, item in
+            let button = UIButton(type: .custom)
+            button.tag = index
+            button.titleLabel?.font = ReactionsCell.font
+            button.setTitle(ReactionsCell.chipTitle(item), for: .normal)
+            button.setTitleColor(item.mineEventId != nil
+                                    ? UIColor(red: 0.0, green: 0.35, blue: 0.75, alpha: 1.0) : .darkGray,
+                                 for: .normal)
+            // Ours reads as "selected": tinted fill + matching border.
+            button.backgroundColor = item.mineEventId != nil
+                ? UIColor(red: 0.85, green: 0.91, blue: 1.0, alpha: 1.0)
+                : UIColor(white: 0.90, alpha: 1.0)
+            button.layer.cornerRadius = ReactionsCell.chipHeight / 2
+            button.layer.borderWidth = 1
+            button.layer.borderColor = (item.mineEventId != nil
+                ? UIColor(red: 0.35, green: 0.6, blue: 0.95, alpha: 1.0)
+                : UIColor(white: 0.78, alpha: 1.0)).cgColor
+            button.addTarget(self, action: #selector(chipTapped(_:)), for: .touchUpInside)
+            contentView.addSubview(button)
+            return button
+        }
+        setNeedsLayout()
+    }
+
+    func setRevealOffset(_ offset: CGFloat) {
+        guard offset != revealOffset else { return }
+        revealOffset = offset
+        setNeedsLayout()
+        layoutIfNeeded()
+    }
+
+    @objc private func chipTapped(_ sender: UIButton) {
+        guard sender.tag >= 0 && sender.tag < items.count else { return }
+        onTapKey?(items[sender.tag].key)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let width = contentView.bounds.width
+        let (frames, _) = ReactionsCell.layout(items: items, width: width)
+        // Others' chips line up with the bubble (past the avatar gutter); ours
+        // are mirrored to the right edge, line by line, so wrapped lines stay
+        // flush right the way the bubbles above them do.
+        let leftStart = EventCell.outerMargin + EventCell.senderGutter
+        for (index, frame) in frames.enumerated() where index < chips.count {
+            var f = frame
+            if isOwnMessage {
+                let lineWidth = ReactionsCell.lineWidth(frames: frames, y: frame.origin.y)
+                f.origin.x = width - EventCell.outerMargin - lineWidth + frame.origin.x
+            } else {
+                f.origin.x = leftStart + frame.origin.x
+            }
+            f.origin.x -= revealOffset
+            chips[index].frame = f
+        }
+    }
+
+    static func height(items: [ReactionItem], width: CGFloat) -> CGFloat {
+        return layout(items: items, width: width).1
+    }
+
+    // Shared by height() and layoutSubviews so the two can't drift apart (the
+    // same discipline EventCell follows). Frames are laid out from x=0; the
+    // caller shifts them to the left gutter or the right edge.
+    private static func layout(items: [ReactionItem], width: CGFloat) -> ([CGRect], CGFloat) {
+        let available = max(40, width - EventCell.outerMargin * 2 - EventCell.senderGutter)
+        var frames: [CGRect] = []
+        var x: CGFloat = 0
+        var y: CGFloat = topGap
+        for item in items {
+            let chipWidth = min(available, textWidth(chipTitle(item)) + chipHPadding * 2)
+            if x > 0 && x + chipWidth > available {
+                x = 0
+                y += chipHeight + rowGap
+            }
+            frames.append(CGRect(x: x, y: y, width: chipWidth, height: chipHeight))
+            x += chipWidth + chipGap
+        }
+        return (frames, y + chipHeight + bottomGap)
+    }
+
+    private static func lineWidth(frames: [CGRect], y: CGFloat) -> CGFloat {
+        var maxX: CGFloat = 0
+        for frame in frames where frame.origin.y == y { maxX = max(maxX, frame.maxX) }
+        return maxX
+    }
+
+    private static func chipTitle(_ item: ReactionItem) -> String {
+        return item.count > 1 ? "\(item.key) \(item.count)" : item.key
+    }
+
+    // UILabel.sizeThatFits rather than any NSString sizing API — those are
+    // iOS 7+ selectors on this runtime.
+    private static let sizingLabel = UILabel()
+    private static func textWidth(_ text: String) -> CGFloat {
+        sizingLabel.font = font
+        sizingLabel.text = text
+        return ceil(sizingLabel.sizeThatFits(CGSize(width: 10000, height: chipHeight)).width)
     }
 }
 

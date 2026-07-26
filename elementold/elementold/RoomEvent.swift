@@ -88,6 +88,13 @@ struct RoomEvent {
         // `info` (empty/0 when the sender omitted them).
         case file(sender: String, mxc: String, filename: String, mimeType: String, sizeBytes: Int)
         case membership(description: String)
+        // An m.reaction annotation. Never a row of its own — the timeline folds
+        // these into a chip strip under the message they target.
+        case reaction(sender: String, targetEventId: String, key: String)
+        // An m.room.redaction. Also not a row: it's only consulted to drop a
+        // reaction that was taken back. Redacted *messages* arrive with empty
+        // content and are already dropped by the blank-body check below.
+        case redaction(targetEventId: String)
     }
 
     let eventId: String
@@ -150,6 +157,25 @@ struct RoomEvent {
             if !isEmote, RoomEvent.isBlank(body) { return nil }
             return RoomEvent(eventId: eventId,
                               kind: .message(sender: sender, body: body, isEmote: isEmote),
+                              timestamp: timestamp)
+
+        case "m.reaction":
+            guard let content = json["content"] as? [String: Any],
+                  let relates = content["m.relates_to"] as? [String: Any],
+                  relates["rel_type"] as? String == "m.annotation",
+                  let target = relates["event_id"] as? String,
+                  let key = relates["key"] as? String, !key.isEmpty else { return nil }
+            return RoomEvent(eventId: eventId,
+                              kind: .reaction(sender: sender, targetEventId: target, key: key),
+                              timestamp: timestamp)
+
+        case "m.room.redaction":
+            // `redacts` sits at the top level up to room version 10 and moved
+            // into content in v11 — accept either.
+            let target = (json["redacts"] as? String)
+                ?? ((json["content"] as? [String: Any])?["redacts"] as? String)
+            guard let redacted = target else { return nil }
+            return RoomEvent(eventId: eventId, kind: .redaction(targetEventId: redacted),
                               timestamp: timestamp)
 
         case "m.room.member":
