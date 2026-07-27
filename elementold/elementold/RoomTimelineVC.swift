@@ -58,6 +58,14 @@ class RoomTimelineVC: UIViewController {
     // table shrinks by its height so it never covers the last message.
     private var typingLabel: UILabel!
     private let typingBarHeight: CGFloat = 22
+
+    // "Replying to Alice: …" strip, docked between the typing strip and the input
+    // bar while a reply is queued. Like the typing strip, the table shrinks by
+    // its height so it never covers the newest message.
+    private var replyBar: UIView!
+    private var replyLabel: UILabel!
+    private var replyCancelButton: UIButton!
+    private let replyBarHeight: CGFloat = 30
     private var typingUsers: [String] = []
     // Throttle for our own outbound typing notices (PUT .../typing/{userId}) so
     // each keystroke doesn't fire a request — resent at most every few seconds
@@ -100,6 +108,17 @@ class RoomTimelineVC: UIViewController {
     // messages: redacting someone else's needs a moderator power level, which
     // we neither check nor expose.
     private var pendingDeleteEventId: String?
+    // Event the long-press → "Reply" action will answer. Any message, from
+    // anyone — unlike Delete, which is our own messages only.
+    private var pendingReplyTargetId: String?
+
+    // The reply the composer currently has queued (set by a rightward swipe or
+    // the long-press "Reply" item, cleared on send / cancel). The sender and
+    // one-line preview are kept alongside it because the outbound reply fallback
+    // quotes them, and the strip above the input bar displays them.
+    private var replyingToEventId: String?
+    private var replyingToSender: String?
+    private var replyingToPreview: String?
 
     // Voice-message recording. The input bar swaps between a text mode and a
     // voice mode (Cancel / Record-Stop / Send). AVAudioRecorder + AVAudioSession
@@ -147,11 +166,25 @@ class RoomTimelineVC: UIViewController {
     // view mid-swipe match, and it animates back to 0 when the swipe ends.
     private var revealOffset: CGFloat = 0
 
+    // A rightward drag on that same pan gesture pulls the bubbles the other way
+    // and, once it passes `replyTriggerDistance`, queues a reply to the row the
+    // drag started on. The target event is captured at .began (the touch point
+    // travels during the drag, and a /sync reload could reshuffle the rows
+    // underneath it), and `replySwipeArmed` latches so releasing anywhere fires.
+    private static let maxReplyPull: CGFloat = 56
+    private static let replyTriggerDistance: CGFloat = 44
+    private var replySwipeEventId: String?
+    private var replySwipeArmed = false
+
     // A message row that knows whether it's the first of a same-sender group
     // (and therefore shows a meta header). Precomputed in rebuildRows().
     private struct EventRow {
         let event: RoomEvent
         let showMeta: Bool
+        // Set when an m.replace edit targets this event: the replacement text,
+        // resolved once in rebuildRows so the height calculation and the cell
+        // can never disagree about what's being displayed.
+        let editedBody: String?
     }
 
     // The flat list actually rendered: message/membership events interleaved
@@ -176,6 +209,10 @@ class RoomTimelineVC: UIViewController {
     // the rows. Lets a tap tell "add" from "take back" (which needs the event
     // id to redact) without re-scanning `events`.
     private var myReactions: [String: [String: String]] = [:]
+
+    // Every loaded event by id, rebuilt with the rows. Lets a reply resolve the
+    // message it answers without a linear scan of `events` per row.
+    private var eventsById: [String: RoomEvent] = [:]
 
     private let cellId = "EventCell"
     private let imageCellId = "ImageEventCell"
@@ -218,6 +255,7 @@ class RoomTimelineVC: UIViewController {
 
         setupTitleView()
         buildInputBar()
+        buildReplyBar()
         buildTypingLabel()
         buildTableView()
         buildStatusLabel()
@@ -378,7 +416,7 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
-    // MARK: - Long-press menu (Copy / React / Delete)
+    // MARK: - Long-press menu (Reply / Copy / React / Delete)
 
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began else { return }
@@ -389,6 +427,7 @@ class RoomTimelineVC: UIViewController {
         pendingCopyText = copyText(for: row)
         pendingReactionEventId = reactableEventId(for: row)
         pendingDeleteEventId = deletableEventId(for: row)
+        pendingReplyTargetId = replyableEventId(for: row)
         // Nothing to offer for a date/receipt separator.
         guard pendingCopyText != nil || pendingReactionEventId != nil else { return }
 
@@ -398,6 +437,9 @@ class RoomTimelineVC: UIViewController {
         // menuItems is global state, so set it every time rather than once —
         // otherwise "React"/"Delete" linger on a row that can't take them.
         var items: [UIMenuItem] = []
+        if pendingReplyTargetId != nil {
+            items.append(UIMenuItem(title: "Reply", action: #selector(replyMenuTapped(_:))))
+        }
         if pendingReactionEventId != nil {
             items.append(UIMenuItem(title: "React", action: #selector(reactMenuTapped(_:))))
         }
@@ -416,7 +458,7 @@ class RoomTimelineVC: UIViewController {
         guard case .event(let eventRow) = row else { return nil }
         switch eventRow.event.kind {
         case .message, .image, .audio, .file: return eventRow.event.eventId
-        case .membership, .reaction, .redaction: return nil
+        case .membership, .reaction, .redaction, .edit: return nil
         }
     }
 
@@ -429,17 +471,29 @@ class RoomTimelineVC: UIViewController {
         return eventRow.event.eventId
     }
 
+    // Replies attach to real messages, from anyone — not to membership notices
+    // or the date/receipt/reaction separator rows.
+    private func replyableEventId(for row: Row) -> String? {
+        guard case .event(let eventRow) = row else { return nil }
+        switch eventRow.event.kind {
+        case .message, .image, .audio, .file: return eventRow.event.eventId
+        case .membership, .reaction, .redaction, .edit: return nil
+        }
+    }
+
     // Copyable text for a row (message body, image caption, or membership line);
     // nil for date/receipt separators (nothing to copy).
     private func copyText(for row: Row) -> String? {
         guard case .event(let eventRow) = row else { return nil }
         switch eventRow.event.kind {
-        case .message(_, let body, _): return body
+        // Copy what's actually on screen, which for an edited message is the
+        // replacement text rather than the original.
+        case .message(_, let body, _): return eventRow.editedBody ?? body
         case .image(_, let caption, _, _, _): return caption.isEmpty ? nil : caption
         case .audio(_, _, _, let caption): return caption.isEmpty ? nil : caption
         case .file(_, _, let filename, _, _): return filename
         case .membership(let description): return description
-        case .reaction, .redaction: return nil
+        case .reaction, .redaction, .edit: return nil
         }
     }
 
@@ -450,12 +504,77 @@ class RoomTimelineVC: UIViewController {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        // Only Copy / React / Delete — no cut/paste/etc. in this menu, and each
-        // only when the long-pressed row actually supports it.
+        // Only Reply / Copy / React / Delete — no cut/paste/etc. in this menu,
+        // and each only when the long-pressed row actually supports it.
+        if action == #selector(replyMenuTapped(_:)) { return pendingReplyTargetId != nil }
         if action == #selector(UIResponder.copy(_:)) { return pendingCopyText != nil }
         if action == #selector(reactMenuTapped(_:)) { return pendingReactionEventId != nil }
         if action == #selector(deleteMenuTapped(_:)) { return pendingDeleteEventId != nil }
         return false
+    }
+
+    // MARK: - Reply composer
+
+    @objc private func replyMenuTapped(_ sender: Any?) {
+        guard let eventId = pendingReplyTargetId else { return }
+        UIMenuController.shared.setMenuVisible(false, animated: true)
+        beginReply(to: eventId)
+    }
+
+    // Queues a reply to `eventId`: shows the "Replying to …" strip above the
+    // input bar and remembers the target's sender + one-line preview, which the
+    // outbound reply fallback quotes (see sendTapped).
+    private func beginReply(to eventId: String) {
+        // Voice mode has its own controls and send path, and replying is a text
+        // action — drop out of it first.
+        if inputMode == .voice { exitVoiceMode() }
+        replyingToEventId = eventId
+        // Normally loaded (the row is on screen), but a reply carrying only the
+        // relation and no quote is still perfectly valid, so don't refuse.
+        let source = eventsById[eventId]
+        replyingToSender = source.flatMap { RoomTimelineVC.senderOf($0) }
+        replyingToPreview = source.flatMap { RoomTimelineVC.previewText(for: $0) }
+        if let sender = replyingToSender {
+            let name = memberNames[sender] ?? shortName(sender)
+            let quote = RoomTimelineVC.oneLine(replyingToPreview ?? "", limit: 80)
+            replyLabel.text = "Replying to \(name): \(quote)"
+        } else {
+            replyLabel.text = "Replying to a message"
+        }
+        replyBar.isHidden = false
+        layoutInputBar()
+        messageField.becomeFirstResponder()
+    }
+
+    private func endReply() {
+        guard replyingToEventId != nil else { return }
+        replyingToEventId = nil
+        replyingToSender = nil
+        replyingToPreview = nil
+        replyBar.isHidden = true
+        layoutInputBar()
+    }
+
+    @objc private func replyCancelTapped() { endReply() }
+
+    // Collapses runs of whitespace/newlines into single spaces and truncates,
+    // for the one-line reply strip. Pure Swift
+    // stdlib on purpose (no Foundation trimming/replacing convenience APIs,
+    // which can bridge to iOS 7+ NSString selectors on this runtime).
+    private static func oneLine(_ text: String, limit: Int) -> String {
+        var out = ""
+        var lastWasSpace = true   // also drops any leading whitespace
+        for scalar in text.unicodeScalars {
+            if out.count >= limit { return out + "\u{2026}" }
+            if scalar == " " || scalar == "\n" || scalar == "\r" || scalar == "\t" {
+                if !lastWasSpace { out.append(" ") }
+                lastWasSpace = true
+            } else {
+                out.unicodeScalars.append(scalar)
+                lastWasSpace = false
+            }
+        }
+        return out
     }
 
     // MARK: - Delete own message
@@ -542,18 +661,45 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
-    // MARK: - Swipe-to-reveal timestamps
+    // MARK: - Horizontal swipe: timestamps (left) / reply (right)
 
     @objc private func handleReveal(_ gesture: UIPanGestureRecognizer) {
         switch gesture.state {
+        case .began:
+            // Note the row the drag starts on: the touch point moves as the
+            // finger travels, but a reply belongs to where it began.
+            let point = gesture.location(in: tableView)
+            if let indexPath = tableView.indexPathForRow(at: point), indexPath.row < rows.count {
+                replySwipeEventId = replyableEventId(for: rows[indexPath.row])
+            } else {
+                replySwipeEventId = nil
+            }
+            replySwipeArmed = false
         case .changed:
             let t = gesture.translation(in: tableView)
-            // Only a predominantly-horizontal, leftward drag reveals timestamps;
-            // otherwise let the table scroll normally.
+            // Only a predominantly-horizontal drag moves the bubbles; otherwise
+            // let the table scroll normally.
             guard abs(t.x) > abs(t.y) else { return }
-            setRevealOffset(min(EventCell.maxReveal, max(0, -t.x)))
+            if t.x > 0 {
+                // Rightward: pull the bubbles aside to reply. A NEGATIVE reveal
+                // offset reuses the very same per-cell translation as the
+                // timestamp reveal, and every cell hides its time label at
+                // offsets <= 0, so no timestamp shows on this side.
+                guard replySwipeEventId != nil else { return }
+                setRevealOffset(-min(RoomTimelineVC.maxReplyPull, t.x))
+                // Tracks the CURRENT distance rather than latching, so dragging
+                // back short of the threshold cancels the reply.
+                replySwipeArmed = t.x >= RoomTimelineVC.replyTriggerDistance
+            } else {
+                replySwipeArmed = false
+                setRevealOffset(min(EventCell.maxReveal, -t.x))
+            }
         case .ended, .cancelled, .failed:
+            let target = (gesture.state == .ended && replySwipeArmed) ? replySwipeEventId : nil
+            replySwipeArmed = false
+            replySwipeEventId = nil
             UIView.animate(withDuration: 0.2) { self.setRevealOffset(0) }
+            if let target = target { beginReply(to: target) }
         default:
             break
         }
@@ -628,6 +774,30 @@ class RoomTimelineVC: UIViewController {
         let vc = MemberListVC(room: room, client: client,
                               memberNames: memberNames, memberAvatars: memberAvatars)
         navigationController?.pushViewController(vc, animated: true)
+    }
+
+    // "Replying to …" strip; hidden unless a reply is queued. Sits directly above
+    // the input bar, positioned in layoutInputBar() like the typing strip. Added
+    // after the input bar so the table (inserted below the bar) can't cover it.
+    private func buildReplyBar() {
+        replyBar = UIView(frame: .zero)
+        replyBar.backgroundColor = UIColor(white: 0.90, alpha: 1.0)
+        replyBar.isHidden = true
+
+        replyLabel = UILabel(frame: .zero)
+        replyLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
+        replyLabel.font = UIFont.systemFont(ofSize: 12)
+        replyLabel.textColor = UIColor(white: 0.3, alpha: 1.0)
+        replyLabel.lineBreakMode = .byTruncatingTail
+        replyBar.addSubview(replyLabel)
+
+        replyCancelButton = UIButton(type: .system)
+        replyCancelButton.setTitle("\u{2715} Cancel", for: .normal)
+        replyCancelButton.titleLabel?.font = UIFont.systemFont(ofSize: 12)
+        replyCancelButton.addTarget(self, action: #selector(replyCancelTapped), for: .touchUpInside)
+        replyBar.addSubview(replyCancelButton)
+
+        view.addSubview(replyBar)
     }
 
     // Typing strip lives above the input bar; positioned in layoutInputBar().
@@ -768,18 +938,30 @@ class RoomTimelineVC: UIViewController {
                                             height: messageField.font!.lineHeight + 2)
         }
 
-        // Typing strip (if shown) sits just above the bar; the table shrinks to
-        // leave room for it so it never overlaps the newest message.
+        // Reply strip (if a reply is queued) sits directly above the bar, and the
+        // typing strip above that; the table shrinks by both so neither ever
+        // overlaps the newest message.
+        let replyVisible = replyBar != nil && !replyBar.isHidden
+        let replyH: CGFloat = replyVisible ? replyBarHeight : 0
+        if replyVisible {
+            replyBar.frame = CGRect(x: 0, y: barY - replyH, width: barWidth, height: replyH)
+            let cancelW: CGFloat = 76
+            replyLabel.frame = CGRect(x: hMargin, y: 0,
+                                      width: max(0, barWidth - hMargin * 2 - cancelW), height: replyH)
+            replyCancelButton.frame = CGRect(x: barWidth - hMargin - cancelW, y: 0,
+                                             width: cancelW, height: replyH)
+        }
+
         let typingVisible = !typingUsers.isEmpty
         let typingH: CGFloat = typingVisible ? typingBarHeight : 0
         if typingLabel != nil {
             typingLabel.isHidden = !typingVisible
-            typingLabel.frame = CGRect(x: hMargin, y: barY - typingH,
+            typingLabel.frame = CGRect(x: hMargin, y: barY - replyH - typingH,
                                        width: barWidth - hMargin * 2, height: typingH)
         }
 
         if isViewLoaded, tableView != nil {
-            tableView.frame.size.height = barY - typingH
+            tableView.frame.size.height = barY - replyH - typingH
         }
     }
 
@@ -921,11 +1103,11 @@ class RoomTimelineVC: UIViewController {
         }
 
         let tableChanged = !newOnes.isEmpty || receiptsChanged
-        // Annotations redraw the chips but shouldn't yank the view to the bottom
-        // or move our read marker onto a reaction event.
+        // Annotations and edits redraw existing rows but shouldn't yank the view
+        // to the bottom or move our read marker onto a non-message event.
         let hasNewMessages = newOnes.contains { event in
             switch event.kind {
-            case .reaction, .redaction: return false
+            case .reaction, .redaction, .edit: return false
             default: return true
             }
         }
@@ -942,7 +1124,7 @@ class RoomTimelineVC: UIViewController {
         }
         if hasNewMessages, let latest = events.last(where: { event in
             switch event.kind {
-            case .reaction, .redaction: return false
+            case .reaction, .redaction, .edit: return false
             default: return true
             }
         }) {
@@ -1000,15 +1182,38 @@ class RoomTimelineVC: UIViewController {
             if case .redaction(let target) = event.kind { redacted.insert(target) }
         }
 
+        var byId: [String: RoomEvent] = [:]
+        for event in events { byId[event.eventId] = event }
+        eventsById = byId
+
+        // Edits rewrite an existing bubble rather than adding one. Keep only the
+        // newest edit per target, and only from the target's own sender — the
+        // spec says an edit from anyone else is to be ignored.
+        var edits: [String: (timestamp: Double, body: String)] = [:]
+        for event in events {
+            guard case .edit(let sender, let target, let body) = event.kind,
+                  !redacted.contains(event.eventId),
+                  let original = byId[target],
+                  RoomTimelineVC.senderOf(original) == sender else { continue }
+            if let existing = edits[target], existing.timestamp >= event.timestamp { continue }
+            edits[target] = (event.timestamp, body)
+        }
+
         // Reactions annotate other events rather than occupying a row, so fold
         // them up front: which keys were used on each target, in first-seen
         // order, how many people used each, and which one is ours.
         var keyOrder: [String: [String]] = [:]
         var keyCounts: [String: [String: Int]] = [:]
         var mine: [String: [String: String]] = [:]
+        // Reactions we know were taken back, so the server's bundled totals
+        // (which may predate the redaction) can be corrected below.
+        var redactedCounts: [String: [String: Int]] = [:]
         for event in events {
-            guard case .reaction(let sender, let target, let key) = event.kind,
-                  !redacted.contains(event.eventId) else { continue }
+            guard case .reaction(let sender, let target, let key) = event.kind else { continue }
+            if redacted.contains(event.eventId) {
+                redactedCounts[target, default: [:]][key, default: 0] += 1
+                continue
+            }
             if keyCounts[target]?[key] == nil {
                 keyOrder[target] = (keyOrder[target] ?? []) + [key]
             }
@@ -1018,6 +1223,26 @@ class RoomTimelineVC: UIViewController {
             }
         }
         myReactions = mine
+
+        // Fold in the totals the server bundled onto each event. This is the
+        // only way reactions to a message older than our loaded history show up
+        // at all — its m.reaction events are outside the timeline we fetched.
+        // The bundle carries no event ids, so it can never tell us that one of
+        // the reactions is ours: a chip added this way always renders as
+        // someone else's until the room is reopened.
+        for event in events where !event.bundledReactions.isEmpty {
+            let target = event.eventId
+            for bundled in event.bundledReactions {
+                let live = keyCounts[target]?[bundled.key] ?? 0
+                let adjusted = max(0, bundled.count - (redactedCounts[target]?[bundled.key] ?? 0))
+                let merged = max(live, adjusted)
+                guard merged > 0 else { continue }
+                if keyCounts[target]?[bundled.key] == nil {
+                    keyOrder[target] = (keyOrder[target] ?? []) + [bundled.key]
+                }
+                keyCounts[target, default: [:]][bundled.key] = merged
+            }
+        }
 
         // The most recent of OUR own messages that a peer has read — a single
         // "Seen" marker goes under it.
@@ -1035,7 +1260,7 @@ class RoomTimelineVC: UIViewController {
             // day-separator / grouping bookkeeping keeps them from splitting a
             // same-sender run or emitting a stray date header.
             switch event.kind {
-            case .reaction, .redaction: continue
+            case .reaction, .redaction, .edit: continue
             default: break
             }
             // A message deleted (redacted) since we loaded it leaves the
@@ -1061,7 +1286,8 @@ class RoomTimelineVC: UIViewController {
                     showMeta = true
                 }
             }
-            result.append(.event(EventRow(event: event, showMeta: showMeta)))
+            result.append(.event(EventRow(event: event, showMeta: showMeta,
+                                          editedBody: edits[event.eventId]?.body)))
             if let keys = keyOrder[event.eventId] {
                 let items = keys.map {
                     ReactionItem(key: $0,
@@ -1087,8 +1313,9 @@ class RoomTimelineVC: UIViewController {
         case .image(let sender, _, _, _, _): return sender
         case .audio(let sender, _, _, _): return sender
         case .file(let sender, _, _, _, _): return sender
-        // Annotations never become rows, so they have no grouping sender.
-        case .membership, .reaction, .redaction: return nil
+        // Annotations and edits never become rows, so they have no grouping
+        // sender. (An edit's own sender is checked separately in rebuildRows.)
+        case .membership, .reaction, .redaction, .edit: return nil
         }
     }
 
@@ -1173,7 +1400,19 @@ class RoomTimelineVC: UIViewController {
         setSending(true)
 
         let path = "/_matrix/client/v3/rooms/\(room.roomId)/send/m.room.message/\(newTxnId())"
-        let body: [String: Any] = ["msgtype": "m.text", "body": text]
+        var body: [String: Any] = ["msgtype": "m.text", "body": text]
+        let replyTarget = replyingToEventId
+        if let replyTarget = replyTarget {
+            // m.relates_to alone, with NO legacy "> <@alice:server> …" fallback
+            // prepended to the body. MSC2781 removed reply fallbacks from the
+            // spec (Matrix 1.13) and Element stopped sending them; bridges built
+            // on mautrix bridgev2 (Messenger, current WhatsApp) consequently no
+            // longer strip one, so a fallback we send arrives on the far side as
+            // literal message text. Older bridges (mautrix-discord) still strip
+            // it, which is why the leak only showed up on some networks.
+            body["m.relates_to"] = ["m.in_reply_to": ["event_id": replyTarget]]
+            endReply()
+        }
         client.put(path, body: body) { [weak self] _, error in
             guard let self = self else { return }
             self.setSending(false)
@@ -1181,6 +1420,9 @@ class RoomTimelineVC: UIViewController {
                 self.messageField.text = text  // don't lose what the user typed
                 self.placeholderLabel.isHidden = true
                 self.adjustInputHeight()
+                // Restore the reply context too, so retrying still answers the
+                // message the user picked.
+                if let replyTarget = replyTarget { self.beginReply(to: replyTarget) }
                 self.showSendError(error)
             }
         }
@@ -1277,6 +1519,9 @@ class RoomTimelineVC: UIViewController {
         // for other clients to fetch; 1600px on the long edge is plenty for chat.
         let resized = downscale(image, maxDimension: 1600)
         guard let data = resized.jpegData(compressionQuality: 0.8) else { return }
+        // Image replies aren't supported yet, so clear any queued reply instead
+        // of leaving the strip up over a photo that won't carry the relation.
+        endReply()
         setSending(true)
         let filename = "elementold-\(Int64(Date().timeIntervalSince1970 * 1000)).jpg"
         client.uploadMedia(data: data, filename: filename, mimeType: "image/jpeg") { [weak self] json, error in
@@ -1325,6 +1570,9 @@ class RoomTimelineVC: UIViewController {
     // runtime); iOS 7-9 auto-prompt on record start and iOS 6 needs no prompt.
     private func enterVoiceMode() {
         guard inputMode == .text else { return }
+        // Replying is a text-mode action, so drop any queued reply rather than
+        // leave the strip claiming a voice note will answer it.
+        endReply()
         inputMode = .voice
         messageField.resignFirstResponder()
         voiceHasRecording = false
@@ -1824,12 +2072,14 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
             return ReactionsCell.height(items: reactionRow.items, width: width)
         case .event(let eventRow):
             switch eventRow.event.kind {
-            case .message(let sender, let body, let isEmote):
-                let text = isEmote ? "* \(memberNames[sender] ?? shortName(sender)) \(body)" : body
+            case .message:
+                let text = bodyText(for: eventRow)
                 let maxBubbleWidth = width * EventCell.bubbleWidthFraction
                 let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
                 let bodyHeight = textHeight(text, font: UIFont.systemFont(ofSize: 15), width: bodyWidth)
-                let bubbleHeight = bodyHeight + EventCell.innerPadding * 2
+                let quoteBlock: CGFloat = replyPreview(for: eventRow.event) != nil
+                    ? EventCell.quoteHeight + EventCell.quoteGap : 0
+                let bubbleHeight = quoteBlock + bodyHeight + EventCell.innerPadding * 2
                 let hasMeta = hasMetaHeader(eventRow)
                 let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
                 let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
@@ -1853,9 +2103,9 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 return topMargin + metaBlock + FileEventCell.bubbleHeight + EventCell.bottomMargin
             case .membership:
                 return 30
-            case .reaction, .redaction:
-                // Folded into a .reactions row / consumed by rebuildRows; never
-                // reaches the table as an event row.
+            case .reaction, .redaction, .edit:
+                // Folded into the event they relate to / consumed by
+                // rebuildRows; never reaches the table as an event row.
                 return 0
             }
         }
@@ -1891,8 +2141,51 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
              .file(let sender, _, _, _, _):
             return metaText(sender: sender, isOwn: sender == MatrixSession.userId,
                             isEmote: false) != nil
-        case .membership, .reaction, .redaction:
+        case .membership, .reaction, .redaction, .edit:
             return false
+        }
+    }
+
+    // The text a message bubble actually shows: the replacement when the message
+    // has been edited (plus an "(edited)" marker), with the sender's display
+    // name folded into an emote. Shared by rowHeight and cellForRowAt so the
+    // measured height and the drawn text can never disagree.
+    private func bodyText(for eventRow: EventRow) -> String {
+        guard case .message(let sender, let body, let isEmote) = eventRow.event.kind else { return "" }
+        var text = eventRow.editedBody ?? body
+        if isEmote { text = "* \(memberNames[sender] ?? shortName(sender)) \(text)" }
+        if eventRow.editedBody != nil { text += " (edited)" }
+        return text
+    }
+
+    // The one-line "Alice: original message" quote drawn inside the bubble above
+    // a reply. Prefers the real target event when we've loaded it; otherwise
+    // falls back to the quote the sender embedded in the reply fallback, which
+    // is all we have when the target is older than our loaded history.
+    private func replyPreview(for event: RoomEvent) -> String? {
+        guard let target = event.replyTo else { return nil }
+        if let source = eventsById[target], let sender = RoomTimelineVC.senderOf(source),
+           let text = RoomTimelineVC.previewText(for: source) {
+            let name = memberNames[sender] ?? shortName(sender)
+            return "\(name): \(text)"
+        }
+        guard let quote = event.replyQuote else { return nil }
+        if let author = event.replyAuthor {
+            return "\(memberNames[author] ?? shortName(author)): \(quote)"
+        }
+        return quote
+    }
+
+    // One-line description of a message for a reply quote: its own text, or a
+    // short label standing in for a non-text attachment. Shared by the in-bubble
+    // quote line and the composer's "Replying to …" strip so they always agree.
+    private static func previewText(for event: RoomEvent) -> String? {
+        switch event.kind {
+        case .message(_, let body, _): return body
+        case .image: return "Photo"
+        case .audio: return "Voice message"
+        case .file(_, _, let filename, _, _): return filename
+        default: return nil
         }
     }
 
@@ -1945,16 +2238,16 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
 
         case .event(let eventRow):
             switch eventRow.event.kind {
-            case .message(let sender, let body, let isEmote):
+            case .message(let sender, _, let isEmote):
                 let cell = (tableView.dequeueReusableCell(withIdentifier: cellId) as? EventCell) ??
                     EventCell(style: .default, reuseIdentifier: cellId)
-                let text = isEmote ? "* \(sender) \(body)" : body
                 let isOwn = sender == MatrixSession.userId
                 let time = TimeFormat.shortTime(msSinceEpoch: eventRow.event.timestamp)
                 let meta = eventRow.showMeta
                     ? metaText(sender: sender, isOwn: isOwn, isEmote: isEmote)
                     : nil
-                cell.configure(meta: meta, body: text, time: time, isOwn: isOwn,
+                cell.configure(meta: meta, quote: replyPreview(for: eventRow.event),
+                               body: bodyText(for: eventRow), time: time, isOwn: isOwn,
                                avatarMxc: memberAvatars[sender], senderName: memberNames[sender] ?? sender)
                 cell.setRevealOffset(revealOffset)
                 return cell
@@ -2022,7 +2315,7 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 cell.textLabel?.text = description
                 return cell
 
-            case .reaction, .redaction:
+            case .reaction, .redaction, .edit:
                 // Never emitted as an event row (see rebuildRows) — satisfy the
                 // switch without inventing a cell for it.
                 return UITableViewCell(style: .default, reuseIdentifier: nil)
@@ -2057,6 +2350,8 @@ private class EventCell: UITableViewCell {
     static let bubbleWidthFraction: CGFloat = 0.75
     static let metaHeight: CGFloat = 15         // height of the meta header line
     static let metaGap: CGFloat = 2             // meta-header-to-bubble spacing
+    static let quoteHeight: CGFloat = 14        // quoted-reply line inside the bubble
+    static let quoteGap: CGFloat = 4            // quote-to-body spacing
     static let topMargin: CGFloat = 8           // above a group's meta header
     static let groupedTopMargin: CGFloat = 2    // above a grouped (headerless) bubble
     static let bottomMargin: CGFloat = 2        // below every bubble
@@ -2074,6 +2369,9 @@ private class EventCell: UITableViewCell {
     private let bubble = UIView()
     private let metaLabel = UILabel()
     private let bodyLabel = UILabel()
+    // The message being replied to, drawn as one truncated line at the top of
+    // the bubble. Hidden unless this message is a reply.
+    private let quoteLabel = UILabel()
     // Small circular sender avatar, shown at the group-start of others' messages.
     private let avatarView = AvatarView()
     // Timestamp docked at the right edge, hidden until a swipe slides the bubble
@@ -2112,6 +2410,13 @@ private class EventCell: UITableViewCell {
         bubble.layer.masksToBounds = true   // actually clip content to the rounded rect
         contentView.addSubview(bubble)
 
+        quoteLabel.backgroundColor = .clear
+        quoteLabel.font = UIFont.systemFont(ofSize: 11)
+        quoteLabel.numberOfLines = 1
+        quoteLabel.lineBreakMode = .byTruncatingTail
+        quoteLabel.isHidden = true
+        bubble.addSubview(quoteLabel)
+
         bodyLabel.backgroundColor = .clear
         bodyLabel.font = UIFont.systemFont(ofSize: 15)
         bodyLabel.numberOfLines = 0
@@ -2127,13 +2432,19 @@ private class EventCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func configure(meta: String?, body: String, time: String, isOwn: Bool,
+    func configure(meta: String?, quote: String?, body: String, time: String, isOwn: Bool,
                    avatarMxc: String?, senderName: String) {
         isOwnMessage = isOwn
         hasMeta = meta != nil
         metaLabel.isHidden = !hasMeta
         metaLabel.text = meta
         metaLabel.textAlignment = isOwn ? .right : .left
+        quoteLabel.isHidden = quote == nil
+        quoteLabel.text = quote
+        // Dimmed against whichever bubble colour it sits on, so the quote reads
+        // as context rather than as part of the message.
+        quoteLabel.textColor = isOwn ? UIColor(white: 1.0, alpha: 0.75)
+                                     : UIColor(white: 0.35, alpha: 1.0)
         bodyLabel.text = body
         bodyLabel.textColor = isOwn ? .white : .black
         bubble.backgroundColor = isOwn ? UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
@@ -2165,9 +2476,19 @@ private class EventCell: UITableViewCell {
         // tightest width that yields the same wrapping, so the bubble can shrink
         // to fit short messages while long ones cap out.
         let bodySize = bodyLabel.sizeThatFits(CGSize(width: maxInnerWidth, height: .greatestFiniteMagnitude))
-        let innerWidth = min(ceil(bodySize.width), maxInnerWidth)
+        // A quoted reply gets to widen the bubble (it truncates to one line, so
+        // it can't change the height) — otherwise a one-word reply to a long
+        // message would cut the quote down to nothing.
+        var contentWidth = ceil(bodySize.width)
+        let quoteBlock: CGFloat = quoteLabel.isHidden ? 0 : EventCell.quoteHeight + EventCell.quoteGap
+        if !quoteLabel.isHidden {
+            let quoteSize = quoteLabel.sizeThatFits(CGSize(width: maxInnerWidth,
+                                                           height: EventCell.quoteHeight))
+            contentWidth = max(contentWidth, ceil(quoteSize.width))
+        }
+        let innerWidth = min(contentWidth, maxInnerWidth)
         let bubbleWidth = innerWidth + EventCell.innerPadding * 2
-        let bubbleHeight = ceil(bodySize.height) + EventCell.innerPadding * 2
+        let bubbleHeight = quoteBlock + ceil(bodySize.height) + EventCell.innerPadding * 2
 
         // Others' messages are indented by the avatar gutter so grouped
         // continuations line up under the group-start bubble (which shows the
@@ -2188,7 +2509,12 @@ private class EventCell: UITableViewCell {
         let bubbleX = isOwnMessage ? contentView.bounds.width - bubbleWidth - EventCell.outerMargin
                                     : leftEdge
         bubble.frame = CGRect(x: bubbleX - revealOffset, y: y, width: bubbleWidth, height: bubbleHeight)
-        bodyLabel.frame = CGRect(x: EventCell.innerPadding, y: EventCell.innerPadding,
+        if !quoteLabel.isHidden {
+            quoteLabel.frame = CGRect(x: EventCell.innerPadding, y: EventCell.innerPadding,
+                                       width: innerWidth, height: EventCell.quoteHeight)
+        }
+        bodyLabel.frame = CGRect(x: EventCell.innerPadding,
+                                  y: EventCell.innerPadding + quoteBlock,
                                   width: innerWidth, height: ceil(bodySize.height))
 
         // Avatar bottom-aligned with the bubble, in the left gutter.

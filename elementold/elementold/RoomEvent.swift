@@ -95,13 +95,40 @@ struct RoomEvent {
         // reaction that was taken back. Redacted *messages* arrive with empty
         // content and are already dropped by the blank-body check below.
         case redaction(targetEventId: String)
+        // An edit (m.replace): a whole new message event whose content replaces
+        // an earlier one's. Not a row either — the timeline swaps the new text
+        // into the original bubble. Rendering it as its own event is exactly the
+        // bug this closes: an edited message used to appear twice.
+        case edit(sender: String, targetEventId: String, body: String)
     }
 
     let eventId: String
     let kind: Kind
     let timestamp: Double
 
+    // Set when this message is a reply (m.in_reply_to). `replyTo` is the event
+    // it answers; the other two come from the reply *fallback* — the quoted
+    // "> <@alice:server> text" block senders prepend to the body for clients
+    // that don't understand replies — and are the only context we have when the
+    // quoted message is older than the history we've loaded.
+    var replyTo: String? = nil
+    var replyQuote: String? = nil
+    var replyAuthor: String? = nil
+
+    // Reaction totals the server bundled onto this event (unsigned.m.relations),
+    // which is how reactions to messages older than our loaded history become
+    // visible at all: we'd otherwise only know about reactions whose m.reaction
+    // events happen to sit in the timeline we fetched. Counts only — the chunk
+    // carries no event ids, so we can't tell whether one of them is ours.
+    var bundledReactions: [(key: String, count: Int)] = []
+
     static func parse(_ json: [String: Any]) -> RoomEvent? {
+        guard var event = parseEvent(json) else { return nil }
+        event.bundledReactions = parseBundledReactions(json)
+        return event
+    }
+
+    private static func parseEvent(_ json: [String: Any]) -> RoomEvent? {
         guard let eventId = json["event_id"] as? String,
               let type = json["type"] as? String,
               let sender = json["sender"] as? String else { return nil }
@@ -110,53 +137,61 @@ struct RoomEvent {
         switch type {
         case "m.room.message":
             guard let content = json["content"] as? [String: Any] else { return nil }
-            let body = content["body"] as? String ?? ""
-            let msgtype = content["msgtype"] as? String ?? "m.text"
-            // m.image with a plaintext `url` (mxc://) renders as an inline image.
-            // Encrypted images (E2EE out of scope for v1) carry a `file` object
-            // instead of `url` — those fall through to the text branch below and
-            // show their filename body, which is the best we can do unencrypted.
-            if msgtype == "m.image", let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
-                let info = content["info"] as? [String: Any]
-                let w = (info?["w"] as? NSNumber)?.intValue ?? 0
-                let h = (info?["h"] as? NSNumber)?.intValue ?? 0
+            let relates = content["m.relates_to"] as? [String: Any]
+
+            // An edit is a whole new event that REPLACES an earlier one. It must
+            // not become a row of its own (that's the double-message bug) — the
+            // timeline folds it into the original bubble.
+            if let relates = relates,
+               relates["rel_type"] as? String == "m.replace",
+               let target = relates["event_id"] as? String {
+                // m.new_content holds the real replacement. The top-level body is
+                // only the "* new text" fallback for clients that don't
+                // understand edits, so strip that marker when we have to use it.
+                var newBody = (content["m.new_content"] as? [String: Any])?["body"] as? String ?? ""
+                if newBody.isEmpty {
+                    newBody = content["body"] as? String ?? ""
+                    if newBody.hasPrefix("* ") { newBody.removeFirst(2) }
+                }
+                if RoomEvent.isBlank(newBody) { return nil }
                 return RoomEvent(eventId: eventId,
-                                  kind: .image(sender: sender, caption: body, mxc: mxc, width: w, height: h),
+                                  kind: .edit(sender: sender, targetEventId: target, body: newBody),
                                   timestamp: timestamp)
             }
-            // m.audio with a plaintext `url` renders as an inline voice message
-            // (play button + duration). Encrypted audio (E2EE out of scope)
-            // carries a `file` object instead and falls through to the text branch.
-            if msgtype == "m.audio", let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
-                let info = content["info"] as? [String: Any]
-                let dur = (info?["duration"] as? NSNumber)?.intValue ?? 0
-                return RoomEvent(eventId: eventId,
-                                  kind: .audio(sender: sender, mxc: mxc, durationMs: dur, caption: body),
-                                  timestamp: timestamp)
+
+            var body = content["body"] as? String ?? ""
+            var replyTo: String?
+            var replyQuote: String?
+            var replyAuthor: String?
+            // A reply carries the quoted message inline at the top of its body
+            // ("> <@alice:server> hi") for clients that don't understand replies.
+            // We render the quote ourselves, so strip the fallback out of the
+            // body — leaving it in is what makes replies look like markup today.
+            if let inReplyTo = relates?["m.in_reply_to"] as? [String: Any],
+               let target = inReplyTo["event_id"] as? String {
+                replyTo = target
+                let split = RoomEvent.splitReplyFallback(body)
+                replyAuthor = split.author
+                replyQuote = split.quote
+                body = split.rest
             }
-            // m.file / m.video render as an attachment bubble (filename, type,
-            // size). Encrypted attachments carry a `file` object instead of
-            // `url` and fall through to the text branch, same as images/audio.
-            if msgtype == "m.file" || msgtype == "m.video",
-               let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
-                let info = content["info"] as? [String: Any]
-                let mime = info?["mimetype"] as? String ?? ""
-                let size = (info?["size"] as? NSNumber)?.intValue ?? 0
-                let name = RoomEvent.isBlank(body) ? "Attachment" : body
-                return RoomEvent(eventId: eventId,
-                                  kind: .file(sender: sender, mxc: mxc, filename: name,
-                                              mimeType: mime, sizeBytes: size),
-                                  timestamp: timestamp)
+
+            guard let kind = RoomEvent.messageKind(content: content, sender: sender, body: body) else {
+                return nil
             }
-            let isEmote = msgtype == "m.emote"
-            // Drop content-less messages (redacted events whose content is now
-            // `{}`, or bot/bridge messages carrying only invisible/format
-            // characters). They'd otherwise render as an empty bubble — a blank
-            // vertical gap between real messages with no text. Emotes are exempt:
-            // their visible text is the sender name, prepended at render time.
-            if !isEmote, RoomEvent.isBlank(body) { return nil }
+            return RoomEvent(eventId: eventId, kind: kind, timestamp: timestamp,
+                              replyTo: replyTo, replyQuote: replyQuote, replyAuthor: replyAuthor)
+
+        case "m.room.encrypted":
+            // E2EE is out of scope for v1, but silently dropping these events
+            // leaves an encrypted room looking like an empty timeline. Render a
+            // plain text bubble instead so it's obvious why nothing is readable.
+            // Reusing .message keeps every exhaustive switch untouched. The lock
+            // is Unicode 6.0, so it exists in iOS 6's Apple Color Emoji.
             return RoomEvent(eventId: eventId,
-                              kind: .message(sender: sender, body: body, isEmote: isEmote),
+                              kind: .message(sender: sender,
+                                             body: "\u{1F512} Encrypted message (not supported)",
+                                             isEmote: false),
                               timestamp: timestamp)
 
         case "m.reaction":
@@ -195,6 +230,100 @@ struct RoomEvent {
         default:
             return nil
         }
+    }
+
+    // The row an m.room.message renders as, once edits and the reply fallback
+    // have been peeled off. Split out so replies keep working for every message
+    // type instead of only plain text.
+    private static func messageKind(content: [String: Any], sender: String, body: String) -> Kind? {
+        let msgtype = content["msgtype"] as? String ?? "m.text"
+        // m.image with a plaintext `url` (mxc://) renders as an inline image.
+        // Encrypted images (E2EE out of scope for v1) carry a `file` object
+        // instead of `url` — those fall through to the text branch below and
+        // show their filename body, which is the best we can do unencrypted.
+        if msgtype == "m.image", let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
+            let info = content["info"] as? [String: Any]
+            let w = (info?["w"] as? NSNumber)?.intValue ?? 0
+            let h = (info?["h"] as? NSNumber)?.intValue ?? 0
+            return .image(sender: sender, caption: body, mxc: mxc, width: w, height: h)
+        }
+        // m.audio with a plaintext `url` renders as an inline voice message
+        // (play button + duration). Encrypted audio (E2EE out of scope)
+        // carries a `file` object instead and falls through to the text branch.
+        if msgtype == "m.audio", let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
+            let info = content["info"] as? [String: Any]
+            let dur = (info?["duration"] as? NSNumber)?.intValue ?? 0
+            return .audio(sender: sender, mxc: mxc, durationMs: dur, caption: body)
+        }
+        // m.file / m.video render as an attachment bubble (filename, type,
+        // size). Encrypted attachments carry a `file` object instead of
+        // `url` and fall through to the text branch, same as images/audio.
+        if msgtype == "m.file" || msgtype == "m.video",
+           let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
+            let info = content["info"] as? [String: Any]
+            let mime = info?["mimetype"] as? String ?? ""
+            let size = (info?["size"] as? NSNumber)?.intValue ?? 0
+            let name = RoomEvent.isBlank(body) ? "Attachment" : body
+            return .file(sender: sender, mxc: mxc, filename: name, mimeType: mime, sizeBytes: size)
+        }
+        let isEmote = msgtype == "m.emote"
+        // Drop content-less messages (redacted events whose content is now
+        // `{}`, or bot/bridge messages carrying only invisible/format
+        // characters). They'd otherwise render as an empty bubble — a blank
+        // vertical gap between real messages with no text. Emotes are exempt:
+        // their visible text is the sender name, prepended at render time.
+        if !isEmote, RoomEvent.isBlank(body) { return nil }
+        return .message(sender: sender, body: body, isEmote: isEmote)
+    }
+
+    // Peel the reply fallback off a body: leading "> " lines (the first of which
+    // usually starts with "<@alice:server>"), then one blank separator line,
+    // then the actual reply. Pure stdlib string work — Foundation's convenience
+    // string APIs are a crash risk on this runtime.
+    static func splitReplyFallback(_ body: String) -> (author: String?, quote: String?, rest: String) {
+        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var index = 0
+        var quoted: [String] = []
+        while index < lines.count, lines[index].hasPrefix(">") {
+            var line = String(lines[index].dropFirst())
+            if line.hasPrefix(" ") { line.removeFirst() }
+            quoted.append(line)
+            index += 1
+        }
+        // No fallback present (some clients omit it) — the body is already clean.
+        guard !quoted.isEmpty else { return (nil, nil, body) }
+        if index < lines.count, lines[index].isEmpty { index += 1 }
+        let rest = lines[index...].joined(separator: "\n")
+
+        var author: String?
+        var first = quoted[0]
+        if first.hasPrefix("<"), let close = first.firstIndex(of: ">") {
+            author = String(first[first.index(after: first.startIndex)..<close])
+            first = String(first[first.index(after: close)...])
+            if first.hasPrefix(" ") { first.removeFirst() }
+            quoted[0] = first
+        }
+        // The quote is only ever shown on one line, so flatten it.
+        let quote = quoted.joined(separator: " ")
+        return (author, RoomEvent.isBlank(quote) ? nil : quote, rest)
+    }
+
+    // Reaction totals the server aggregated onto the event itself. Present on
+    // /sync and /messages events alike, and the only way to see reactions to a
+    // message whose m.reaction events fall outside the timeline we fetched.
+    private static func parseBundledReactions(_ json: [String: Any]) -> [(key: String, count: Int)] {
+        guard let unsigned = json["unsigned"] as? [String: Any],
+              let relations = unsigned["m.relations"] as? [String: Any],
+              let annotation = relations["m.annotation"] as? [String: Any],
+              let chunk = annotation["chunk"] as? [[String: Any]] else { return [] }
+        var result: [(key: String, count: Int)] = []
+        for entry in chunk {
+            guard (entry["type"] as? String) == "m.reaction",
+                  let key = entry["key"] as? String, !key.isEmpty,
+                  let count = (entry["count"] as? NSNumber)?.intValue, count > 0 else { continue }
+            result.append((key: key, count: count))
+        }
+        return result
     }
 
     // True when `s` contains no visible characters: ASCII/Unicode whitespace
