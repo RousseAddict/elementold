@@ -1,5 +1,6 @@
 #include "curl_bridge.h"
 #include <curl/curl.h>
+#include <stdio.h>
 
 void curl_bridge_global_init(void) {
     curl_global_init(CURL_GLOBAL_ALL);
@@ -71,6 +72,33 @@ void curl_bridge_set_put_body(CurlHandle h, const void *body, long len) {
     curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "PUT");
     curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, len);
     curl_easy_setopt(h, CURLOPT_COPYPOSTFIELDS, body);
+}
+
+/* Feeds the request body to libcurl a chunk at a time. Reading stays on the C
+   side so no Swift buffer copy sits in the middle of the transfer. */
+static size_t curl_bridge_upload_read(char *buffer, size_t size, size_t nitems, void *userdata) {
+    return fread(buffer, size, nitems, (FILE *)userdata);
+}
+
+void *curl_bridge_upload_open(const char *path) {
+    return fopen(path, "rb");
+}
+
+void curl_bridge_upload_close(void *file) {
+    if (file) {
+        fclose((FILE *)file);
+    }
+}
+
+/* POSTFIELDSIZE_LARGE gives a real Content-Length, so the body is sent as a plain
+   sized POST rather than chunked — Synapse's upload endpoint expects the former.
+   Note this deliberately pairs with NO redirect following: replaying a redirected
+   POST would mean rewinding the file, which needs a seek callback we don't set. */
+void curl_bridge_set_post_stream(CurlHandle h, void *file, long long len) {
+    curl_easy_setopt(h, CURLOPT_POST, 1L);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)len);
+    curl_easy_setopt(h, CURLOPT_READFUNCTION, curl_bridge_upload_read);
+    curl_easy_setopt(h, CURLOPT_READDATA, file);
 }
 
 void *curl_bridge_headers_append(void *list, const char *header) {

@@ -28,6 +28,14 @@ void        curl_bridge_set_progress_fn(CurlHandle h, CurlBridgeProgressFn fn, v
 /* POST + custom headers (used by the login path) */
 void        curl_bridge_set_post_body(CurlHandle h, const void *body, long len);
 void        curl_bridge_set_put_body(CurlHandle h, const void *body, long len);
+
+/* Streaming POST straight off disk: libcurl pulls the body in chunks instead of
+   taking a full in-memory copy the way set_post_body does, so upload size stops
+   being bounded by RAM. The caller opens the file, hands the handle to
+   set_post_stream, and closes it after curl_bridge_perform returns. */
+void       *curl_bridge_upload_open(const char *path);
+void        curl_bridge_upload_close(void *file);
+void        curl_bridge_set_post_stream(CurlHandle h, void *file, long long len);
 void       *curl_bridge_headers_append(void *list, const char *header);
 void        curl_bridge_set_headers(CurlHandle h, void *list);
 void        curl_bridge_headers_free(void *list);

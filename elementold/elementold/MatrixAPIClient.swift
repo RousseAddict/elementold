@@ -65,6 +65,23 @@ class MatrixAPIClient {
         }
     }
 
+    // Same endpoint as uploadMedia, but streamed off disk with progress reporting
+    // instead of buffered in memory — the only way to send something large (a video,
+    // an arbitrary file) without risking a low-memory kill on this hardware.
+    func uploadMediaFile(path: String, filename: String, mimeType: String,
+                         progress: ((Float) -> Void)?,
+                         completion: @escaping ([String: Any]?, Error?) -> Void) {
+        var headers = authHeaders()
+        headers["Content-Type"] = mimeType
+        let apiPath = "/_matrix/media/v3/upload?filename=\(filename)"
+        CurlFetcher.postFile(url: fullURL(apiPath), headers: headers,
+                             filePath: path, progress: progress) { responseData in
+            self.parse(responseData,
+                       responseData == nil ? MatrixError(errcode: "M_UNKNOWN", error: "Upload connection failed") : nil,
+                       completion: completion)
+        }
+    }
+
     // MARK: - Helpers
 
     private func fullURL(_ path: String) -> String {

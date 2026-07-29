@@ -69,6 +69,14 @@ class RoomTimelineVC: UIViewController {
     private var replyLabel: UILabel!
     private var replyCancelButton: UIButton!
     private let replyBarHeight: CGFloat = 30
+
+    // "Uploading… 42%" strip, docked in the same stack as the reply/typing strips
+    // while a streamed media upload is in flight. Videos take long enough that a
+    // silently-disabled send button reads as a freeze.
+    private var uploadBar: UIView!
+    private var uploadLabel: UILabel!
+    private var uploadProgressView: UIProgressView!
+    private let uploadBarHeight: CGFloat = 30
     private var typingUsers: [String] = []
     // Throttle for our own outbound typing notices (PUT .../typing/{userId}) so
     // each keystroke doesn't fire a request — resent at most every few seconds
@@ -260,6 +268,7 @@ class RoomTimelineVC: UIViewController {
         setupTitleView()
         buildInputBar()
         buildReplyBar()
+        buildUploadBar()
         buildTypingLabel()
         buildTableView()
         buildStatusLabel()
@@ -822,6 +831,44 @@ class RoomTimelineVC: UIViewController {
         view.addSubview(replyBar)
     }
 
+    // "Uploading… N%" strip; hidden unless a streamed upload is in flight. Same
+    // placement rules as the reply strip.
+    private func buildUploadBar() {
+        uploadBar = UIView(frame: .zero)
+        uploadBar.backgroundColor = UIColor(white: 0.90, alpha: 1.0)
+        uploadBar.isHidden = true
+
+        uploadLabel = UILabel(frame: .zero)
+        uploadLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
+        uploadLabel.font = UIFont.systemFont(ofSize: 12)
+        uploadLabel.textColor = UIColor(white: 0.3, alpha: 1.0)
+        uploadBar.addSubview(uploadLabel)
+
+        uploadProgressView = UIProgressView(progressViewStyle: .default)
+        uploadBar.addSubview(uploadProgressView)
+
+        view.addSubview(uploadBar)
+    }
+
+    // nil hides the strip; a fraction shows it. Called from the upload's progress
+    // callback, which CurlFetcher already marshals to main.
+    private func setUploadProgress(_ fraction: Float?) {
+        guard uploadBar != nil else { return }
+        guard let fraction = fraction else {
+            guard !uploadBar.isHidden else { return }
+            uploadBar.isHidden = true
+            layoutInputBar()
+            return
+        }
+        let clamped = min(max(fraction, 0), 1)
+        uploadLabel.text = "Uploading… \(Int(clamped * 100))%"
+        uploadProgressView.progress = clamped
+        if uploadBar.isHidden {
+            uploadBar.isHidden = false
+            layoutInputBar()
+        }
+    }
+
     // Typing strip lives above the input bar; positioned in layoutInputBar().
     private func buildTypingLabel() {
         typingLabel = UILabel(frame: .zero)
@@ -960,8 +1007,8 @@ class RoomTimelineVC: UIViewController {
                                             height: messageField.font!.lineHeight + 2)
         }
 
-        // Reply strip (if a reply is queued) sits directly above the bar, and the
-        // typing strip above that; the table shrinks by both so neither ever
+        // Stacked bottom-up above the input bar: reply strip, upload progress strip,
+        // then the typing strip. The table shrinks by all three so none of them ever
         // overlaps the newest message.
         let replyVisible = replyBar != nil && !replyBar.isHidden
         let replyH: CGFloat = replyVisible ? replyBarHeight : 0
@@ -974,16 +1021,29 @@ class RoomTimelineVC: UIViewController {
                                              width: cancelW, height: replyH)
         }
 
+        let uploadVisible = uploadBar != nil && !uploadBar.isHidden
+        let uploadH: CGFloat = uploadVisible ? uploadBarHeight : 0
+        if uploadVisible {
+            uploadBar.frame = CGRect(x: 0, y: barY - replyH - uploadH, width: barWidth, height: uploadH)
+            let labelW: CGFloat = 110
+            uploadLabel.frame = CGRect(x: hMargin, y: 0, width: labelW, height: uploadH)
+            let barX = hMargin + labelW
+            // UIProgressView has a fixed intrinsic height, so it's centred rather
+            // than stretched to fill the strip.
+            uploadProgressView.frame = CGRect(x: barX, y: (uploadH - 2) / 2,
+                                              width: max(0, barWidth - barX - hMargin), height: 2)
+        }
+
         let typingVisible = !typingUsers.isEmpty
         let typingH: CGFloat = typingVisible ? typingBarHeight : 0
         if typingLabel != nil {
             typingLabel.isHidden = !typingVisible
-            typingLabel.frame = CGRect(x: hMargin, y: barY - replyH - typingH,
+            typingLabel.frame = CGRect(x: hMargin, y: barY - replyH - uploadH - typingH,
                                        width: barWidth - hMargin * 2, height: typingH)
         }
 
         if isViewLoaded, tableView != nil {
-            tableView.frame.size.height = barY - replyH - typingH
+            tableView.frame.size.height = barY - replyH - uploadH - typingH
         }
     }
 
@@ -1549,10 +1609,10 @@ class RoomTimelineVC: UIViewController {
         var types = ["public.image"]
         if available.contains("public.movie") { types.append("public.movie") }
         picker.mediaTypes = types
-        // The upload path buffers the whole file in memory (see
-        // maxVideoUploadBytes), so lean on the picker to shrink it: it transcodes
-        // both recorded and library movies to this quality on export, which keeps a
-        // minute of video in the same size range as the photos we already send.
+        // The upload streams off disk so size isn't a memory concern, but a phone on
+        // cellular still has to push the bytes: the picker transcodes both recorded
+        // and library movies to this quality on export, which keeps a minute of video
+        // in the same size range as the photos we already send.
         picker.videoQuality = .typeMedium
         picker.videoMaximumDuration = 60
         picker.delegate = self
@@ -1571,15 +1631,31 @@ class RoomTimelineVC: UIViewController {
         endReply()
         setSending(true)
         let filename = "elementold-\(Int64(Date().timeIntervalSince1970 * 1000)).jpg"
-        client.uploadMedia(data: data, filename: filename, mimeType: "image/jpeg") { [weak self] json, error in
-            guard let self = self else { return }
+        // Spooled to disk so the upload streams with a progress bar, same as video.
+        // NSData's path-based write — Data.write(to:) hangs on this runtime.
+        let spoolPath = (NSTemporaryDirectory() as NSString).appendingPathComponent(filename)
+        guard (data as NSData).write(toFile: spoolPath, atomically: true) else {
+            setSending(false)
+            showAlert(title: "Couldn't send photo",
+                      message: "The photo couldn't be prepared for upload.")
+            return
+        }
+        // Held so the event's info.size doesn't keep the whole JPEG alive.
+        let size = data.count
+        setUploadProgress(0)
+        client.uploadMediaFile(path: spoolPath, filename: filename, mimeType: "image/jpeg",
+                               progress: { [weak self] fraction in
+            self?.setUploadProgress(fraction)
+        }) { json, error in
+            try? FileManager.default.removeItem(atPath: spoolPath)
+            self.setUploadProgress(nil)
             guard let mxc = json?["content_uri"] as? String else {
                 self.setSending(false)
                 self.showSendError(error ?? MatrixAPIClient.MatrixError(errcode: "M_UNKNOWN",
                                                                         error: "Upload returned no content_uri"))
                 return
             }
-            self.sendImageMessage(mxc: mxc, image: resized, size: data.count, filename: filename)
+            self.sendImageMessage(mxc: mxc, image: resized, size: size, filename: filename)
         }
     }
 
@@ -1617,26 +1693,6 @@ class RoomTimelineVC: UIViewController {
         let durationMs: Int
     }
 
-    // The upload path holds the whole file in memory, and libcurl copies the body
-    // again (CURLOPT_COPYPOSTFIELDS), so peak use is roughly twice the file size.
-    // Past this cap a 4S risks a low-memory kill, which is worse than refusing —
-    // so oversized clips get an alert. A streaming upload would lift the limit.
-    private static let maxVideoUploadBytes = 16 * 1024 * 1024
-
-    // DIAGNOSTIC: video send/render is invisible on device (no console), and the
-    // remux falls back silently by design, so leave a breadcrumb trail in
-    // UserDefaults for Settings → Diagnostics to show. Remove once confirmed.
-    static let videoTraceKey = "elementold.videoTrace"
-    private static var tracedVideoRows = Set<String>()
-    static func videoTrace(_ line: String) {
-        let defaults = UserDefaults.standard
-        var lines = defaults.stringArray(forKey: videoTraceKey) ?? []
-        lines.append(line)
-        if lines.count > 10 { lines.removeFirst(lines.count - 10) }
-        defaults.set(lines, forKey: videoTraceKey)
-        defaults.synchronize()
-    }
-
     private func uploadAndSendVideo(atPath path: String) {
         guard !isSending else { return }
         // Video replies aren't supported yet, so clear any queued reply rather than
@@ -1655,9 +1711,7 @@ class RoomTimelineVC: UIViewController {
     // no re-encode: the tracks are copied, so it's fast and lossless. When it isn't
     // available for this asset we send the original unchanged rather than fail.
     private func remuxToMP4(path: String, completion: @escaping (String, Bool) -> Void) {
-        RoomTimelineVC.videoTrace("pick .\(RoomTimelineVC.videoExtension(of: path))")
         guard RoomTimelineVC.videoExtension(of: path) != "mp4" else {
-            RoomTimelineVC.videoTrace("remux skip: already mp4")
             completion(path, false)
             return
         }
@@ -1670,7 +1724,6 @@ class RoomTimelineVC: UIViewController {
         guard let session = AVAssetExportSession(asset: asset,
                                                  presetName: AVAssetExportPresetPassthrough),
               session.supportedFileTypes.contains(.mp4) else {
-            RoomTimelineVC.videoTrace("remux skip: mp4 unsupported")
             completion(path, false)
             return
         }
@@ -1685,21 +1738,18 @@ class RoomTimelineVC: UIViewController {
             // AVFoundation calls back off the main thread, unlike CurlFetcher.
             DispatchQueue.main.async {
                 guard session.status == .completed else {
-                    let reason = (session.error as NSError?).map { "\($0.domain) \($0.code)" } ?? "none"
-                    RoomTimelineVC.videoTrace("remux failed: status=\(session.status.rawValue) err=\(reason)")
                     try? FileManager.default.removeItem(atPath: outPath)
                     completion(path, false)
                     return
                 }
-                RoomTimelineVC.videoTrace("remux ok -> mp4")
                 completion(outPath, true)
             }
         }
     }
 
     private func uploadPreparedVideo(atPath path: String, temporary: Bool) {
-        // Stat before reading: an oversized file must never be loaded at all. This
-        // checks the prepared file, which is the one that actually lands in memory.
+        // The size only feeds the event's `info` and the Content-Length now that the
+        // body streams off disk, but a zero here means the file isn't readable at all.
         let attrs = try? FileManager.default.attributesOfItem(atPath: path)
         let sizeBytes = (attrs?[.size] as? NSNumber)?.intValue ?? 0
         guard sizeBytes > 0 else {
@@ -1708,37 +1758,25 @@ class RoomTimelineVC: UIViewController {
                           temporaryPath: temporary ? path : nil)
             return
         }
-        let cap = RoomTimelineVC.maxVideoUploadBytes
-        guard sizeBytes <= cap else {
-            failVideoSend(title: "Video too large",
-                          message: String(format: "That video is %.1f MB. The limit is %d MB — try a shorter clip.",
-                                          Double(sizeBytes) / (1024 * 1024), cap / (1024 * 1024)),
-                          temporaryPath: temporary ? path : nil)
-            return
-        }
 
         let meta = videoMeta(path: path)
         let ext = RoomTimelineVC.videoExtension(of: path)
         let mime = RoomTimelineVC.videoMimeType(extension: ext)
         let filename = "elementold-\(Int64(Date().timeIntervalSince1970 * 1000)).\(ext)"
-        RoomTimelineVC.videoTrace("send \(mime) \(sizeBytes / 1024)KB \(meta.width)x\(meta.height)")
 
-        // Poster frame first: it goes out before the video so the big Data isn't
-        // resident while a second request is in flight, and the event can then
-        // carry thumbnail_url (without it other clients show a bare filename).
+        // Poster frame first, so the event can carry thumbnail_url — without it other
+        // clients show a bare filename. It's small, so it uploads unbuffered.
         uploadVideoThumbnail(path: path) { [weak self] thumbMxc, thumbInfo, thumbImage in
             guard let self = self else { return }
-            let data = FileManager.default.contents(atPath: path)
-            // Earliest safe point to drop the remux output: the bytes are in memory
-            // now, so no later path has to remember to clean up.
-            if temporary { try? FileManager.default.removeItem(atPath: path) }
-            guard let data = data else {
-                self.failVideoSend(title: "Couldn't read video",
-                                   message: "The picked video couldn't be opened.",
-                                   temporaryPath: nil)
-                return
-            }
-            self.client.uploadMedia(data: data, filename: filename, mimeType: mime) { json, error in
+            self.setUploadProgress(0)
+            self.client.uploadMediaFile(path: path, filename: filename, mimeType: mime,
+                                        progress: { [weak self] fraction in
+                self?.setUploadProgress(fraction)
+            }) { json, error in
+                // The temp remux output is only safe to drop here: libcurl was reading
+                // straight from it for the whole transfer.
+                if temporary { try? FileManager.default.removeItem(atPath: path) }
+                self.setUploadProgress(nil)
                 guard let mxc = json?["content_uri"] as? String else {
                     self.setSending(false)
                     self.showSendError(error ?? MatrixAPIClient.MatrixError(errcode: "M_UNKNOWN",
@@ -1746,7 +1784,7 @@ class RoomTimelineVC: UIViewController {
                     return
                 }
                 self.sendVideoMessage(mxc: mxc, filename: filename, mimeType: mime,
-                                      size: data.count, meta: meta,
+                                      size: sizeBytes, meta: meta,
                                       thumbMxc: thumbMxc, thumbInfo: thumbInfo, thumbImage: thumbImage)
             }
         }
@@ -1754,6 +1792,7 @@ class RoomTimelineVC: UIViewController {
 
     private func failVideoSend(title: String, message: String, temporaryPath: String?) {
         if let temporaryPath = temporaryPath { try? FileManager.default.removeItem(atPath: temporaryPath) }
+        setUploadProgress(nil)
         setSending(false)
         showAlert(title: title, message: message)
     }
@@ -2614,14 +2653,6 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 let meta = eventRow.showMeta ? metaText(sender: sender, isOwn: isOwn, isEmote: false) : nil
                 let downloaded = MediaCache.shared.downloadedFilePath(mxc: video.mxc, filename: video.filename,
                                                                       mimeType: video.mimeType) != nil
-                // DIAGNOSTIC: distinguishes "no video cell at all" from "video cell
-                // with no poster to draw". Once per mxc — cellForRowAt runs on every
-                // scroll and reload, and each trace writes UserDefaults. Remove once
-                // confirmed.
-                if RoomTimelineVC.tracedVideoRows.insert(video.mxc).inserted {
-                    RoomTimelineVC.videoTrace("row \(video.mimeType) thumb="
-                                              + (video.thumbnailMxc != nil ? "yes" : "no"))
-                }
                 cell.configure(meta: meta, video: video, downloaded: downloaded, time: time, isOwn: isOwn,
                                avatarMxc: memberAvatars[sender], senderName: memberNames[sender] ?? sender)
                 // Reflect an in-flight download onto this (possibly recycled) cell.
@@ -3654,15 +3685,27 @@ extension RoomTimelineVC: UITextViewDelegate {
 extension RoomTimelineVC: UIImagePickerControllerDelegate, UINavigationControllerDelegate {
     func imagePickerController(_ picker: UIImagePickerController,
                                didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
-        picker.dismiss(animated: true)
         // A movie pick carries .mediaURL, a photo carries .originalImage. Check the
         // movie key first, since some sources hand back both.
         if let url = info[.mediaURL] as? URL {
+            picker.dismiss(animated: true)
             uploadAndSendVideo(atPath: url.path)
             return
         }
-        guard let image = info[.originalImage] as? UIImage else { return }
-        uploadAndSendImage(image)
+        guard let image = info[.originalImage] as? UIImage else {
+            picker.dismiss(animated: true)
+            return
+        }
+        // Push the confirmation only once the picker is fully out of the way —
+        // pushing into a nav stack still covered by a dismissing modal drops the
+        // animation and can leave the bars in a half-transitioned state.
+        picker.dismiss(animated: true) { [weak self] in
+            guard let self = self else { return }
+            let confirm = ImageConfirmVC(image: image) { [weak self] picked in
+                self?.uploadAndSendImage(picked)
+            }
+            self.navigationController?.pushViewController(confirm, animated: true)
+        }
     }
 
     func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
@@ -3862,6 +3905,52 @@ private class ReactionsCell: UITableViewCell {
         sizingLabel.font = font
         sizingLabel.text = text
         return ceil(sizingLabel.sizeThatFits(CGSize(width: 10000, height: chipHeight)).width)
+    }
+}
+
+// MARK: - Photo send confirmation
+
+// Confirmation step for a picked photo. The library picker sends on a single tap,
+// while its movie counterpart already shows the clip with its own Choose button —
+// so this gives photos the same second look before they go out. Pushed on the
+// timeline's nav stack like every other secondary screen here, and kept in this
+// file to avoid a pbxproj round-trip.
+class ImageConfirmVC: UIViewController {
+
+    private let image: UIImage
+    private let onSend: (UIImage) -> Void
+    private var imageView: UIImageView!
+    // The upload starts as we pop, so a second tap during the animation would
+    // queue a duplicate send.
+    private var sent = false
+
+    init(image: UIImage, onSend: @escaping (UIImage) -> Void) {
+        self.image = image
+        self.onSend = onSend
+        super.init(nibName: nil, bundle: nil)
+        title = "Send Photo"
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+
+        imageView = UIImageView(frame: view.bounds)
+        imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        imageView.contentMode = .scaleAspectFit
+        imageView.image = image
+        view.addSubview(imageView)
+
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Send", style: .done,
+                                                            target: self, action: #selector(sendTapped))
+    }
+
+    @objc private func sendTapped() {
+        guard !sent else { return }
+        sent = true
+        onSend(image)
+        navigationController?.popViewController(animated: true)
     }
 }
 

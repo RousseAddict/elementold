@@ -284,9 +284,6 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         // Build time comes off the executable's mtime, so it can't drift out of sync
         // with what's actually installed — the reliable way to spot a stale install.
         var parts = ["Build: \(UserSettingsVC.buildStamp())"]
-        // DIAGNOSTIC: video send/render breadcrumbs. Remove with videoTrace.
-        let trace = UserDefaults.standard.stringArray(forKey: RoomTimelineVC.videoTraceKey) ?? []
-        if !trace.isEmpty { parts.append("Video:\n" + trace.joined(separator: "\n")) }
         // Surfaces the last recorded crash (if any) here rather than as a
         // launch-time popup — inspectable on demand without interrupting startup.
         if crashExpanded, let crash = CrashLogger.lastCrash { parts.append("Last crash:\n\(crash)") }

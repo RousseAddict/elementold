@@ -15,7 +15,7 @@ private let curlDataWriteCallback: @convention(c) (UnsafeRawPointer?, Int, Int, 
 private let curlFileWriteCallback: @convention(c) (UnsafeRawPointer?, Int, Int, UnsafeMutableRawPointer?) -> Int = { ptr, size, nmemb, userdata in
     guard let ptr = ptr, let userdata = userdata else { return 0 }
     let bytes = size * nmemb
-    let box = Unmanaged<CurlDownloadBox>.fromOpaque(userdata).takeUnretainedValue()
+    let box = Unmanaged<CurlTransferBox>.fromOpaque(userdata).takeUnretainedValue()
     box.fileHandle?.write(Data(bytes: ptr, count: bytes))
     box.bytesReceived += Int64(bytes)
     return bytes
@@ -24,13 +24,22 @@ private let curlFileWriteCallback: @convention(c) (UnsafeRawPointer?, Int, Int, 
 // Reports download progress (0...1) back to the main thread.
 private let curlProgressCallback: @convention(c) (UnsafeMutableRawPointer?, Int64, Int64, Int64, Int64) -> Int32 = { clientp, dltotal, dlnow, _, _ in
     guard let clientp = clientp, dltotal > 0 else { return 0 }
-    let box = Unmanaged<CurlDownloadBox>.fromOpaque(clientp).takeUnretainedValue()
+    let box = Unmanaged<CurlTransferBox>.fromOpaque(clientp).takeUnretainedValue()
     let progress = Float(dlnow) / Float(dltotal)
     DispatchQueue.main.async { box.progressHandler?(progress) }
     return 0
 }
 
-private class CurlDownloadBox {
+// Same as above for the upload direction (ulnow/ultotal instead of dlnow/dltotal).
+private let curlUploadProgressCallback: @convention(c) (UnsafeMutableRawPointer?, Int64, Int64, Int64, Int64) -> Int32 = { clientp, _, _, ultotal, ulnow in
+    guard let clientp = clientp, ultotal > 0 else { return 0 }
+    let box = Unmanaged<CurlTransferBox>.fromOpaque(clientp).takeUnretainedValue()
+    let progress = Float(ulnow) / Float(ultotal)
+    DispatchQueue.main.async { box.progressHandler?(progress) }
+    return 0
+}
+
+private class CurlTransferBox {
     var fileHandle: FileHandle?
     var bytesReceived: Int64 = 0
     var progressHandler: ((Float) -> Void)?
@@ -71,6 +80,10 @@ class CurlFetcher {
     // Dedicated queue for file downloads, kept separate from curlQueue so a
     // multi-GB movie download never blocks API calls or thumbnail fetches.
     private static let downloadQueue = DispatchQueue(label: "com.jellyold.curl.download")
+    // Uploads get their own queue rather than sharing downloadQueue: that one is
+    // serial, so a media upload would otherwise sit behind an in-progress file
+    // download (and vice versa) for the whole transfer.
+    private static let uploadQueue = DispatchQueue(label: "com.jellyold.curl.upload")
     // Thread-safe once-init: Swift static let uses dispatch_once. The first
     // background thread to touch this runs curl_global_init exactly once.
     // Never run from the main thread (crashes — OpenSSL threading init).
@@ -158,6 +171,27 @@ class CurlFetcher {
             DispatchQueue.main.async {
                 release(fetcher)
                 completion(ok)
+            }
+        }
+    }
+
+    // POST a file's contents as the raw request body, streamed off disk with
+    // progress, on the dedicated upload queue; completion on the main thread.
+    // Unlike postData this never holds the payload in memory, so size is bounded
+    // by the server's limit rather than by RAM.
+    static func postFile(url: String,
+                         headers: [String: String],
+                         filePath: String,
+                         progress: ((Float) -> Void)?,
+                         completion: @escaping (Data?) -> Void) {
+        let fetcher = CurlFetcher()
+        retain(fetcher)
+        CurlFetcher.uploadQueue.async {
+            let data = fetcher.syncPostFile(url: url, headers: headers,
+                                            filePath: filePath, progress: progress)
+            DispatchQueue.main.async {
+                release(fetcher)
+                completion(data)
             }
         }
     }
@@ -279,6 +313,49 @@ class CurlFetcher {
         return buf as Data
     }
 
+    // Like syncDownload, no CURLOPT_TIMEOUT: a large upload over a slow connection
+    // can easily outrun any total-time cap that suits an API call.
+    private func syncPostFile(url: String, headers: [String: String],
+                              filePath: String, progress: ((Float) -> Void)?) -> Data? {
+        _ = CurlFetcher.curlGlobalInit
+        let attrs = try? FileManager.default.attributesOfItem(atPath: filePath)
+        let length = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        guard length > 0, let file = filePath.withCString({ curl_bridge_upload_open($0) }) else { return nil }
+        defer { curl_bridge_upload_close(file) }
+
+        let h = curl_bridge_init()
+        defer { curl_bridge_cleanup(h) }
+
+        let buf = NSMutableData()
+        let ptr = Unmanaged.passUnretained(buf).toOpaque()
+
+        url.withCString { curl_bridge_set_url(h, $0) }
+        CurlFetcher.applyTLS(h)
+        // No follow_redirects: replaying the POST would need the body rewound.
+        curl_bridge_set_timeout(h, 0)
+        curl_bridge_set_write_fn(h, curlDataWriteCallback, ptr)
+
+        let box = CurlTransferBox()
+        box.progressHandler = progress
+        let boxPtr = Unmanaged.passUnretained(box).toOpaque()
+        if progress != nil { curl_bridge_set_progress_fn(h, curlUploadProgressCallback, boxPtr) }
+
+        var headerList: UnsafeMutableRawPointer?
+        for (k, v) in headers {
+            "\(k): \(v)".withCString { headerList = curl_bridge_headers_append(headerList, $0) }
+        }
+        if headerList != nil { curl_bridge_set_headers(h, headerList) }
+        defer { if headerList != nil { curl_bridge_headers_free(headerList) } }
+
+        curl_bridge_set_post_stream(h, file, length)
+
+        let rc = curl_bridge_perform(h)
+        guard rc == 0 else { return nil }
+        // Body returned regardless of status so the caller can read Matrix's
+        // {errcode,error} (e.g. M_TOO_LARGE when the server rejects the size).
+        return buf as Data
+    }
+
     // No CURLOPT_TIMEOUT (secs: 0 = unbounded) — movie downloads can run far longer
     // than an API call, and a total-time cap would abort a large file mid-transfer.
     private func syncDownload(url: String, headers: [String: String],
@@ -289,7 +366,7 @@ class CurlFetcher {
 
         FileManager.default.createFile(atPath: outputPath, contents: nil, attributes: nil)
         guard let fh = FileHandle(forWritingAtPath: outputPath) else { return false }
-        let box = CurlDownloadBox()
+        let box = CurlTransferBox()
         box.fileHandle = fh
         box.progressHandler = progress
         let boxPtr = Unmanaged.passUnretained(box).toOpaque()
