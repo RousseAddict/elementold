@@ -201,6 +201,7 @@ class RoomListVC: UIViewController {
         let rooms = json["rooms"] as? [String: Any]
         updateInvitations(from: rooms)
 
+        var roomsChanged = false
         if let join = rooms?["join"] as? [String: Any] {
             for (roomId, rawRoom) in join {
                 guard let roomJSON = rawRoom as? [String: Any] else { continue }
@@ -209,6 +210,18 @@ class RoomListVC: UIViewController {
                                                 selfUserId: MatrixSession.userId, isOpen: roomId == openRoomId,
                                                 isInitialSync: isInitial)
             }
+            roomsChanged = true
+        }
+        // Rooms we've left (or been kicked from) — including ones we just left
+        // from Room Settings. Without this they lingered in the list until the
+        // app was restarted, since only `join` was ever read.
+        if let leave = rooms?["leave"] as? [String: Any] {
+            for roomId in leave.keys where roomsById[roomId] != nil {
+                roomsById[roomId] = nil
+                roomsChanged = true
+            }
+        }
+        if roomsChanged {
             sortedRooms = roomsById.values.sorted { $0.lastMessageTimestamp > $1.lastMessageTimestamp }
         }
 
@@ -832,22 +845,7 @@ class NewConversationVC: UIViewController {
     }
 
     private func makeField(placeholder: String) -> UITextField {
-        let f = UITextField()
-        // Match RoomTimelineVC's chat input: no bezel, white rounded field with a
-        // thin grey border, and a small left inset spacer for the text.
-        f.borderStyle = .none
-        f.backgroundColor = .white
-        f.layer.cornerRadius = 8
-        f.layer.masksToBounds = true
-        f.layer.borderWidth = 0.5
-        f.layer.borderColor = UIColor(white: 0.8, alpha: 1.0).cgColor
-        f.font = UIFont.systemFont(ofSize: 16)
-        f.contentVerticalAlignment = .center
-        f.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 10, height: 1))
-        f.leftViewMode = .always
-        f.placeholder = placeholder
-        f.clearButtonMode = .whileEditing
-        return f
+        return makeRoundedField(placeholder: placeholder)
     }
 
     // Recomputes the header layout for the current mode and (re)assigns it so the
@@ -904,41 +902,13 @@ class NewConversationVC: UIViewController {
     }
 
     private func performSearch() {
-        let term = (searchField.text ?? "").trimmed()
-        // Always offer a raw-MXID row when the text looks like a user id, even if
-        // the directory search is disabled or returns nothing.
-        let mxidRow: [(String, String, String?)] = NewConversationVC.looksLikeMXID(term) ? [(term, term, nil)] : []
-        guard term.count >= 2 else {
-            results = mxidRow.map { (userId: $0.0, name: $0.1, avatarMxc: $0.2) }
-            tableView.reloadData()
-            return
-        }
         searchToken += 1
         let token = searchToken
-        client.post("/_matrix/client/v3/user_directory/search",
-                    body: ["search_term": term, "limit": 20]) { [weak self] json, _ in
-            DispatchQueue.main.async {
-                guard let self = self, token == self.searchToken else { return }
-                var found: [(userId: String, name: String, avatarMxc: String?)] = []
-                if let arr = json?["results"] as? [[String: Any]] {
-                    for r in arr {
-                        guard let uid = r["user_id"] as? String else { continue }
-                        let dn = (r["display_name"] as? String) ?? uid
-                        found.append((userId: uid, name: dn, avatarMxc: r["avatar_url"] as? String))
-                    }
-                }
-                // Prepend the raw-MXID row if it isn't already in the results.
-                for m in mxidRow where !found.contains(where: { $0.userId == m.0 }) {
-                    found.insert((userId: m.0, name: m.1, avatarMxc: m.2), at: 0)
-                }
-                self.results = found
-                self.tableView.reloadData()
-            }
+        UserDirectory.search(client: client, term: (searchField.text ?? "").trimmed()) { [weak self] found in
+            guard let self = self, token == self.searchToken else { return }
+            self.results = found
+            self.tableView.reloadData()
         }
-    }
-
-    private static func looksLikeMXID(_ s: String) -> Bool {
-        return s.hasPrefix("@") && s.firstIndex(of: ":") != nil && s.count >= 4
     }
 
     // MARK: create
@@ -1032,6 +1002,198 @@ extension NewConversationVC: UITableViewDataSource, UITableViewDelegate {
         } else {
             startDirect(userId: r.userId, name: r.name)
         }
+    }
+}
+
+// MARK: - Shared user-directory search
+
+// User-directory lookup shared by New Conversation and Invite. Always offers a
+// raw "@user:server" row when the typed text looks like a Matrix ID, so an exact
+// user can be reached even on a homeserver with the directory disabled.
+struct UserDirectory {
+    typealias Result = (userId: String, name: String, avatarMxc: String?)
+
+    // Completion is always delivered on the main thread.
+    static func search(client: MatrixAPIClient, term: String,
+                       completion: @escaping ([Result]) -> Void) {
+        let mxidRow: [Result] = looksLikeMXID(term) ? [(userId: term, name: term, avatarMxc: nil)] : []
+        guard term.count >= 2 else { completion(mxidRow); return }
+        client.post("/_matrix/client/v3/user_directory/search",
+                    body: ["search_term": term, "limit": 20]) { json, _ in
+            DispatchQueue.main.async {
+                var found: [Result] = []
+                if let arr = json?["results"] as? [[String: Any]] {
+                    for r in arr {
+                        guard let uid = r["user_id"] as? String else { continue }
+                        let dn = (r["display_name"] as? String) ?? uid
+                        found.append((userId: uid, name: dn, avatarMxc: r["avatar_url"] as? String))
+                    }
+                }
+                for m in mxidRow where !found.contains(where: { $0.userId == m.userId }) {
+                    found.insert(m, at: 0)
+                }
+                completion(found)
+            }
+        }
+    }
+
+    static func looksLikeMXID(_ s: String) -> Bool {
+        return s.hasPrefix("@") && s.firstIndex(of: ":") != nil && s.count >= 4
+    }
+}
+
+// Rounded white text field matching RoomTimelineVC's chat input: no bezel (the
+// roundedRect bezel's fixed insets look misaligned at custom heights on this
+// runtime), thin grey border, small left inset spacer.
+fileprivate func makeRoundedField(placeholder: String) -> UITextField {
+    let f = UITextField()
+    f.borderStyle = .none
+    f.backgroundColor = .white
+    f.layer.cornerRadius = 8
+    f.layer.masksToBounds = true
+    f.layer.borderWidth = 0.5
+    f.layer.borderColor = UIColor(white: 0.8, alpha: 1.0).cgColor
+    f.font = UIFont.systemFont(ofSize: 16)
+    f.contentVerticalAlignment = .center
+    f.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 10, height: 1))
+    f.leftViewMode = .always
+    f.placeholder = placeholder
+    f.clearButtonMode = .whileEditing
+    return f
+}
+
+// MARK: - Invite someone
+
+// Invite a user to an existing room, pushed from Room Settings. Lives here (not
+// in RoomTimelineVC.swift) so all user-directory UI shares one implementation.
+class InviteUserVC: UIViewController {
+
+    private let roomId: String
+    private let client: MatrixAPIClient
+    private var results: [UserDirectory.Result] = []
+    private var searchToken = 0
+    private var inviting = false
+
+    private var tableView: UITableView!
+    private var headerContainer: UIView!
+    private var searchField: UITextField!
+    private let cellId = "InviteResultCell"
+
+    init(roomId: String, client: MatrixAPIClient) {
+        self.roomId = roomId
+        self.client = client
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "Invite"
+        view.backgroundColor = .white
+
+        tableView = UITableView(frame: view.bounds, style: .plain)
+        tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.rowHeight = 58
+        view.addSubview(tableView)
+
+        // Controls live in the table header so UIKit positions them under the nav
+        // bar with no #available / topLayoutGuide (both unsafe on this runtime).
+        let width = view.bounds.width
+        headerContainer = UIView(frame: CGRect(x: 0, y: 0, width: width, height: 58))
+        headerContainer.autoresizingMask = [.flexibleWidth]
+        searchField = makeRoundedField(placeholder: "Search users or @user:server")
+        searchField.autocapitalizationType = .none
+        searchField.autocorrectionType = .no
+        searchField.returnKeyType = .search
+        searchField.frame = CGRect(x: 12, y: 12, width: width - 24, height: 34)
+        searchField.addTarget(self, action: #selector(searchEditingChanged), for: .editingChanged)
+        searchField.delegate = self
+        headerContainer.addSubview(searchField)
+        tableView.tableHeaderView = headerContainer
+    }
+
+    @objc private func searchEditingChanged() { performSearch() }
+
+    private func performSearch() {
+        searchToken += 1
+        let token = searchToken
+        UserDirectory.search(client: client, term: (searchField.text ?? "").trimmed()) { [weak self] found in
+            guard let self = self, token == self.searchToken else { return }
+            self.results = found
+            self.tableView.reloadData()
+        }
+    }
+
+    private func invite(userId: String, name: String) {
+        guard !inviting else { return }
+        inviting = true
+        view.endEditing(true)
+        // Room and user IDs go UNENCODED in the path; the user id travels in the
+        // JSON body anyway.
+        client.post("/_matrix/client/v3/rooms/\(roomId)/invite",
+                    body: ["user_id": userId]) { [weak self] _, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.inviting = false
+                if let error = error {
+                    self.showAlert("Couldn't invite", "\(error)")
+                } else {
+                    // No success alert: presenting one from a view controller
+                    // that's being popped doesn't reliably show. The invitee
+                    // shows up in the member list instead.
+                    _ = name
+                    self.navigationController?.popViewController(animated: true)
+                }
+            }
+        }
+    }
+
+    private func showAlert(_ title: String, _ message: String) {
+#if IOS6_TARGET
+        let alert = UIAlertView()
+        alert.title = title
+        alert.message = message
+        alert.addButton(withTitle: "OK")
+        alert.show()
+#else
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+#endif
+    }
+}
+
+extension InviteUserVC: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        textField.resignFirstResponder()
+        performSearch()
+        return true
+    }
+}
+
+extension InviteUserVC: UITableViewDataSource, UITableViewDelegate {
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        return results.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: cellId)
+            ?? UITableViewCell(style: .subtitle, reuseIdentifier: cellId)
+        let r = results[indexPath.row]
+        cell.textLabel?.text = r.name
+        cell.detailTextLabel?.text = r.userId
+        cell.detailTextLabel?.textColor = .gray
+        cell.accessoryType = .disclosureIndicator
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        let r = results[indexPath.row]
+        invite(userId: r.userId, name: r.name)
     }
 }
 

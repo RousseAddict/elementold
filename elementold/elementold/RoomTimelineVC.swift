@@ -19,7 +19,9 @@ private struct ReactionItem {
 // de-dupe our own echoed event against the locally-inserted placeholder).
 class RoomTimelineVC: UIViewController {
 
-    private let room: Room
+    // `var` (not `let`): Room Settings edits the name/topic/avatar and hands the
+    // updated Room back so the nav title refreshes without waiting for /sync.
+    private var room: Room
     private let client: MatrixAPIClient
     private let syncEngine: SyncEngine
 
@@ -754,6 +756,12 @@ class RoomTimelineVC: UIViewController {
         label.frame = CGRect(x: avatarSize + gap, y: (height - label.frame.height) / 2,
                              width: labelWidth, height: label.frame.height)
         container.addSubview(label)
+        // Tapping the title (avatar + name) opens Room Settings — the same
+        // affordance Element/WhatsApp/Telegram use, and it needs no new icon
+        // asset (hence no project.pbxproj round-trip).
+        container.isUserInteractionEnabled = true
+        container.addGestureRecognizer(UITapGestureRecognizer(target: self,
+                                                              action: #selector(openRoomSettings)))
         navigationItem.titleView = container
 
         // Right-hand button (users icon) opens the member list for this room.
@@ -773,6 +781,16 @@ class RoomTimelineVC: UIViewController {
     @objc private func openMemberList() {
         let vc = MemberListVC(room: room, client: client,
                               memberNames: memberNames, memberAvatars: memberAvatars)
+        navigationController?.pushViewController(vc, animated: true)
+    }
+
+    @objc private func openRoomSettings() {
+        let vc = RoomSettingsVC(room: room, client: client)
+        vc.onRoomUpdated = { [weak self] updated in
+            guard let self = self else { return }
+            self.room = updated
+            self.setupTitleView()
+        }
         navigationController?.pushViewController(vc, animated: true)
     }
 
@@ -3341,6 +3359,290 @@ class TextFileViewerVC: UIViewController {
             ?? ""
         if text.isEmpty { return "This file has no readable text." }
         return truncated ? text + "\n\n\u{2026} (truncated)" : text
+    }
+}
+
+// MARK: - Room settings
+
+// Room settings, pushed by tapping the timeline's nav title. Covers the settings
+// that are cheap and safe on this target: photo, name, topic, inviting someone,
+// and leaving. Kept in this file (not a separate .swift) to avoid a pbxproj
+// registration round-trip — same reason MemberListVC lives here.
+//
+// Everything is written as room state via
+//   PUT /_matrix/client/v3/rooms/{roomId}/state/{eventType}
+// (the state key is empty for all three, so it's omitted from the path).
+// No power-level gating: we never read m.room.power_levels, so a user without
+// permission just gets the homeserver's M_FORBIDDEN surfaced in an alert. Room
+// IDs travel UNENCODED in the path (percent-encoding crashes on this runtime).
+class RoomSettingsVC: UIViewController, UITableViewDataSource, UITableViewDelegate {
+
+    // Handed the updated Room after each successful edit so the timeline can
+    // refresh its nav title/avatar without waiting for the change to come back
+    // around through /sync.
+    var onRoomUpdated: ((Room) -> Void)?
+
+    private var room: Room
+    private let client: MatrixAPIClient
+    private var tableView: UITableView!
+    private let cellId = "RoomSettingCell"
+    // Strongly held for the duration of the pick+upload: UIImagePickerController's
+    // and UIActionSheet's delegates are both weak.
+    private var avatarPicker: AvatarPicker?
+    private let leaveSheetTag = 95
+
+    init(room: Room, client: MatrixAPIClient) {
+        self.room = room
+        self.client = client
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "Room Settings"
+        view.backgroundColor = .white
+
+        tableView = UITableView(frame: view.bounds, style: .grouped)
+        tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        tableView.dataSource = self
+        tableView.delegate = self
+        view.addSubview(tableView)
+    }
+
+    // MARK: - Table
+
+    // 0 = Room (photo, name, topic), 1 = People (invite), 2 = leave.
+    func numberOfSections(in tableView: UITableView) -> Int { return 3 }
+
+    func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+        switch section {
+        case 0: return "Room"
+        case 1: return "People"
+        default: return nil
+        }
+    }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        switch section {
+        case 0: return 3
+        default: return 1
+        }
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        if indexPath.section == 0 && indexPath.row == 0 {
+            let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "AV") ??
+                UITableViewCell(style: .default, reuseIdentifier: cellId + "AV")
+            cell.textLabel?.text = "Photo"
+            cell.textLabel?.textColor = .black
+            cell.textLabel?.textAlignment = .left
+            let avatar = AvatarView(frame: CGRect(x: 0, y: 0, width: 34, height: 34))
+            avatar.setAvatar(mxc: room.avatarMxc, name: room.name)
+            cell.accessoryView = avatar
+            cell.selectionStyle = .default
+            return cell
+        }
+        if indexPath.section == 2 {
+            let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
+                UITableViewCell(style: .default, reuseIdentifier: cellId)
+            cell.accessoryView = nil
+            cell.accessoryType = .none
+            cell.textLabel?.text = "Leave Room"
+            cell.textLabel?.textColor = UIColor(red: 0.85, green: 0.15, blue: 0.15, alpha: 1.0)
+            cell.textLabel?.textAlignment = .center
+            cell.selectionStyle = .default
+            return cell
+        }
+        let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
+            UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
+        cell.accessoryView = nil
+        cell.textLabel?.textColor = .black
+        cell.textLabel?.textAlignment = .left
+        cell.accessoryType = .disclosureIndicator
+        cell.selectionStyle = .default
+        if indexPath.section == 1 {
+            cell.textLabel?.text = "Invite someone\u{2026}"
+            cell.detailTextLabel?.text = nil
+            return cell
+        }
+        if indexPath.row == 1 {
+            cell.textLabel?.text = "Name"
+            cell.detailTextLabel?.text = room.name
+        } else {
+            cell.textLabel?.text = "Topic"
+            let topic = room.topic ?? ""
+            cell.detailTextLabel?.text = topic.isEmpty ? "None" : topic
+        }
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        switch (indexPath.section, indexPath.row) {
+        case (0, 0):
+            pickPhoto()
+        case (0, 1):
+            editName()
+        case (0, 2):
+            editTopic()
+        case (1, _):
+            navigationController?.pushViewController(
+                InviteUserVC(roomId: room.roomId, client: client), animated: true)
+        default:
+            confirmLeave()
+        }
+    }
+
+    // MARK: - Edits
+
+    private func editName() {
+        let editor = TextEditVC(screenTitle: "Room name", placeholder: "Room name",
+                                current: room.name, multiline: false)
+        editor.onSave = { [weak self] name in self?.saveName(name) }
+        navigationController?.pushViewController(editor, animated: true)
+    }
+
+    private func editTopic() {
+        let editor = TextEditVC(screenTitle: "Topic", placeholder: "Topic",
+                                current: room.topic ?? "", multiline: true)
+        editor.onSave = { [weak self] topic in self?.saveTopic(topic) }
+        navigationController?.pushViewController(editor, animated: true)
+    }
+
+    private func saveName(_ raw: String) {
+        let name = raw.roomSettingsTrimmed()
+        guard !name.isEmpty, name != room.name else { return }
+        putState("m.room.name", body: ["name": name]) { [weak self] in
+            guard let self = self else { return }
+            self.room.name = name
+            self.commit()
+        }
+    }
+
+    private func saveTopic(_ raw: String) {
+        let topic = raw.roomSettingsTrimmed()
+        guard topic != (room.topic ?? "") else { return }
+        putState("m.room.topic", body: ["topic": topic]) { [weak self] in
+            guard let self = self else { return }
+            self.room.topic = topic
+            self.commit()
+        }
+    }
+
+    private func pickPhoto() {
+        let picker = AvatarPicker(client: client)
+        avatarPicker = picker
+        picker.start(from: self, anchor: view) { [weak self] mxc, _, error in
+            guard let self = self else { return }
+            self.avatarPicker = nil
+            guard let mxc = mxc else {
+                if let error = error { self.showAlert("Couldn't upload", "\(error)") }
+                return
+            }
+            self.putState("m.room.avatar", body: ["url": mxc]) { [weak self] in
+                guard let self = self else { return }
+                self.room.avatarMxc = mxc
+                self.commit()
+            }
+        }
+    }
+
+    private func putState(_ eventType: String, body: [String: Any],
+                          onSuccess: @escaping () -> Void) {
+        let path = "/_matrix/client/v3/rooms/\(room.roomId)/state/\(eventType)"
+        client.put(path, body: body) { [weak self] _, error in
+            guard let self = self else { return }
+            if let error = error {
+                // A homeserver M_FORBIDDEN here means the account lacks the power
+                // level for this state event — surfaced as-is rather than
+                // pre-checked, since we never read m.room.power_levels.
+                self.showAlert("Couldn't update", "\(error)")
+                return
+            }
+            onSuccess()
+        }
+    }
+
+    // Reflects the locally-applied change in this screen and hands the updated
+    // Room back to the timeline.
+    private func commit() {
+        if isViewLoaded { tableView.reloadData() }
+        onRoomUpdated?(room)
+    }
+
+    // MARK: - Leave
+
+    private func confirmLeave() {
+        let message = "You'll stop receiving messages from this room. You'll need a new invite to rejoin."
+#if IOS6_TARGET
+        let sheet = UIActionSheet()
+        sheet.title = message
+        sheet.addButton(withTitle: "Leave Room")   // index 0 (destructive)
+        sheet.addButton(withTitle: "Cancel")       // index 1
+        sheet.destructiveButtonIndex = 0
+        sheet.cancelButtonIndex = 1
+        sheet.tag = leaveSheetTag
+        sheet.delegate = self
+        sheet.show(in: view)
+#else
+        let alert = UIAlertController(title: "Leave room?", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Leave Room", style: .destructive) { [weak self] _ in
+            self?.performLeave()
+        })
+        present(alert, animated: true)
+#endif
+    }
+
+    fileprivate func performLeave() {
+        client.post("/_matrix/client/v3/rooms/\(room.roomId)/leave", body: [:]) { [weak self] _, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.showAlert("Couldn't leave", "\(error)")
+                return
+            }
+            // Back to the room list. The room itself disappears from the list when
+            // the next /sync reports it under `rooms.leave` (RoomListVC.handleSync).
+            self.navigationController?.popToRootViewController(animated: true)
+        }
+    }
+
+    private func showAlert(_ title: String, _ message: String) {
+#if IOS6_TARGET
+        let alert = UIAlertView()
+        alert.title = title
+        alert.message = message
+        alert.addButton(withTitle: "OK")
+        alert.show()
+#else
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+#endif
+    }
+}
+
+#if IOS6_TARGET
+extension RoomSettingsVC: UIActionSheetDelegate {
+    func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
+        guard actionSheet.tag == leaveSheetTag,
+              buttonIndex == actionSheet.destructiveButtonIndex else { return }
+        performLeave()
+    }
+}
+#endif
+
+private extension String {
+    // Pure-Swift whitespace trim (no Foundation CharacterSet — iOS-6-safe rule).
+    // Named distinctly because this file already has other String helpers.
+    func roomSettingsTrimmed() -> String {
+        let ws: Set<Character> = [" ", "\t", "\n", "\r"]
+        var chars = Array(self)
+        while let f = chars.first, ws.contains(f) { chars.removeFirst() }
+        while let l = chars.last, ws.contains(l) { chars.removeLast() }
+        return String(chars)
     }
 }
 

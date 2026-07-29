@@ -56,6 +56,10 @@ struct Room {
     // origin network (Discord/WhatsApp/…). nil for a native Matrix room.
     var bridgeNetwork: String?      // protocol.displayname ?? protocol.id
     var bridgeAvatarMxc: String?    // protocol.avatar_url (mxc://)
+    // Room topic from m.room.topic state. Shown/edited in Room Settings. Empty
+    // string is a legitimate value (a topic that was cleared), so this stays nil
+    // only while we've never seen the state event.
+    var topic: String?
 
     // Convenience: this room is a Matrix space (grouping container, no timeline).
     var isSpace: Bool { return roomType == "m.space" }
@@ -77,6 +81,7 @@ struct Room {
         var spaceChildren = existing?.spaceChildren ?? []
         var bridgeNetwork = existing?.bridgeNetwork
         var bridgeAvatarMxc = existing?.bridgeAvatarMxc
+        var topic = existing?.topic
         var explicitAvatarFound = existing?.avatarMxc != nil
         var fallbackMemberName: String?
         var fallbackMemberAvatar: String?
@@ -91,6 +96,8 @@ struct Room {
             } else if type == "m.room.avatar", let url = content["url"] as? String, url.hasPrefix("mxc://") {
                 avatarMxc = url
                 explicitAvatarFound = true
+            } else if type == "m.room.topic", let t = content["topic"] as? String {
+                topic = t
             } else if type == "m.room.create" {
                 // Space detection: m.room.create carries the room's type.
                 if let t = content["type"] as? String, !t.isEmpty { roomType = t }
@@ -191,6 +198,7 @@ struct Room {
                     avatarMxc: avatarMxc, memberNames: memberNames, memberAvatars: memberAvatars,
                     unreadCount: unreadCount,
                     roomType: roomType, spaceChildren: spaceChildren,
-                    bridgeNetwork: bridgeNetwork, bridgeAvatarMxc: bridgeAvatarMxc)
+                    bridgeNetwork: bridgeNetwork, bridgeAvatarMxc: bridgeAvatarMxc,
+                    topic: topic)
     }
 }
