@@ -280,10 +280,26 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             return "Keeps syncing in the background to alert you of new messages. "
                  + "Off by default; turning it off stops all background activity."
         }
+        guard section == 3 else { return nil }
+        // Build time comes off the executable's mtime, so it can't drift out of sync
+        // with what's actually installed — the reliable way to spot a stale install.
+        var parts = ["Build: \(UserSettingsVC.buildStamp())"]
+        // DIAGNOSTIC: video send/render breadcrumbs. Remove with videoTrace.
+        let trace = UserDefaults.standard.stringArray(forKey: RoomTimelineVC.videoTraceKey) ?? []
+        if !trace.isEmpty { parts.append("Video:\n" + trace.joined(separator: "\n")) }
         // Surfaces the last recorded crash (if any) here rather than as a
         // launch-time popup — inspectable on demand without interrupting startup.
-        guard section == 3, crashExpanded, let crash = CrashLogger.lastCrash else { return nil }
-        return "Last crash:\n\(crash)"
+        if crashExpanded, let crash = CrashLogger.lastCrash { parts.append("Last crash:\n\(crash)") }
+        return parts.joined(separator: "\n\n")
+    }
+
+    private static func buildStamp() -> String {
+        guard let path = Bundle.main.executablePath,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let date = attrs[.modificationDate] as? Date else { return "unknown" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d HH:mm"
+        return formatter.string(from: date)
     }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {

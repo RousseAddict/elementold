@@ -72,6 +72,20 @@ enum TimeFormat {
 // A single timeline row: either a chat message or an inline membership event.
 // Unsupported event types (reactions, redactions, etc.) are dropped for v1 —
 // per plan.md Phase 5, only m.room.message + membership rows are rendered.
+// Everything an m.video bubble needs. `thumbnailMxc` is info.thumbnail_url when
+// the sender supplied a poster frame — nil means we draw a placeholder instead,
+// since fetching a frame out of the video would mean downloading all of it.
+struct VideoAttachment {
+    let mxc: String
+    let thumbnailMxc: String?
+    let filename: String
+    let mimeType: String
+    let sizeBytes: Int
+    let width: Int
+    let height: Int
+    let durationMs: Int
+}
+
 struct RoomEvent {
     enum Kind {
         case message(sender: String, body: String, isEmote: Bool)
@@ -83,10 +97,14 @@ struct RoomEvent {
         // `durationMs` is info.duration in milliseconds (0 if the sender omitted
         // it), `caption` is the body text ("Voice message · m:ss").
         case audio(sender: String, mxc: String, durationMs: Int, caption: String)
-        // An m.file / m.video attachment: `mxc` is the content URI, `filename`
-        // is the body (the original filename), `mimeType`/`sizeBytes` come from
-        // `info` (empty/0 when the sender omitted them).
+        // An m.file attachment: `mxc` is the content URI, `filename` is the body
+        // (the original filename), `mimeType`/`sizeBytes` come from `info`
+        // (empty/0 when the sender omitted them).
         case file(sender: String, mxc: String, filename: String, mimeType: String, sizeBytes: Int)
+        // An m.video attachment. Carried as a struct rather than eight more
+        // associated values, so the switch sites that only want the sender stay
+        // readable. Renders as a poster-frame bubble with a play badge.
+        case video(sender: String, video: VideoAttachment)
         case membership(description: String)
         // An m.reaction annotation. Never a row of its own — the timeline folds
         // these into a chip strip under the message they target.
@@ -255,15 +273,27 @@ struct RoomEvent {
             let dur = (info?["duration"] as? NSNumber)?.intValue ?? 0
             return .audio(sender: sender, mxc: mxc, durationMs: dur, caption: body)
         }
-        // m.file / m.video render as an attachment bubble (filename, type,
-        // size). Encrypted attachments carry a `file` object instead of
-        // `url` and fall through to the text branch, same as images/audio.
+        // m.file renders as an attachment bubble (filename, type, size), m.video
+        // as a poster-frame bubble. Encrypted attachments carry a `file` object
+        // instead of `url` and fall through to the text branch, as with images.
         if msgtype == "m.file" || msgtype == "m.video",
            let mxc = content["url"] as? String, mxc.hasPrefix("mxc://") {
             let info = content["info"] as? [String: Any]
             let mime = info?["mimetype"] as? String ?? ""
             let size = (info?["size"] as? NSNumber)?.intValue ?? 0
             let name = RoomEvent.isBlank(body) ? "Attachment" : body
+            if msgtype == "m.video" {
+                // Only accept a plaintext mxc thumbnail: an encrypted one arrives
+                // as thumbnail_file, which we can't fetch.
+                var thumb = info?["thumbnail_url"] as? String
+                if thumb?.hasPrefix("mxc://") != true { thumb = nil }
+                let video = VideoAttachment(mxc: mxc, thumbnailMxc: thumb, filename: name,
+                                            mimeType: mime, sizeBytes: size,
+                                            width: (info?["w"] as? NSNumber)?.intValue ?? 0,
+                                            height: (info?["h"] as? NSNumber)?.intValue ?? 0,
+                                            durationMs: (info?["duration"] as? NSNumber)?.intValue ?? 0)
+                return .video(sender: sender, video: video)
+            }
             return .file(sender: sender, mxc: mxc, filename: name, mimeType: mime, sizeBytes: size)
         }
         let isEmote = msgtype == "m.emote"

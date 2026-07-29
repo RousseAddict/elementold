@@ -1,5 +1,6 @@
 import UIKit
 import AVFoundation
+import CoreMedia
 import AudioToolbox
 import MediaPlayer
 
@@ -145,6 +146,7 @@ class RoomTimelineVC: UIViewController {
     private var audioProgressTimer: Timer?
     private let audioCellId = "AudioEventCell"
     private let fileCellId = "FileEventCell"
+    private let videoCellId = "VideoEventCell"
     // In-flight attachment downloads (mxc -> 0...1), so a recycled or scrolled-in
     // cell can show the current progress.
     private var fileProgress: [String: Float] = [:]
@@ -459,7 +461,7 @@ class RoomTimelineVC: UIViewController {
     private func reactableEventId(for row: Row) -> String? {
         guard case .event(let eventRow) = row else { return nil }
         switch eventRow.event.kind {
-        case .message, .image, .audio, .file: return eventRow.event.eventId
+        case .message, .image, .audio, .file, .video: return eventRow.event.eventId
         case .membership, .reaction, .redaction, .edit: return nil
         }
     }
@@ -478,7 +480,7 @@ class RoomTimelineVC: UIViewController {
     private func replyableEventId(for row: Row) -> String? {
         guard case .event(let eventRow) = row else { return nil }
         switch eventRow.event.kind {
-        case .message, .image, .audio, .file: return eventRow.event.eventId
+        case .message, .image, .audio, .file, .video: return eventRow.event.eventId
         case .membership, .reaction, .redaction, .edit: return nil
         }
     }
@@ -494,6 +496,7 @@ class RoomTimelineVC: UIViewController {
         case .image(_, let caption, _, _, _): return caption.isEmpty ? nil : caption
         case .audio(_, _, _, let caption): return caption.isEmpty ? nil : caption
         case .file(_, _, let filename, _, _): return filename
+        case .video(_, let video): return video.filename
         case .membership(let description): return description
         case .reaction, .redaction, .edit: return nil
         }
@@ -714,6 +717,7 @@ class RoomTimelineVC: UIViewController {
             (cell as? ImageEventCell)?.setRevealOffset(offset)
             (cell as? AudioEventCell)?.setRevealOffset(offset)
             (cell as? FileEventCell)?.setRevealOffset(offset)
+            (cell as? VideoEventCell)?.setRevealOffset(offset)
             (cell as? ReactionsCell)?.setRevealOffset(offset)
         }
     }
@@ -1331,6 +1335,7 @@ class RoomTimelineVC: UIViewController {
         case .image(let sender, _, _, _, _): return sender
         case .audio(let sender, _, _, _): return sender
         case .file(let sender, _, _, _, _): return sender
+        case .video(let sender, _): return sender
         // Annotations and edits never become rows, so they have no grouping
         // sender. (An edit's own sender is checked separately in rebuildRows.)
         case .membership, .reaction, .redaction, .edit: return nil
@@ -1377,11 +1382,21 @@ class RoomTimelineVC: UIViewController {
     // fire once per image rather than on every reload.
     private func prefetchImageThumbnails() {
         for event in events {
-            guard case .image(_, _, let mxc, let w, let h) = event.kind,
-                  !prefetchedMxcs.contains(mxc) else { continue }
-            prefetchedMxcs.insert(mxc)
-            let (reqW, reqH) = ImageEventCell.thumbnailRequestSize(imageWidth: w, imageHeight: h)
-            MediaCache.shared.loadThumbnail(mxc: mxc, width: reqW, height: reqH) { _ in }
+            // Videos are prefetched too: their poster frame is an ordinary
+            // thumbnail request, keyed on the thumbnail's own mxc.
+            var request: (mxc: String, w: Int, h: Int)?
+            switch event.kind {
+            case .image(_, _, let mxc, let w, let h):
+                request = (mxc, w, h)
+            case .video(_, let video):
+                if let thumb = video.thumbnailMxc { request = (thumb, video.width, video.height) }
+            default:
+                break
+            }
+            guard let req = request, !prefetchedMxcs.contains(req.mxc) else { continue }
+            prefetchedMxcs.insert(req.mxc)
+            let (reqW, reqH) = ImageEventCell.thumbnailRequestSize(imageWidth: req.w, imageHeight: req.h)
+            MediaCache.shared.loadThumbnail(mxc: req.mxc, width: reqW, height: reqH) { _ in }
         }
     }
 
@@ -1526,6 +1541,20 @@ class RoomTimelineVC: UIViewController {
     private func presentPicker(source: UIImagePickerController.SourceType) {
         let picker = UIImagePickerController()
         picker.sourceType = source
+        // "public.image"/"public.movie" are the literal values of kUTTypeImage and
+        // kUTTypeMovie, used directly so this file doesn't need MobileCoreServices.
+        // Asking for a media type the source can't provide raises an exception, so
+        // movies are only offered when the source actually supports them.
+        let available = UIImagePickerController.availableMediaTypes(for: source) ?? []
+        var types = ["public.image"]
+        if available.contains("public.movie") { types.append("public.movie") }
+        picker.mediaTypes = types
+        // The upload path buffers the whole file in memory (see
+        // maxVideoUploadBytes), so lean on the picker to shrink it: it transcodes
+        // both recorded and library movies to this quality on export, which keeps a
+        // minute of video in the same size range as the photos we already send.
+        picker.videoQuality = .typeMedium
+        picker.videoMaximumDuration = 60
         picker.delegate = self
         present(picker, animated: true)
     }
@@ -1576,6 +1605,252 @@ class RoomTimelineVC: UIViewController {
             guard let self = self else { return }
             self.setSending(false)
             if let error = error { self.showSendError(error) }
+        }
+    }
+
+    // MARK: - Video attach / upload / send
+
+    // Dimensions and duration pulled off the picked file for the event's `info`.
+    private struct VideoMeta {
+        let width: Int
+        let height: Int
+        let durationMs: Int
+    }
+
+    // The upload path holds the whole file in memory, and libcurl copies the body
+    // again (CURLOPT_COPYPOSTFIELDS), so peak use is roughly twice the file size.
+    // Past this cap a 4S risks a low-memory kill, which is worse than refusing —
+    // so oversized clips get an alert. A streaming upload would lift the limit.
+    private static let maxVideoUploadBytes = 16 * 1024 * 1024
+
+    // DIAGNOSTIC: video send/render is invisible on device (no console), and the
+    // remux falls back silently by design, so leave a breadcrumb trail in
+    // UserDefaults for Settings → Diagnostics to show. Remove once confirmed.
+    static let videoTraceKey = "elementold.videoTrace"
+    private static var tracedVideoRows = Set<String>()
+    static func videoTrace(_ line: String) {
+        let defaults = UserDefaults.standard
+        var lines = defaults.stringArray(forKey: videoTraceKey) ?? []
+        lines.append(line)
+        if lines.count > 10 { lines.removeFirst(lines.count - 10) }
+        defaults.set(lines, forKey: videoTraceKey)
+        defaults.synchronize()
+    }
+
+    private func uploadAndSendVideo(atPath path: String) {
+        guard !isSending else { return }
+        // Video replies aren't supported yet, so clear any queued reply rather than
+        // leaving the strip up over a send that won't carry the relation.
+        endReply()
+        // Locked before the export starts, so a second pick can't race it.
+        setSending(true)
+        remuxToMP4(path: path) { [weak self] preparedPath, isTemporary in
+            self?.uploadPreparedVideo(atPath: preparedPath, temporary: isTemporary)
+        }
+    }
+
+    // The camera and library hand us QuickTime (.mov). mautrix-whatsapp re-encodes
+    // whatever it gets, but mautrix-meta passes the bytes through untouched, and
+    // Messenger then won't play a .mov — so rewrap into MP4 first. Passthrough means
+    // no re-encode: the tracks are copied, so it's fast and lossless. When it isn't
+    // available for this asset we send the original unchanged rather than fail.
+    private func remuxToMP4(path: String, completion: @escaping (String, Bool) -> Void) {
+        RoomTimelineVC.videoTrace("pick .\(RoomTimelineVC.videoExtension(of: path))")
+        guard RoomTimelineVC.videoExtension(of: path) != "mp4" else {
+            RoomTimelineVC.videoTrace("remux skip: already mp4")
+            completion(path, false)
+            return
+        }
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        // Deliberately NOT gated on exportPresets(compatibleWith:) — that call never
+        // lists passthrough, so gating on it skipped the remux every time. The real
+        // test is whether the session can write MP4: a passthrough session only
+        // rewraps into containers its tracks already fit, and setting an unsupported
+        // outputFileType raises, so this must be checked before assigning it.
+        guard let session = AVAssetExportSession(asset: asset,
+                                                 presetName: AVAssetExportPresetPassthrough),
+              session.supportedFileTypes.contains(.mp4) else {
+            RoomTimelineVC.videoTrace("remux skip: mp4 unsupported")
+            completion(path, false)
+            return
+        }
+        // Unique name: the export refuses to write over an existing file. NSString
+        // path append — URL.appendingPathComponent hangs on this runtime.
+        let name = "elementold-remux-\(Int64(Date().timeIntervalSince1970 * 1000)).mp4"
+        let outPath = (NSTemporaryDirectory() as NSString).appendingPathComponent(name)
+        session.outputURL = URL(fileURLWithPath: outPath)
+        session.outputFileType = .mp4
+        session.shouldOptimizeForNetworkUse = true
+        session.exportAsynchronously {
+            // AVFoundation calls back off the main thread, unlike CurlFetcher.
+            DispatchQueue.main.async {
+                guard session.status == .completed else {
+                    let reason = (session.error as NSError?).map { "\($0.domain) \($0.code)" } ?? "none"
+                    RoomTimelineVC.videoTrace("remux failed: status=\(session.status.rawValue) err=\(reason)")
+                    try? FileManager.default.removeItem(atPath: outPath)
+                    completion(path, false)
+                    return
+                }
+                RoomTimelineVC.videoTrace("remux ok -> mp4")
+                completion(outPath, true)
+            }
+        }
+    }
+
+    private func uploadPreparedVideo(atPath path: String, temporary: Bool) {
+        // Stat before reading: an oversized file must never be loaded at all. This
+        // checks the prepared file, which is the one that actually lands in memory.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let sizeBytes = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        guard sizeBytes > 0 else {
+            failVideoSend(title: "Couldn't read video",
+                          message: "The picked video couldn't be opened.",
+                          temporaryPath: temporary ? path : nil)
+            return
+        }
+        let cap = RoomTimelineVC.maxVideoUploadBytes
+        guard sizeBytes <= cap else {
+            failVideoSend(title: "Video too large",
+                          message: String(format: "That video is %.1f MB. The limit is %d MB — try a shorter clip.",
+                                          Double(sizeBytes) / (1024 * 1024), cap / (1024 * 1024)),
+                          temporaryPath: temporary ? path : nil)
+            return
+        }
+
+        let meta = videoMeta(path: path)
+        let ext = RoomTimelineVC.videoExtension(of: path)
+        let mime = RoomTimelineVC.videoMimeType(extension: ext)
+        let filename = "elementold-\(Int64(Date().timeIntervalSince1970 * 1000)).\(ext)"
+        RoomTimelineVC.videoTrace("send \(mime) \(sizeBytes / 1024)KB \(meta.width)x\(meta.height)")
+
+        // Poster frame first: it goes out before the video so the big Data isn't
+        // resident while a second request is in flight, and the event can then
+        // carry thumbnail_url (without it other clients show a bare filename).
+        uploadVideoThumbnail(path: path) { [weak self] thumbMxc, thumbInfo, thumbImage in
+            guard let self = self else { return }
+            let data = FileManager.default.contents(atPath: path)
+            // Earliest safe point to drop the remux output: the bytes are in memory
+            // now, so no later path has to remember to clean up.
+            if temporary { try? FileManager.default.removeItem(atPath: path) }
+            guard let data = data else {
+                self.failVideoSend(title: "Couldn't read video",
+                                   message: "The picked video couldn't be opened.",
+                                   temporaryPath: nil)
+                return
+            }
+            self.client.uploadMedia(data: data, filename: filename, mimeType: mime) { json, error in
+                guard let mxc = json?["content_uri"] as? String else {
+                    self.setSending(false)
+                    self.showSendError(error ?? MatrixAPIClient.MatrixError(errcode: "M_UNKNOWN",
+                                                                            error: "Upload returned no content_uri"))
+                    return
+                }
+                self.sendVideoMessage(mxc: mxc, filename: filename, mimeType: mime,
+                                      size: data.count, meta: meta,
+                                      thumbMxc: thumbMxc, thumbInfo: thumbInfo, thumbImage: thumbImage)
+            }
+        }
+    }
+
+    private func failVideoSend(title: String, message: String, temporaryPath: String?) {
+        if let temporaryPath = temporaryPath { try? FileManager.default.removeItem(atPath: temporaryPath) }
+        setSending(false)
+        showAlert(title: title, message: message)
+    }
+
+    private func sendVideoMessage(mxc: String, filename: String, mimeType: String, size: Int,
+                                  meta: VideoMeta, thumbMxc: String?, thumbInfo: [String: Any]?,
+                                  thumbImage: UIImage?) {
+        let path = "/_matrix/client/v3/rooms/\(room.roomId)/send/m.room.message/\(newTxnId())"
+        // Only send fields we actually resolved — a zero width or duration is worse
+        // than an absent one, since receivers lay out from whatever we advertise.
+        var info: [String: Any] = ["mimetype": mimeType, "size": size]
+        if meta.width > 0 { info["w"] = meta.width }
+        if meta.height > 0 { info["h"] = meta.height }
+        if meta.durationMs > 0 { info["duration"] = meta.durationMs }
+        if let thumbMxc = thumbMxc {
+            info["thumbnail_url"] = thumbMxc
+            if let thumbInfo = thumbInfo { info["thumbnail_info"] = thumbInfo }
+        }
+        let body: [String: Any] = ["msgtype": "m.video", "body": filename, "url": mxc, "info": info]
+        // Prime the cache with the poster we already have, under the exact key our
+        // own row will ask for: a just-uploaded mxc 404s on the thumbnail endpoint
+        // for a moment, which would otherwise leave our bubble grey (same fix as
+        // sendImageMessage).
+        if let thumbMxc = thumbMxc, let thumbImage = thumbImage {
+            let (reqW, reqH) = ImageEventCell.thumbnailRequestSize(imageWidth: meta.width,
+                                                                  imageHeight: meta.height)
+            MediaCache.shared.storeThumbnail(thumbImage, mxc: thumbMxc, width: reqW, height: reqH)
+        }
+        client.put(path, body: body) { [weak self] _, error in
+            guard let self = self else { return }
+            self.setSending(false)
+            if let error = error { self.showSendError(error) }
+        }
+    }
+
+    // Always calls back: a nil mxc just means the video sends without a preview,
+    // which is much better than failing the whole send over a poster frame. The
+    // image comes back too, so the caller can prime the cache with it.
+    private func uploadVideoThumbnail(path: String,
+                                      completion: @escaping (String?, [String: Any]?, UIImage?) -> Void) {
+        guard let thumb = videoThumbnail(path: path),
+              let data = thumb.jpegData(compressionQuality: 0.7) else {
+            completion(nil, nil, nil)
+            return
+        }
+        let filename = "elementold-thumb-\(Int64(Date().timeIntervalSince1970 * 1000)).jpg"
+        client.uploadMedia(data: data, filename: filename, mimeType: "image/jpeg") { json, _ in
+            guard let mxc = json?["content_uri"] as? String, !mxc.isEmpty else {
+                completion(nil, nil, nil)
+                return
+            }
+            completion(mxc, ["mimetype": "image/jpeg",
+                             "w": Int(thumb.size.width),
+                             "h": Int(thumb.size.height),
+                             "size": data.count], thumb)
+        }
+    }
+
+    private func videoThumbnail(path: String) -> UIImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: URL(fileURLWithPath: path)))
+        // Without this a clip recorded in portrait comes out sideways.
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 800, height: 800)
+        // Half a second in: the first frame of a recording is often black.
+        let time = CMTimeMakeWithSeconds(0.5, preferredTimescale: 600)
+        guard let cg = try? generator.copyCGImage(at: time, actualTime: nil) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
+    private func videoMeta(path: String) -> VideoMeta {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        let seconds = CMTimeGetSeconds(asset.duration)
+        let durationMs = (seconds.isFinite && seconds > 0) ? Int(seconds * 1000) : 0
+        var width = 0
+        var height = 0
+        if let track = asset.tracks(withMediaType: .video).first {
+            // naturalSize ignores the rotation held in the track transform, so a
+            // portrait clip would otherwise be advertised as landscape.
+            let size = track.naturalSize.applying(track.preferredTransform)
+            width = Int(abs(size.width))
+            height = Int(abs(size.height))
+        }
+        return VideoMeta(width: width, height: height, durationMs: durationMs)
+    }
+
+    // The picker hands back .MOV on iOS 6-9; keep the real extension so receivers
+    // can infer the type from the filename when they ignore `info.mimetype`.
+    private static func videoExtension(of path: String) -> String {
+        let ext = fileExtension(of: path)
+        return ["mov", "mp4", "m4v", "3gp"].contains(ext) ? ext : "mov"
+    }
+
+    private static func videoMimeType(extension ext: String) -> String {
+        switch ext {
+        case "mp4", "m4v": return "video/mp4"
+        case "3gp": return "video/3gpp"
+        default: return "video/quicktime"
         }
     }
 
@@ -1901,7 +2176,7 @@ class RoomTimelineVC: UIViewController {
         guard fileProgress[mxc] == nil else { return }   // already downloading
 
         fileProgress[mxc] = 0
-        visibleFileCell(for: mxc)?.setProgress(0)
+        visibleAttachmentCell(for: mxc)?.setProgress(0)
         MediaCache.shared.downloadFile(mxc: mxc, filename: filename, mimeType: mimeType,
                                        progress: { [weak self] fraction in
             guard let self = self else { return }
@@ -1910,11 +2185,11 @@ class RoomTimelineVC: UIViewController {
             let previous = self.fileProgress[mxc] ?? -1
             guard Int(fraction * 100) != Int(previous * 100) else { return }
             self.fileProgress[mxc] = fraction
-            self.visibleFileCell(for: mxc)?.setProgress(fraction)
+            self.visibleAttachmentCell(for: mxc)?.setProgress(fraction)
         }) { [weak self] path in
             guard let self = self else { return }
             self.fileProgress.removeValue(forKey: mxc)
-            let cell = self.visibleFileCell(for: mxc)
+            let cell = self.visibleAttachmentCell(for: mxc)
             if let path = path {
                 cell?.markDownloaded()
                 // The download was started by an explicit tap, so open it right
@@ -1993,9 +2268,9 @@ class RoomTimelineVC: UIViewController {
         return String(filename[filename.index(after: dot)...]).lowercased()
     }
 
-    private func visibleFileCell(for mxc: String) -> FileEventCell? {
+    private func visibleAttachmentCell(for mxc: String) -> AttachmentProgressCell? {
         for cell in tableView.visibleCells {
-            if let fileCell = cell as? FileEventCell, fileCell.mxc == mxc { return fileCell }
+            if let attachment = cell as? AttachmentProgressCell, attachment.mxc == mxc { return attachment }
         }
         return nil
     }
@@ -2119,6 +2394,15 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
                 let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
                 return topMargin + metaBlock + FileEventCell.bubbleHeight + EventCell.bottomMargin
+            case .video(_, let video):
+                let maxBubbleWidth = width * EventCell.bubbleWidthFraction
+                let posterSize = ImageEventCell.displaySize(imageWidth: video.width,
+                                                            imageHeight: video.height,
+                                                            maxWidth: maxBubbleWidth)
+                let hasMeta = hasMetaHeader(eventRow)
+                let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
+                let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+                return topMargin + metaBlock + posterSize.height + EventCell.bottomMargin
             case .membership:
                 return 30
             case .reaction, .redaction, .edit:
@@ -2156,7 +2440,8 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                             isEmote: isEmote) != nil
         case .image(let sender, _, _, _, _),
              .audio(let sender, _, _, _),
-             .file(let sender, _, _, _, _):
+             .file(let sender, _, _, _, _),
+             .video(let sender, _):
             return metaText(sender: sender, isOwn: sender == MatrixSession.userId,
                             isEmote: false) != nil
         case .membership, .reaction, .redaction, .edit:
@@ -2203,6 +2488,7 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         case .image: return "Photo"
         case .audio: return "Voice message"
         case .file(_, _, let filename, _, _): return filename
+        case .video: return "Video"
         default: return nil
         }
     }
@@ -2317,6 +2603,32 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 cell.setRevealOffset(revealOffset)
                 cell.onTap = { [weak self] in
                     self?.handleFileTap(mxc: mxc, filename: filename, mimeType: mimeType)
+                }
+                return cell
+
+            case .video(let sender, let video):
+                let cell = (tableView.dequeueReusableCell(withIdentifier: videoCellId) as? VideoEventCell) ??
+                    VideoEventCell(style: .default, reuseIdentifier: videoCellId)
+                let isOwn = sender == MatrixSession.userId
+                let time = TimeFormat.shortTime(msSinceEpoch: eventRow.event.timestamp)
+                let meta = eventRow.showMeta ? metaText(sender: sender, isOwn: isOwn, isEmote: false) : nil
+                let downloaded = MediaCache.shared.downloadedFilePath(mxc: video.mxc, filename: video.filename,
+                                                                      mimeType: video.mimeType) != nil
+                // DIAGNOSTIC: distinguishes "no video cell at all" from "video cell
+                // with no poster to draw". Once per mxc — cellForRowAt runs on every
+                // scroll and reload, and each trace writes UserDefaults. Remove once
+                // confirmed.
+                if RoomTimelineVC.tracedVideoRows.insert(video.mxc).inserted {
+                    RoomTimelineVC.videoTrace("row \(video.mimeType) thumb="
+                                              + (video.thumbnailMxc != nil ? "yes" : "no"))
+                }
+                cell.configure(meta: meta, video: video, downloaded: downloaded, time: time, isOwn: isOwn,
+                               avatarMxc: memberAvatars[sender], senderName: memberNames[sender] ?? sender)
+                // Reflect an in-flight download onto this (possibly recycled) cell.
+                cell.setProgress(fileProgress[video.mxc])
+                cell.setRevealOffset(revealOffset)
+                cell.onTap = { [weak self] in
+                    self?.handleFileTap(mxc: video.mxc, filename: video.filename, mimeType: video.mimeType)
                 }
                 return cell
 
@@ -2871,10 +3183,19 @@ private class AudioEventCell: UITableViewCell {
     }
 }
 
-// An m.file / m.video attachment bubble: a file-type "chip" (the uppercase
-// extension) next to the filename and a "PDF · 2.4 MB" subtitle. Display only
-// for now — downloading and opening the attachment comes later.
-private class FileEventCell: UITableViewCell {
+// Both attachment bubbles (the generic file chip and the video poster) show
+// download progress the same way, so the tap/progress plumbing in the VC drives
+// them through this instead of naming a concrete cell class.
+fileprivate protocol AttachmentProgressCell: AnyObject {
+    var mxc: String? { get }
+    func setProgress(_ progress: Float?)
+    func markDownloaded()
+}
+
+// An m.file attachment bubble: a file-type "chip" (the uppercase extension) next
+// to the filename and a "PDF · 2.4 MB" subtitle. Tapping downloads it (progress
+// shown inline) and then opens it.
+private class FileEventCell: UITableViewCell, AttachmentProgressCell {
     static let bubbleHeight: CGFloat = 58
     static let bubbleMaxWidth: CGFloat = 250
 
@@ -3096,6 +3417,232 @@ private class FileEventCell: UITableViewCell {
     }
 }
 
+// An m.video attachment bubble: the sender's poster frame with a play badge and
+// a duration pill, sized like an image bubble. Falls back to the plain grey
+// placeholder when the sender supplied no thumbnail — pulling a frame out of the
+// video itself would mean downloading the whole thing first. Tapping downloads
+// and plays, sharing the VC's file-download plumbing.
+private class VideoEventCell: UITableViewCell, AttachmentProgressCell {
+    private let bubble = UIView()
+    private let posterView = UIImageView()
+    private let playBadge = UIView()
+    private let playIcon = UIImageView()
+    private let durationLabel = UILabel()
+    private let progressView = UIProgressView(progressViewStyle: .default)
+    private let metaLabel = UILabel()
+    private let avatarView = AvatarView()
+    private let revealTimeLabel = UILabel()
+    private var isOwnMessage = false
+    private var hasMeta = false
+    private var revealOffset: CGFloat = 0
+    private var posterWidth = 0
+    private var posterHeight = 0
+
+    // Download state and the idle subtitle ("0:23", or the size when the sender
+    // omitted a duration), kept so a progress tick needn't re-derive them.
+    private var isDownloaded = false
+    private var idleText = ""
+
+    // The thumbnail mxc currently being loaded — guards a stale async load from
+    // landing on a recycled cell. Separate from `mxc`, which is the video itself
+    // (what the VC matches download progress against).
+    private var currentThumbnailMxc: String?
+    var mxc: String?
+    var onTap: (() -> Void)?
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+
+        // iOS 6: UILabel defaults to an opaque white background — every label
+        // over the bubble must be cleared explicitly.
+        metaLabel.backgroundColor = .clear
+        metaLabel.font = UIFont.systemFont(ofSize: 11)
+        metaLabel.textColor = .gray
+        contentView.addSubview(metaLabel)
+
+        avatarView.isHidden = true
+        contentView.addSubview(avatarView)
+
+        bubble.layer.cornerRadius = 12
+        bubble.layer.masksToBounds = true
+        bubble.backgroundColor = UIColor(white: 0.85, alpha: 1.0)   // placeholder tint
+        contentView.addSubview(bubble)
+
+        posterView.contentMode = .scaleAspectFill
+        posterView.clipsToBounds = true
+        bubble.addSubview(posterView)
+
+        // Dark scrim behind the glyph so the badge reads over a light frame.
+        playBadge.backgroundColor = UIColor(white: 0, alpha: 0.45)
+        playBadge.layer.cornerRadius = VideoEventCell.badgeSize / 2
+        playBadge.layer.masksToBounds = true
+        bubble.addSubview(playBadge)
+
+        // The white variant, since the badge behind it is always dark.
+        playIcon.image = UIImage(named: "PlayWhite")
+        playIcon.contentMode = .scaleAspectFit
+        playBadge.addSubview(playIcon)
+
+        // This one keeps a background on purpose: it's a pill over the poster.
+        durationLabel.backgroundColor = UIColor(white: 0, alpha: 0.45)
+        durationLabel.font = UIFont.boldSystemFont(ofSize: 11)
+        durationLabel.textColor = .white
+        durationLabel.textAlignment = .center
+        durationLabel.layer.cornerRadius = 4
+        durationLabel.layer.masksToBounds = true
+        bubble.addSubview(durationLabel)
+
+        progressView.isHidden = true
+        progressView.progressTintColor = .white
+        bubble.addSubview(progressView)
+
+        revealTimeLabel.backgroundColor = .clear
+        revealTimeLabel.font = UIFont.systemFont(ofSize: 11)
+        revealTimeLabel.textColor = .gray
+        revealTimeLabel.textAlignment = .right
+        revealTimeLabel.isHidden = true
+        contentView.addSubview(revealTimeLabel)
+
+        bubble.isUserInteractionEnabled = true
+        bubble.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(bubbleTapped)))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    @objc private func bubbleTapped() { onTap?() }
+
+    func configure(meta: String?, video: VideoAttachment, downloaded: Bool, time: String, isOwn: Bool,
+                   avatarMxc: String?, senderName: String) {
+        isOwnMessage = isOwn
+        hasMeta = meta != nil
+        metaLabel.isHidden = !hasMeta
+        metaLabel.text = meta
+        metaLabel.textAlignment = isOwn ? .right : .left
+        revealTimeLabel.text = time
+        let showAvatar = !isOwn && hasMeta
+        avatarView.isHidden = !showAvatar
+        if showAvatar { avatarView.setAvatar(mxc: avatarMxc, name: senderName) }
+
+        mxc = video.mxc
+        isDownloaded = downloaded
+        posterWidth = video.width
+        posterHeight = video.height
+        idleText = VideoEventCell.idleText(video: video)
+        setProgress(nil)
+
+        // The poster is an ordinary thumbnail request keyed on the thumbnail's own
+        // mxc, but sized from the video's dimensions so the box matches rowHeight.
+        posterView.image = nil
+        currentThumbnailMxc = video.thumbnailMxc
+        if let thumb = video.thumbnailMxc {
+            let (reqW, reqH) = ImageEventCell.thumbnailRequestSize(imageWidth: video.width,
+                                                                   imageHeight: video.height)
+            MediaCache.shared.loadThumbnail(mxc: thumb, width: reqW, height: reqH) { [weak self] image in
+                guard let self = self, self.currentThumbnailMxc == thumb, let image = image else { return }
+                self.posterView.image = image
+            }
+        }
+
+        setNeedsLayout()
+    }
+
+    // `progress` nil means "not downloading" — the pill then shows the duration.
+    func setProgress(_ progress: Float?) {
+        if let progress = progress {
+            progressView.isHidden = false
+            progressView.progress = progress
+            playBadge.isHidden = true
+            durationLabel.text = " \(Int(progress * 100))% "
+            return
+        }
+        progressView.isHidden = true
+        playBadge.isHidden = false
+        durationLabel.text = " \(idleText) "
+        setNeedsLayout()
+    }
+
+    func markDownloaded() {
+        isDownloaded = true
+        setProgress(nil)
+    }
+
+    func setRevealOffset(_ offset: CGFloat) {
+        guard offset != revealOffset else { return }
+        revealOffset = offset
+        setNeedsLayout()
+        layoutIfNeeded()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let maxBubbleWidth = contentView.bounds.width * EventCell.bubbleWidthFraction
+        let box = ImageEventCell.displaySize(imageWidth: posterWidth, imageHeight: posterHeight,
+                                             maxWidth: maxBubbleWidth)
+
+        let leftEdge = EventCell.outerMargin + (isOwnMessage ? 0 : EventCell.senderGutter)
+
+        var y: CGFloat = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+        if hasMeta {
+            let metaX = isOwnMessage ? contentView.bounds.width - EventCell.outerMargin - maxBubbleWidth
+                                     : leftEdge
+            metaLabel.frame = CGRect(x: metaX - revealOffset, y: y,
+                                      width: maxBubbleWidth, height: EventCell.metaHeight)
+            y += EventCell.metaHeight + EventCell.metaGap
+        }
+
+        let bubbleX = isOwnMessage ? contentView.bounds.width - box.width - EventCell.outerMargin
+                                    : leftEdge
+        bubble.frame = CGRect(x: bubbleX - revealOffset, y: y, width: box.width, height: box.height)
+        posterView.frame = bubble.bounds
+
+        let badge = VideoEventCell.badgeSize
+        playBadge.frame = CGRect(x: (box.width - badge) / 2, y: (box.height - badge) / 2,
+                                  width: badge, height: badge)
+        // Inset the glyph, and nudge it right: a triangle's visual centre sits
+        // left of its bounding box.
+        playIcon.frame = playBadge.bounds.insetBy(dx: 10, dy: 10).offsetBy(dx: 1, dy: 0)
+
+        let pillWidth = min(box.width - 12, durationLabel.sizeThatFits(CGSize(width: box.width,
+                                                                             height: 16)).width + 8)
+        durationLabel.frame = CGRect(x: 6, y: box.height - 22, width: max(28, pillWidth), height: 16)
+        progressView.frame = CGRect(x: 6, y: box.height - 4, width: box.width - 12, height: 2)
+
+        if !avatarView.isHidden {
+            let ax = EventCell.outerMargin - revealOffset
+            let ay = bubble.frame.maxY - EventCell.avatarSize
+            avatarView.frame = CGRect(x: ax, y: ay, width: EventCell.avatarSize, height: EventCell.avatarSize)
+        }
+
+        revealTimeLabel.frame = CGRect(x: contentView.bounds.width - EventCell.maxReveal + 2,
+                                        y: bubble.frame.minY, width: EventCell.maxReveal - 8,
+                                        height: bubble.frame.height)
+        revealTimeLabel.isHidden = revealOffset <= 0.5
+    }
+
+    private static let badgeSize: CGFloat = 44
+
+    // "0:23" when the sender gave a duration, else the size, else just "Video" —
+    // the pill doubles as the only affordance saying this is a playable clip.
+    private static func idleText(video: VideoAttachment) -> String {
+        if video.durationMs > 0 {
+            let total = video.durationMs / 1000
+            return String(format: "%d:%02d", total / 60, total % 60)
+        }
+        if video.sizeBytes > 0 { return humanSize(video.sizeBytes) }
+        return "Video"
+    }
+
+    private static func humanSize(_ bytes: Int) -> String {
+        let b = Double(bytes)
+        if b >= 1024 * 1024 { return String(format: "%.1f MB", b / (1024 * 1024)) }
+        if b >= 1024 { return String(format: "%.0f KB", b / 1024) }
+        return "\(bytes) B"
+    }
+}
+
 extension RoomTimelineVC: UITextViewDelegate {
     func textViewDidChange(_ textView: UITextView) {
         placeholderLabel.isHidden = !textView.text.isEmpty
@@ -3108,6 +3655,12 @@ extension RoomTimelineVC: UIImagePickerControllerDelegate, UINavigationControlle
     func imagePickerController(_ picker: UIImagePickerController,
                                didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
         picker.dismiss(animated: true)
+        // A movie pick carries .mediaURL, a photo carries .originalImage. Check the
+        // movie key first, since some sources hand back both.
+        if let url = info[.mediaURL] as? URL {
+            uploadAndSendVideo(atPath: url.path)
+            return
+        }
         guard let image = info[.originalImage] as? UIImage else { return }
         uploadAndSendImage(image)
     }
