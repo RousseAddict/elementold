@@ -140,9 +140,16 @@ struct RoomEvent {
     // carries no event ids, so we can't tell whether one of them is ours.
     var bundledReactions: [(key: String, count: Int)] = []
 
+    // The transaction id we generated when sending this event, echoed back by the
+    // homeserver in unsigned.transaction_id — present only on our own events, and
+    // only for the device that sent them. It's how a queued message recognises its
+    // own arrival and retires its placeholder row.
+    var transactionId: String? = nil
+
     static func parse(_ json: [String: Any]) -> RoomEvent? {
         guard var event = parseEvent(json) else { return nil }
         event.bundledReactions = parseBundledReactions(json)
+        event.transactionId = (json["unsigned"] as? [String: Any])?["transaction_id"] as? String
         return event
     }
 

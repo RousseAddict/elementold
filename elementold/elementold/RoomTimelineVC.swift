@@ -209,6 +209,9 @@ class RoomTimelineVC: UIViewController {
         case receipt(String)
         // A strip of reaction chips under the message they annotate.
         case reactions(ReactionRow)
+        // An outgoing message the server hasn't confirmed yet. Always the last
+        // rows in the list, so it never has to interleave with real events.
+        case pending(PendingMessage)
     }
     private struct ReactionRow {
         let targetEventId: String
@@ -216,6 +219,41 @@ class RoomTimelineVC: UIViewController {
         let isOwn: Bool
     }
     private var rows: [Row] = []
+
+    // A message we've accepted from the composer but the homeserver hasn't
+    // confirmed yet. Sending no longer blocks the input: the text leaves the
+    // field immediately, appears as a provisional bubble, and is retired when
+    // /sync echoes it back. "Sent" isn't a state here — confirmation *removes*
+    // the entry and the real event takes over the row.
+    private enum PendingState { case sending, failed }
+    private struct PendingMessage {
+        // The Matrix transaction id, which doubles as this entry's identity. A
+        // retry deliberately reuses it: that's exactly what transaction ids are
+        // for, so retrying can't duplicate a message the server did receive.
+        let txnId: String
+        let body: String
+        let replyTo: String?
+        // Local clock, only used to order the queue and to pick a date header.
+        // Int64, not Int — a millisecond epoch overflows 32-bit Int on armv7.
+        let timestamp: Int64
+        var state: PendingState
+        // Filled from the send response. A second way to recognise the event
+        // when it arrives, in case unsigned.transaction_id is absent.
+        var eventId: String?
+        // Why the last attempt failed, shown when the row is tapped. Without it
+        // a rejection (a size limit, M_FORBIDDEN) would be indistinguishable
+        // from a dropped connection.
+        var errorText: String? = nil
+    }
+    // Strictly main-thread: handleSync runs off the sync thread, so it matches
+    // ids there but mutates this inside its existing main-queue hop.
+    private var pending: [PendingMessage] = []
+    // Only one send is in flight at a time. Not for the UI's sake — the input is
+    // free the whole time — but because Synapse orders events by receipt, so
+    // firing the queue in parallel could land messages out of order.
+    private var isSendInFlight = false
+    // The failed message whose row was tapped, awaiting the retry/discard sheet.
+    private var pendingActionTxnId: String?
 
     // target event id -> reaction key -> OUR reaction's event id, rebuilt with
     // the rows. Lets a tap tell "add" from "take back" (which needs the event
@@ -236,6 +274,7 @@ class RoomTimelineVC: UIViewController {
     // one UIActionSheetDelegate serves them and the "+" attach sheet.
     private let reactionSheetTag = 93
     private let deleteSheetTag = 94
+    private let pendingSheetTag = 96
 
     // Offered by the long-press "React" menu item. All Unicode 6.0, so they
     // exist in the Apple Color Emoji font shipped with iOS 6.
@@ -497,6 +536,10 @@ class RoomTimelineVC: UIViewController {
     // Copyable text for a row (message body, image caption, or membership line);
     // nil for date/receipt separators (nothing to copy).
     private func copyText(for row: Row) -> String? {
+        // A queued message has real text on screen, so copying it is meaningful
+        // even though it has no event id yet (which is why the react/reply/delete
+        // helpers above deliberately refuse it).
+        if case .pending(let message) = row { return message.body }
         guard case .event(let eventRow) = row else { return nil }
         switch eventRow.event.kind {
         // Copy what's actually on screen, which for an edited message is the
@@ -1196,6 +1239,10 @@ class RoomTimelineVC: UIViewController {
         if tableChanged || typingChanged {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
+                // Retiring a queued message has to happen on the main thread with
+                // the rest of the UI work — `pending` is only ever touched here
+                // and from the composer, both on main.
+                if !newOnes.isEmpty { self.retirePending(matching: newOnes) }
                 if tableChanged {
                     self.reloadTable()
                     self.updateStatusLabel()
@@ -1384,6 +1431,19 @@ class RoomTimelineVC: UIViewController {
             }
             prevEvent = event
         }
+        // Queued messages tail the list — they're by definition newer than
+        // anything the server has sent us, so they never interleave. The day key
+        // carries on from the loop above so a message queued past midnight still
+        // gets its own date separator.
+        for message in pending {
+            let ts = Double(message.timestamp)
+            let key = TimeFormat.dayKey(msSinceEpoch: ts)
+            if key != lastDayKey {
+                result.append(.date(TimeFormat.dateHeader(msSinceEpoch: ts)))
+                lastDayKey = key
+            }
+            result.append(.pending(message))
+        }
         rows = result
     }
 
@@ -1475,14 +1535,15 @@ class RoomTimelineVC: UIViewController {
 
     // MARK: - Sending
 
+    // Accepts the composed text into the outgoing queue and returns immediately.
+    // Nothing here waits on the network: the field empties, a provisional bubble
+    // appears at the bottom, and the user can carry on typing while earlier
+    // messages are still on the wire.
     @objc private func sendTapped() {
         if inputMode == .voice { sendVoiceMessage(); return }
         guard let text = messageField.text, !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        // Give immediate feedback and prevent double-sends: a failure here used
-        // to only `print()` (invisible with no attached Xcode console on the
-        // ad-hoc-installed IPA), so the send button looked "stuck" with no
-        // indication anything happened, whether it succeeded, failed, or was
-        // still in flight.
+        // A media upload still holds the old lock (one shared progress strip
+        // can't describe two uploads), and it disables this button anyway.
         guard !isSending else { return }
         messageField.text = ""
         // Programmatic text changes don't fire textViewDidChange, so restore the
@@ -1490,12 +1551,32 @@ class RoomTimelineVC: UIViewController {
         placeholderLabel.isHidden = false
         adjustInputHeight()
         sendTypingStop()
-        setSending(true)
 
-        let path = "/_matrix/client/v3/rooms/\(room.roomId)/send/m.room.message/\(newTxnId())"
-        var body: [String: Any] = ["msgtype": "m.text", "body": text]
+        // The reply relation travels with the queued message, so the composer
+        // strip can be cleared unconditionally right now — a failure later
+        // retries from the queue entry and still answers the right message.
         let replyTarget = replyingToEventId
-        if let replyTarget = replyTarget {
+        endReply()
+        pending.append(PendingMessage(txnId: newTxnId(), body: text, replyTo: replyTarget,
+                                      timestamp: Int64(Date().timeIntervalSince1970 * 1000),
+                                      state: .sending, eventId: nil))
+        reloadTable()
+        scrollToBottom(animated: true)
+        pumpSendQueue()
+    }
+
+    // Sends the oldest still-unsent message, one at a time. Re-entrant-safe via
+    // `isSendInFlight`, and called again from each completion so the queue drains
+    // itself in order.
+    private func pumpSendQueue() {
+        guard !isSendInFlight else { return }
+        guard let index = pending.firstIndex(where: { $0.state == .sending && $0.eventId == nil }) else { return }
+        let message = pending[index]
+        isSendInFlight = true
+
+        let path = "/_matrix/client/v3/rooms/\(room.roomId)/send/m.room.message/\(message.txnId)"
+        var body: [String: Any] = ["msgtype": "m.text", "body": message.body]
+        if let replyTo = message.replyTo {
             // m.relates_to alone, with NO legacy "> <@alice:server> …" fallback
             // prepended to the body. MSC2781 removed reply fallbacks from the
             // spec (Matrix 1.13) and Element stopped sending them; bridges built
@@ -1503,27 +1584,114 @@ class RoomTimelineVC: UIViewController {
             // longer strip one, so a fallback we send arrives on the far side as
             // literal message text. Older bridges (mautrix-discord) still strip
             // it, which is why the leak only showed up on some networks.
-            body["m.relates_to"] = ["m.in_reply_to": ["event_id": replyTarget]]
-            endReply()
+            body["m.relates_to"] = ["m.in_reply_to": ["event_id": replyTo]]
         }
-        client.put(path, body: body) { [weak self] _, error in
+        client.put(path, body: body) { [weak self] json, error in
             guard let self = self else { return }
-            self.setSending(false)
-            if let error = error {
-                self.messageField.text = text  // don't lose what the user typed
-                self.placeholderLabel.isHidden = true
-                self.adjustInputHeight()
-                // Restore the reply context too, so retrying still answers the
-                // message the user picked.
-                if let replyTarget = replyTarget { self.beginReply(to: replyTarget) }
-                self.showSendError(error)
+            self.isSendInFlight = false
+            // The entry may already be gone: /sync can deliver the event before
+            // this response arrives, which retires it on the transaction id.
+            if let current = self.pending.firstIndex(where: { $0.txnId == message.txnId }) {
+                if let error = error {
+                    self.pending[current].state = .failed
+                    self.pending[current].errorText = "\(error)"
+                } else if let eventId = json?["event_id"] as? String {
+                    // Confirmed. The row stays until /sync brings the real event,
+                    // so the bubble doesn't blink out and back in; recording the
+                    // id lets that sync retire it even without a transaction id.
+                    self.pending[current].eventId = eventId
+                } else {
+                    // Accepted but we've no id to match on — drop the placeholder
+                    // and let /sync render the message as an ordinary event.
+                    self.pending.remove(at: current)
+                }
+                self.reloadTable()
             }
+            // No alert on failure: the bubble itself says it didn't send, and a
+            // queue drained while offline would otherwise stack up one alert per
+            // message. The reason is shown when the row is tapped instead.
+            self.pumpSendQueue()
         }
     }
 
-    // Toggles the "a send is in flight" UI state across the whole input bar so
-    // text sends and image uploads share one consistent lock (double-send guard
-    // + disabled controls + spinner-ish "…" on the send button).
+    // Drops any queued message the homeserver has now echoed back to us, matching
+    // on the transaction id it returns on our own events (or on the event id the
+    // send response gave us, for a server that omits one). The caller reloads the
+    // table either way, since it only runs when new events arrived. Main thread.
+    private func retirePending(matching newEvents: [RoomEvent]) {
+        guard !pending.isEmpty else { return }
+        var txnIds = Set<String>()
+        var eventIds = Set<String>()
+        for event in newEvents {
+            if let txnId = event.transactionId { txnIds.insert(txnId) }
+            eventIds.insert(event.eventId)
+        }
+        pending.removeAll { message in
+            if txnIds.contains(message.txnId) { return true }
+            if let eventId = message.eventId, eventIds.contains(eventId) { return true }
+            return false
+        }
+    }
+
+    // MARK: - Failed sends
+
+    // Tapping a failed bubble offers to send it again or throw it away. Retrying
+    // reuses the original transaction id, so if the server actually did receive
+    // the first attempt this can't produce a duplicate. Deliberately no automatic
+    // retry: a homeserver that's rejecting us (M_FORBIDDEN, a size limit) would
+    // otherwise be retried forever.
+    private func handlePendingTap(_ txnId: String) {
+        guard let message = pending.first(where: { $0.txnId == txnId }), message.state == .failed else { return }
+        pendingActionTxnId = txnId
+        let reason = message.errorText
+        #if IOS6_TARGET
+        let sheet = UIActionSheet()
+        // UIActionSheet has no separate message field, so the reason goes in the
+        // title under the headline.
+        sheet.title = reason == nil ? "Message not sent" : "Message not sent\n\(reason!)"
+        sheet.delegate = self
+        sheet.tag = pendingSheetTag
+        sheet.addButton(withTitle: "Try Again")
+        sheet.destructiveButtonIndex = sheet.addButton(withTitle: "Delete")
+        sheet.cancelButtonIndex = sheet.addButton(withTitle: "Cancel")
+        sheet.show(in: view)
+        #else
+        let sheet = UIAlertController(title: "Message not sent", message: reason, preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Try Again", style: .default) { [weak self] _ in
+            self?.retryPending()
+        })
+        sheet.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            self?.discardPending()
+        })
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+        sheet.popoverPresentationController?.sourceView = view
+        sheet.popoverPresentationController?.sourceRect = view.bounds
+        present(sheet, animated: true, completion: nil)
+        #endif
+    }
+
+    private func retryPending() {
+        guard let txnId = pendingActionTxnId,
+              let index = pending.firstIndex(where: { $0.txnId == txnId }) else { return }
+        pendingActionTxnId = nil
+        pending[index].state = .sending
+        pending[index].errorText = nil
+        reloadTable()
+        pumpSendQueue()
+    }
+
+    private func discardPending() {
+        guard let txnId = pendingActionTxnId else { return }
+        pendingActionTxnId = nil
+        pending.removeAll { $0.txnId == txnId }
+        reloadTable()
+    }
+
+    // Toggles the "an upload is in flight" UI state across the whole input bar.
+    // Text sends no longer use this — they queue instead — so it's the media
+    // paths (photo, video, voice note) that still lock the bar: they share one
+    // serial upload queue and one progress strip, neither of which can represent
+    // two transfers at once.
     private func setSending(_ sending: Bool) {
         isSending = sending
         messageField.isEditable = !sending
@@ -2379,6 +2547,15 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         return rows.count
     }
 
+    // The only selectable row here is a failed outgoing message, which offers to
+    // retry or discard itself. Everything else stays inert (all the cells set
+    // selectionStyle = .none, so there's nothing to deselect visually).
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: false)
+        guard indexPath.row < rows.count, case .pending(let message) = rows[indexPath.row] else { return }
+        handlePendingTap(message.txnId)
+    }
+
     // Manual row-height calculation for multi-line message bodies.
     // UITableView.automaticDimension is iOS 8+ only; without this, the default
     // fixed row height clipped wrapped text, which both rendered messages
@@ -2402,6 +2579,19 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
             return 18
         case .reactions(let reactionRow):
             return ReactionsCell.height(items: reactionRow.items, width: width)
+        case .pending(let message):
+            // Measured exactly like an own text bubble, plus the status line —
+            // the same shared-constants discipline as every other branch here,
+            // since it's drawn by the same EventCell.
+            let maxBubbleWidth = width * EventCell.bubbleWidthFraction
+            let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
+            let bodyHeight = textHeight(message.body, font: UIFont.systemFont(ofSize: 15), width: bodyWidth)
+            let quoteBlock: CGFloat = pendingQuote(for: message) != nil
+                ? EventCell.quoteHeight + EventCell.quoteGap : 0
+            let statusBlock = EventCell.statusHeight + EventCell.statusGap
+            let bubbleHeight = quoteBlock + bodyHeight + statusBlock + EventCell.innerPadding * 2
+            // Own messages never draw a meta header, so no meta block here.
+            return EventCell.groupedTopMargin + bubbleHeight + EventCell.bottomMargin
         case .event(let eventRow):
             switch eventRow.event.kind {
             case .message:
@@ -2518,6 +2708,16 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         return quote
     }
 
+    // The quote line for a queued reply. Unlike replyPreview it has no fallback
+    // to work from — a message we're sending carries no reply fallback — so an
+    // unloaded target simply shows no quote.
+    private func pendingQuote(for message: PendingMessage) -> String? {
+        guard let target = message.replyTo, let source = eventsById[target],
+              let sender = RoomTimelineVC.senderOf(source),
+              let text = RoomTimelineVC.previewText(for: source) else { return nil }
+        return "\(memberNames[sender] ?? shortName(sender)): \(text)"
+    }
+
     // One-line description of a message for a reply quote: its own text, or a
     // short label standing in for a non-text attachment. Shared by the in-bubble
     // quote line and the composer's "Replying to …" strip so they always agree.
@@ -2577,6 +2777,18 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
             cell.setRevealOffset(revealOffset)
             let target = reactionRow.targetEventId
             cell.onTapKey = { [weak self] key in self?.toggleReaction(target: target, key: key) }
+            return cell
+
+        case .pending(let message):
+            let cell = (tableView.dequeueReusableCell(withIdentifier: cellId) as? EventCell) ??
+                EventCell(style: .default, reuseIdentifier: cellId)
+            let failed = message.state == .failed
+            cell.configure(meta: nil, quote: pendingQuote(for: message), body: message.body,
+                           time: TimeFormat.shortTime(msSinceEpoch: Double(message.timestamp)),
+                           isOwn: true, avatarMxc: nil, senderName: "",
+                           status: failed ? "Not sent \u{2014} tap to retry" : "Sending\u{2026}",
+                           statusIsError: failed)
+            cell.setRevealOffset(revealOffset)
             return cell
 
         case .event(let eventRow):
@@ -2713,6 +2925,8 @@ private class EventCell: UITableViewCell {
     static let metaGap: CGFloat = 2             // meta-header-to-bubble spacing
     static let quoteHeight: CGFloat = 14        // quoted-reply line inside the bubble
     static let quoteGap: CGFloat = 4            // quote-to-body spacing
+    static let statusHeight: CGFloat = 13       // send-status line inside the bubble
+    static let statusGap: CGFloat = 3           // body-to-status spacing
     static let topMargin: CGFloat = 8           // above a group's meta header
     static let groupedTopMargin: CGFloat = 2    // above a grouped (headerless) bubble
     static let bottomMargin: CGFloat = 2        // below every bubble
@@ -2733,6 +2947,9 @@ private class EventCell: UITableViewCell {
     // The message being replied to, drawn as one truncated line at the top of
     // the bubble. Hidden unless this message is a reply.
     private let quoteLabel = UILabel()
+    // "Sending…" / "Not sent" for a message still in the outgoing queue, as one
+    // line under the body. Hidden for every event the server has confirmed.
+    private let statusLabel = UILabel()
     // Small circular sender avatar, shown at the group-start of others' messages.
     private let avatarView = AvatarView()
     // Timestamp docked at the right edge, hidden until a swipe slides the bubble
@@ -2783,6 +3000,14 @@ private class EventCell: UITableViewCell {
         bodyLabel.numberOfLines = 0
         bubble.addSubview(bodyLabel)
 
+        statusLabel.backgroundColor = .clear
+        statusLabel.font = UIFont.systemFont(ofSize: 10)
+        statusLabel.numberOfLines = 1
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.textAlignment = .right
+        statusLabel.isHidden = true
+        bubble.addSubview(statusLabel)
+
         revealTimeLabel.backgroundColor = .clear
         revealTimeLabel.font = UIFont.systemFont(ofSize: 11)
         revealTimeLabel.textColor = .gray
@@ -2793,8 +3018,11 @@ private class EventCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    // `status` is only passed for a message still in the outgoing queue; every
+    // confirmed event leaves it nil and the line isn't drawn at all.
     func configure(meta: String?, quote: String?, body: String, time: String, isOwn: Bool,
-                   avatarMxc: String?, senderName: String) {
+                   avatarMxc: String?, senderName: String,
+                   status: String? = nil, statusIsError: Bool = false) {
         isOwnMessage = isOwn
         hasMeta = meta != nil
         metaLabel.isHidden = !hasMeta
@@ -2810,6 +3038,13 @@ private class EventCell: UITableViewCell {
         bodyLabel.textColor = isOwn ? .white : .black
         bubble.backgroundColor = isOwn ? UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
                                         : UIColor(white: 0.85, alpha: 1.0)
+        statusLabel.isHidden = status == nil
+        statusLabel.text = status
+        // A failure has to stand out against the blue bubble, so it's drawn in
+        // full white while "Sending…" stays dimmed like the quote line.
+        statusLabel.textColor = statusIsError ? .white : UIColor(white: 1.0, alpha: 0.75)
+        // An unconfirmed message reads as provisional rather than sent.
+        bubble.alpha = status == nil ? 1.0 : 0.7
         revealTimeLabel.text = time
         // Avatar only on others' group-start rows (own messages need no avatar;
         // grouped continuations align under the group-start bubble via the gutter).
@@ -2847,9 +3082,17 @@ private class EventCell: UITableViewCell {
                                                            height: EventCell.quoteHeight))
             contentWidth = max(contentWidth, ceil(quoteSize.width))
         }
+        // Same deal for the send-status line: one truncating line, so it can
+        // widen the bubble without affecting how the body wraps.
+        let statusBlock: CGFloat = statusLabel.isHidden ? 0 : EventCell.statusHeight + EventCell.statusGap
+        if !statusLabel.isHidden {
+            let statusSize = statusLabel.sizeThatFits(CGSize(width: maxInnerWidth,
+                                                             height: EventCell.statusHeight))
+            contentWidth = max(contentWidth, ceil(statusSize.width))
+        }
         let innerWidth = min(contentWidth, maxInnerWidth)
         let bubbleWidth = innerWidth + EventCell.innerPadding * 2
-        let bubbleHeight = quoteBlock + ceil(bodySize.height) + EventCell.innerPadding * 2
+        let bubbleHeight = quoteBlock + ceil(bodySize.height) + statusBlock + EventCell.innerPadding * 2
 
         // Others' messages are indented by the avatar gutter so grouped
         // continuations line up under the group-start bubble (which shows the
@@ -2877,6 +3120,11 @@ private class EventCell: UITableViewCell {
         bodyLabel.frame = CGRect(x: EventCell.innerPadding,
                                   y: EventCell.innerPadding + quoteBlock,
                                   width: innerWidth, height: ceil(bodySize.height))
+        if !statusLabel.isHidden {
+            statusLabel.frame = CGRect(x: EventCell.innerPadding,
+                                       y: bodyLabel.frame.maxY + EventCell.statusGap,
+                                       width: innerWidth, height: EventCell.statusHeight)
+        }
 
         // Avatar bottom-aligned with the bubble, in the left gutter.
         if !avatarView.isHidden {
@@ -3725,6 +3973,14 @@ extension RoomTimelineVC: UIActionSheetDelegate {
         }
         if actionSheet.tag == deleteSheetTag {
             if buttonIndex == actionSheet.destructiveButtonIndex { deleteConfirmed() }
+            return
+        }
+        if actionSheet.tag == pendingSheetTag {
+            if buttonIndex == actionSheet.destructiveButtonIndex {
+                discardPending()
+            } else if buttonIndex != actionSheet.cancelButtonIndex {
+                retryPending()
+            }
             return
         }
         // Map by title, not index: the button set is dynamic (camera row is
