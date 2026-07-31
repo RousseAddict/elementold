@@ -21,6 +21,22 @@ class SyncEngine {
     private let serverTimeoutMs = 30000
     private var clientTimeoutSeconds: Int { (serverTimeoutMs / 1000) + 10 }
 
+    // The INITIAL sync needs its own, much larger allowance. `timeout` above only
+    // bounds how long the server waits for new events, which applies to an
+    // incremental sync; the first sync has nothing to wait for and instead spends
+    // however long it takes to build full state plus a timeline for every joined
+    // room. That cost grows with the size of the room list, and past a few dozen
+    // rooms it comfortably exceeded the 40s budget — the curl handle's timeout is
+    // a TOTAL transfer deadline, so it fired while the server was still working
+    // and surfaced as "Connection failed", every 40 seconds, forever: `since` is
+    // only assigned from a successful response, so each retry started another
+    // full initial sync and the app could never reach the cheap incremental path.
+    //
+    // NOTE: a stall detector (CURLOPT_LOW_SPEED_*) is NOT usable as a substitute
+    // here. The server sends nothing at all while it computes, so a low-speed
+    // abort would kill the request for exactly the same wrong reason.
+    private let initialSyncTimeoutSeconds = 180
+
     // Delay before retrying after a failed poll, so an unreachable/erroring
     // server doesn't get hammered in a tight loop.
     private let retryDelaySeconds: TimeInterval = 5
@@ -143,7 +159,8 @@ class SyncEngine {
             path += "&since=\(encoded)"
         }
 
-        api.get(path, timeout: clientTimeoutSeconds) { [weak self] json, error in
+        let timeout = isInitial ? initialSyncTimeoutSeconds : clientTimeoutSeconds
+        api.get(path, timeout: timeout) { [weak self] json, error in
             guard let self = self else { return }
             self.isRequestInFlight = false
 

@@ -55,6 +55,13 @@ private class CurlTransferBox {
 
 class CurlFetcher {
     private static var active: [CurlFetcher] = []
+    // Why the last transfer on THIS fetcher failed at the curl level, e.g.
+    // "Timeout was reached (curl 28)". One CurlFetcher is created per request, so
+    // this needs no synchronisation: it is written on the worker thread before
+    // that request's completion is dispatched, and read only from there.
+    // Exists because returning a bare nil Data made every transport failure —
+    // timeout, DNS, TLS — surface as the same "check the server URL" message.
+    private var lastFailure: String?
     // Bounded-concurrency pool. Was an *unbounded* concurrent DispatchQueue,
     // but each request runs a BLOCKING curl_bridge_perform (up to ~40s for the
     // /sync long-poll), so every in-flight request pins a worker thread for its
@@ -101,6 +108,16 @@ class CurlFetcher {
     // hand curl this PEM explicitly (see applyTLS). Resolved once at launch.
     private static let caBundlePath: String? = Bundle.main.path(forResource: "cacert", ofType: "pem")
 
+    // Human-readable form of a CURLcode, from curl's own error table. The number
+    // is kept alongside the text so a report can be matched against curl's
+    // documented codes (28 = timeout, 6 = DNS, 60 = cert verification).
+    private static func describe(_ rc: Int32) -> String {
+        if let cstr = curl_bridge_strerror(rc) {
+            return "\(String(cString: cstr)) (curl \(rc))"
+        }
+        return "curl error \(rc)"
+    }
+
     // Enable full TLS cert verification AND point OpenSSL at our CA bundle. Both
     // must happen together — verification with no trust store rejects everything.
     // Called for every request (harmless on plain-HTTP URLs).
@@ -112,9 +129,14 @@ class CurlFetcher {
     }
 
     // GET url -> Data on a background thread; completion on the main thread.
+    // `transportError` is invoked (main thread, just before `completion`) with the
+    // curl-level reason when the transfer never produced a response at all. It is
+    // optional so the callers that don't care — every media fetch — are unchanged;
+    // HTTPClient uses it to report the real cause instead of one generic message.
     static func fetchData(url: String,
                           headers: [String: String] = [:],
                           timeout: Int = 30,
+                          transportError: ((String) -> Void)? = nil,
                           completion: @escaping (Data?) -> Void) {
         let fetcher = CurlFetcher()
         retain(fetcher)
@@ -122,6 +144,7 @@ class CurlFetcher {
             let data = fetcher.syncFetchData(url: url, headers: headers, timeout: timeout)
             DispatchQueue.main.async {
                 release(fetcher)
+                if let reason = fetcher.lastFailure { transportError?(reason) }
                 completion(data)
             }
         }
@@ -133,6 +156,7 @@ class CurlFetcher {
                          headers: [String: String],
                          body: Data,
                          timeout: Int = 30,
+                         transportError: ((String) -> Void)? = nil,
                          completion: @escaping (Data?) -> Void) {
         let fetcher = CurlFetcher()
         retain(fetcher)
@@ -140,6 +164,7 @@ class CurlFetcher {
             let data = fetcher.syncPostData(url: url, headers: headers, body: body, timeout: timeout)
             DispatchQueue.main.async {
                 release(fetcher)
+                if let reason = fetcher.lastFailure { transportError?(reason) }
                 completion(data)
             }
         }
@@ -151,6 +176,7 @@ class CurlFetcher {
                         headers: [String: String],
                         body: Data,
                         timeout: Int = 30,
+                        transportError: ((String) -> Void)? = nil,
                         completion: @escaping (Data?) -> Void) {
         let fetcher = CurlFetcher()
         retain(fetcher)
@@ -158,6 +184,7 @@ class CurlFetcher {
             let data = fetcher.syncPutData(url: url, headers: headers, body: body, timeout: timeout)
             DispatchQueue.main.async {
                 release(fetcher)
+                if let reason = fetcher.lastFailure { transportError?(reason) }
                 completion(data)
             }
         }
@@ -241,7 +268,10 @@ class CurlFetcher {
         defer { if headerList != nil { curl_bridge_headers_free(headerList) } }
 
         let rc = curl_bridge_perform(h)
-        guard rc == 0 else { return nil }
+        guard rc == 0 else {
+            lastFailure = CurlFetcher.describe(rc)
+            return nil
+        }
         let code = curl_bridge_response_code(h)
         // Body returned regardless of status: Matrix errors (4xx/5xx) carry a
         // JSON {errcode,error} body that MatrixAPIClient.parse() needs to read.
@@ -276,7 +306,10 @@ class CurlFetcher {
         }
 
         let rc = curl_bridge_perform(h)
-        guard rc == 0 else { return nil }
+        guard rc == 0 else {
+            lastFailure = CurlFetcher.describe(rc)
+            return nil
+        }
         let code = curl_bridge_response_code(h)
         // Body returned regardless of status: Matrix errors (4xx/5xx) carry a
         // JSON {errcode,error} body that MatrixAPIClient.parse() needs to read.
@@ -311,7 +344,10 @@ class CurlFetcher {
         }
 
         let rc = curl_bridge_perform(h)
-        guard rc == 0 else { return nil }
+        guard rc == 0 else {
+            lastFailure = CurlFetcher.describe(rc)
+            return nil
+        }
         let code = curl_bridge_response_code(h)
         // Body returned regardless of status: Matrix errors (4xx/5xx) carry a
         // JSON {errcode,error} body that MatrixAPIClient.parse() needs to read.

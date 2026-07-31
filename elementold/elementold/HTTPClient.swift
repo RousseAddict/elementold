@@ -12,11 +12,15 @@ class HTTPClient {
         // hosts fail under NSURLConnection. Works over both HTTP and HTTPS.
         // timeout is overridable so long-poll callers (Matrix /sync) can wait
         // longer than a normal request without racing the server-side timeout.
-        CurlFetcher.fetchData(url: url, headers: headers, timeout: timeout) { data in
+        // Both closures below run on the main thread and transportError fires
+        // first, so `reason` is already set by the time the body is inspected.
+        var reason: String?
+        CurlFetcher.fetchData(url: url, headers: headers, timeout: timeout,
+                              transportError: { reason = $0 }) { data in
             if let data = data {
                 completion(data, nil)
             } else {
-                completion(nil, makeError("Connection failed. Check the server URL and that it is reachable."))
+                completion(nil, makeError(failureMessage(reason)))
             }
         }
     }
@@ -34,11 +38,13 @@ class HTTPClient {
         // require GCM-only TLS fail the handshake under NSURLConnection. OpenSSL
         // negotiates GCM correctly — HTTPS logins now work and HTTP logins are
         // unaffected (curl handles both schemes).
-        CurlFetcher.postData(url: url, headers: allHeaders, body: bodyData) { data in
+        var reason: String?
+        CurlFetcher.postData(url: url, headers: allHeaders, body: bodyData,
+                             transportError: { reason = $0 }) { data in
             if let data = data {
                 completion(data, nil)
             } else {
-                completion(nil, makeError("Connection failed. Check the server URL and that it is reachable."))
+                completion(nil, makeError(failureMessage(reason)))
             }
         }
     }
@@ -53,13 +59,26 @@ class HTTPClient {
         let bodyData = (try? JSONSerialization.data(withJSONObject: body, options: [])) ?? Data()
         // Used for Matrix event sends (PUT /rooms/{id}/send/...) and state
         // updates. Same libcurl + embedded OpenSSL transport as get()/post().
-        CurlFetcher.putData(url: url, headers: allHeaders, body: bodyData) { data in
+        var reason: String?
+        CurlFetcher.putData(url: url, headers: allHeaders, body: bodyData,
+                            transportError: { reason = $0 }) { data in
             if let data = data {
                 completion(data, nil)
             } else {
-                completion(nil, makeError("Connection failed. Check the server URL and that it is reachable."))
+                completion(nil, makeError(failureMessage(reason)))
             }
         }
+    }
+
+    // The old text was a single generic sentence for every transport failure,
+    // which actively misled: a request that timed out because the server was
+    // still building the response read as a wrong or unreachable URL. When curl
+    // tells us what went wrong, say so; keep the guidance only as a fallback.
+    private static func failureMessage(_ reason: String?) -> String {
+        if let reason = reason {
+            return "Connection failed: \(reason)"
+        }
+        return "Connection failed. Check the server URL and that it is reachable."
     }
 
     private static func makeError(_ message: String) -> NSError {
