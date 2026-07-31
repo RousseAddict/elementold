@@ -1096,7 +1096,10 @@ class RoomTimelineVC: UIViewController {
         let fitWidth = messageField.bounds.width
         let content = messageField.sizeThatFits(CGSize(width: fitWidth, height: .greatestFiniteMagnitude)).height
         let target = min(max(content, inputMinHeight), inputMaxHeight)
-        messageField.isScrollEnabled = content > inputMaxHeight
+        // Only written when it flips: this runs per keystroke, and assigning
+        // isScrollEnabled on a UITextView is not a free no-op.
+        let shouldScroll = content > inputMaxHeight
+        if messageField.isScrollEnabled != shouldScroll { messageField.isScrollEnabled = shouldScroll }
         guard abs(target - currentFieldHeight) > 0.5 else { return }
         currentFieldHeight = target
         layoutInputBar()
@@ -1716,9 +1719,11 @@ class RoomTimelineVC: UIViewController {
     // at most once every few seconds while the field is non-empty). Room/user IDs
     // are sent unencoded in the path, matching every other room-scoped request in
     // this app (percent-encoding via Foundation crashes on the iOS 6 runtime).
-    private func sendTypingIfNeeded() {
+    // `isEmpty` is passed in rather than re-read off messageField: reading .text on
+    // this runtime's UITextView is not free, and the only caller already has it.
+    private func sendTypingIfNeeded(isEmpty: Bool) {
         guard let userId = MatrixSession.userId else { return }
-        guard let text = messageField.text, !text.isEmpty else { sendTypingStop(); return }
+        guard !isEmpty else { sendTypingStop(); return }
         let now = Date().timeIntervalSince1970
         guard now - lastTypingSent > 4 else { return }
         lastTypingSent = now
@@ -2585,7 +2590,7 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
             // since it's drawn by the same EventCell.
             let maxBubbleWidth = width * EventCell.bubbleWidthFraction
             let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
-            let bodyHeight = textHeight(message.body, font: UIFont.systemFont(ofSize: 15), width: bodyWidth)
+            let bodyHeight = textHeight(message.body, font: EventCell.bodyFont, width: bodyWidth)
             let quoteBlock: CGFloat = pendingQuote(for: message) != nil
                 ? EventCell.quoteHeight + EventCell.quoteGap : 0
             let statusBlock = EventCell.statusHeight + EventCell.statusGap
@@ -2598,7 +2603,7 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
                 let text = bodyText(for: eventRow)
                 let maxBubbleWidth = width * EventCell.bubbleWidthFraction
                 let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
-                let bodyHeight = textHeight(text, font: UIFont.systemFont(ofSize: 15), width: bodyWidth)
+                let bodyHeight = textHeight(text, font: EventCell.bodyFont, width: bodyWidth)
                 let quoteBlock: CGFloat = replyPreview(for: eventRow.event) != nil
                     ? EventCell.quoteHeight + EventCell.quoteGap : 0
                 let bubbleHeight = quoteBlock + bodyHeight + EventCell.innerPadding * 2
@@ -2732,13 +2737,41 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         }
     }
 
-    private func textHeight(_ text: String, font: UIFont, width: CGFloat) -> CGFloat {
+    // UITableView asks for every row's height on every reloadData (there's no
+    // estimatedRowHeight before iOS 7, and we couldn't use it anyway), and a /sync
+    // carrying one new message reloads the whole table. In a room with a few
+    // hundred messages that meant a few hundred UILabel allocations and a few
+    // hundred text layout passes on the main thread per sync — the "typing feels
+    // laggy" symptom, since a keystroke's typing notification round-trips through
+    // /sync and lands work back on main.
+    //
+    // Two fixes, both of which keep this a pure function of (text, font, width):
+    // one reused sizing label instead of a fresh one per row (the same trick
+    // ReactionsCell.sizingLabel already uses further down), and a memo table,
+    // since across reloads the same text is measured at the same width over and
+    // over. Main thread only, like everything else that touches the table.
+    private static let sizingLabel: UILabel = {
         let label = UILabel()
-        label.font = font
         label.numberOfLines = 0
+        return label
+    }()
+    private static var textHeightCache: [String: CGFloat] = [:]
+
+    private func textHeight(_ text: String, font: UIFont, width: CGFloat) -> CGFloat {
+        let w = max(1, width)
+        // Font size is part of the key because the two call sites could diverge
+        // later; today they share one font.
+        let key = "\(Int(w))|\(font.pointSize)|\(text)"
+        if let cached = RoomTimelineVC.textHeightCache[key] { return cached }
+        let label = RoomTimelineVC.sizingLabel
+        label.font = font
         label.text = text
-        let size = label.sizeThatFits(CGSize(width: max(1, width), height: .greatestFiniteMagnitude))
-        return ceil(size.height)
+        let height = ceil(label.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude)).height)
+        // Bounded rather than evicted cleverly: the keys are message bodies, so
+        // an unbounded map would grow with scrollback for the whole session.
+        if RoomTimelineVC.textHeightCache.count > 800 { RoomTimelineVC.textHeightCache.removeAll() }
+        RoomTimelineVC.textHeightCache[key] = height
+        return height
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -2927,6 +2960,9 @@ private class EventCell: UITableViewCell {
     static let quoteGap: CGFloat = 4            // quote-to-body spacing
     static let statusHeight: CGFloat = 13       // send-status line inside the bubble
     static let statusGap: CGFloat = 3           // body-to-status spacing
+    // The body font lives here so rowHeight's measurement and the cell's own
+    // bodyLabel can't drift apart, and so neither re-resolves it per row.
+    static let bodyFont = UIFont.systemFont(ofSize: 15)
     static let topMargin: CGFloat = 8           // above a group's meta header
     static let groupedTopMargin: CGFloat = 2    // above a grouped (headerless) bubble
     static let bottomMargin: CGFloat = 2        // below every bubble
@@ -2996,7 +3032,7 @@ private class EventCell: UITableViewCell {
         bubble.addSubview(quoteLabel)
 
         bodyLabel.backgroundColor = .clear
-        bodyLabel.font = UIFont.systemFont(ofSize: 15)
+        bodyLabel.font = EventCell.bodyFont
         bodyLabel.numberOfLines = 0
         bubble.addSubview(bodyLabel)
 
@@ -3924,9 +3960,13 @@ private class VideoEventCell: UITableViewCell, AttachmentProgressCell {
 
 extension RoomTimelineVC: UITextViewDelegate {
     func textViewDidChange(_ textView: UITextView) {
-        placeholderLabel.isHidden = !textView.text.isEmpty
+        // Runs on every keystroke, so read .text once and only touch the
+        // placeholder when its visibility actually changes (assigning isHidden
+        // marks the view dirty even when the value is unchanged).
+        let isEmpty = textView.text.isEmpty
+        if placeholderLabel.isHidden == isEmpty { placeholderLabel.isHidden = !isEmpty }
         adjustInputHeight()
-        sendTypingIfNeeded()
+        sendTypingIfNeeded(isEmpty: isEmpty)
     }
 }
 
