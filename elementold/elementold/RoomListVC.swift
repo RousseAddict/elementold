@@ -15,6 +15,9 @@ class RoomListVC: UIViewController {
     // (declined/left). `invitations` is the sorted view rendered in the banner.
     private var invitesById: [String: Invitation] = [:]
     private var invitations: [Invitation] = []
+    // The rooms actually rendered, after the space/bucket/search filters. Kept as
+    // stored state and refreshed via rebuildDisplayedRooms() — see there for why.
+    private var displayedRooms: [Room] = []
     private var hasSyncedOnce = false
     private var loadingTimer: Timer?
     private var loadingSeconds = 0
@@ -225,8 +228,10 @@ class RoomListVC: UIViewController {
             sortedRooms = roomsById.values.sorted { $0.lastMessageTimestamp > $1.lastMessageTimestamp }
         }
 
-        // Rebuild the bridge/space filter buckets from the (just-updated) rooms.
+        // Rebuild the bridge/space filter buckets from the (just-updated) rooms,
+        // then the rendered list, which depends on both.
         rebuildFilters()
+        rebuildDisplayedRooms()
 
         hasSyncedOnce = true
         // Total unread across all joined rooms, mirrored on the app icon badge.
@@ -342,6 +347,13 @@ class RoomListVC: UIViewController {
 
     private func performLogout() {
         syncEngine.stop()
+        // The loading ticker is normally invalidated by the first successful sync
+        // (updateStatusLabel). Logging out before that ever happened would leave it
+        // running at 1 Hz forever — and since it's a selector-based Timer holding a
+        // strong ref to us, it would keep this whole screen alive after LoginVC
+        // replaces it.
+        loadingTimer?.invalidate()
+        loadingTimer = nil
         // Clear the app icon badge so the next account doesn't inherit a stale count.
         UIApplication.shared.applicationIconBadgeNumber = 0
         MatrixSession.clear()
@@ -353,22 +365,30 @@ class RoomListVC: UIViewController {
 
     // MARK: - Search / filter
 
-    // Rooms shown in the list. Three filters stacked, in order:
+    // Rebuilds `displayedRooms` from `sortedRooms`. Three filters stacked:
     //   1. Space rooms (isSpace) are never shown — they're grouping containers
     //      with no timeline, surfaced only as filter buckets.
     //   2. The selected bridge/space bucket, if any (selectedFilterId != nil).
     //   3. The search bar text (client-side: Matrix has no "search my joined
     //      rooms" endpoint, so filtering the synced list by name is correct).
-    private var displayedRooms: [Room] {
+    //
+    // Stored rather than computed: the table's data source reads it once per row
+    // in cellForRowAt, so a computed property ran these filters (V+1) times per
+    // reloadData over every joined room, allocating a new array each time. While
+    // typing in the search bar that landed on the main thread per keystroke.
+    // Call this whenever one of the three inputs above changes.
+    private func rebuildDisplayedRooms() {
         var rooms = sortedRooms.filter { !$0.isSpace }
         if let id = selectedFilterId,
            let bucket = filters.first(where: { $0.id == id }) {
             rooms = rooms.filter { bucket.roomIds.contains($0.roomId) }
         }
         if !searchText.isEmpty {
-            rooms = rooms.filter { RoomListVC.nameMatches($0.name, query: searchText) }
+            // Lower-case and unpack the needle ONCE, not once per room compared.
+            let query = Array(searchText.lowercased())
+            rooms = rooms.filter { RoomListVC.nameMatches($0.name, query: query) }
         }
-        return rooms
+        displayedRooms = rooms
     }
 
     // Rebuilds the filter buckets from roomsById. Called off-main after every
@@ -442,6 +462,7 @@ class RoomListVC: UIViewController {
 
     private func applyFilter(_ id: String?) {
         selectedFilterId = id
+        rebuildDisplayedRooms()
         updateFilterControl()
         tableView.reloadData()
     }
@@ -507,14 +528,15 @@ class RoomListVC: UIViewController {
     // `range(of:)`/`contains(_:)` (whose underlying NSString selectors are a
     // crash risk on this iOS 6 runtime) — only Character comparison + lowercased()
     // (already proven safe elsewhere in this file).
-    private static func nameMatches(_ name: String, query: String) -> Bool {
+    // `query` arrives already lower-cased and unpacked so the caller can hoist
+    // that out of its per-room loop.
+    private static func nameMatches(_ name: String, query: [Character]) -> Bool {
+        if query.isEmpty { return true }
         let n = Array(name.lowercased())
-        let q = Array(query.lowercased())
-        if q.isEmpty { return true }
-        if q.count > n.count { return false }
-        for start in 0...(n.count - q.count) {
+        if query.count > n.count { return false }
+        for start in 0...(n.count - query.count) {
             var ok = true
-            for j in 0..<q.count where n[start + j] != q[j] { ok = false; break }
+            for j in 0..<query.count where n[start + j] != query[j] { ok = false; break }
             if ok { return true }
         }
         return false
@@ -610,6 +632,9 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
         if let sIdx = sortedRooms.firstIndex(where: { $0.roomId == roomId }) {
             sortedRooms[sIdx].unreadCount = 0
         }
+        // displayedRooms holds copies of these structs, so it has to be refreshed
+        // or the row below would redraw from the stale (non-zero) unreadCount.
+        rebuildDisplayedRooms()
         // Reload against the currently DISPLAYED (possibly filtered) index.
         if let idx = displayedRooms.firstIndex(where: { $0.roomId == roomId }) {
             tableView.reloadRows(at: [IndexPath(row: idx, section: roomSection)], with: .none)
@@ -623,6 +648,7 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
 extension RoomListVC: UISearchBarDelegate {
     func searchBar(_ searchBar: UISearchBar, textDidChange text: String) {
         searchText = text
+        rebuildDisplayedRooms()
         tableView.reloadData()
     }
 
@@ -637,6 +663,7 @@ extension RoomListVC: UISearchBarDelegate {
     func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
         searchBar.text = ""
         searchText = ""
+        rebuildDisplayedRooms()
         searchBar.setShowsCancelButton(false, animated: true)
         searchBar.resignFirstResponder()
         tableView.reloadData()

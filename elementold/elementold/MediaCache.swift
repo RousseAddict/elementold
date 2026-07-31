@@ -40,11 +40,20 @@ class MediaCache {
         if recentLog.count > recentLogLimit { recentLog.removeLast(recentLog.count - recentLogLimit) }
     }
 
-    // Compact "WxH" pixel size of a decoded image, for the diagnostic — a "mem
-    // hit" that shows blank on screen is either a degenerate (0x0) cached image
-    // or a display/layout problem; logging the size tells the two apart.
+    // Compact "WxH" pixel size of a decoded image, for the diagnostic — a cached
+    // image that shows blank on screen is either degenerate (0x0) or a
+    // display/layout problem; logging the size tells the two apart.
     private static func dims(_ image: UIImage) -> String {
         return "\(Int(image.size.width))x\(Int(image.size.height))"
+    }
+
+    // Compact identifier for the diagnostic log: drops the long common endpoint
+    // prefix so a line reads just "thumbnail/server/id?wxh". Built on demand at
+    // each record site rather than up front in load(), which would pay for it on
+    // the memory-cache-hit path that records nothing.
+    private static func diagTag(_ urlPath: String) -> String {
+        let apiPrefix = "/_matrix/client/v1/media/"
+        return urlPath.hasPrefix(apiPrefix) ? String(urlPath.dropFirst(apiPrefix.count)) : urlPath
     }
 
     private let memory: NSCache<NSString, UIImage> = {
@@ -148,14 +157,12 @@ class MediaCache {
 
     private func load(key: String, urlPath: String, timeout: Int, animated: Bool = false,
                       completion: @escaping (UIImage?) -> Void) {
-        // Compact identifier for the diagnostic log: drop the long common endpoint
-        // prefix so each line reads just "thumbnail/server/id?wxh". Recorded for
-        // EVERY source (mem/disk/network) so the "Diagnostics" row shows one line
-        // per image — a missing line then means the cell never requested it at all.
-        let apiPrefix = "/_matrix/client/v1/media/"
-        let tag = urlPath.hasPrefix(apiPrefix) ? String(urlPath.dropFirst(apiPrefix.count)) : urlPath
+        // A memory hit is the overwhelmingly common case — every /sync reloads the
+        // table, so every visible avatar and image bubble comes back through here.
+        // Nothing is recorded on this path: the diagnostic tag and message were
+        // being built (three string allocations) per cell per reload for a log with
+        // no reader, and a cache hit is exactly the case nobody needs to debug.
         if let cached = memory.object(forKey: key as NSString) {
-            MediaCache.record("mem hit \(MediaCache.dims(cached)) \(tag)")
             completion(cached)
             return
         }
@@ -167,7 +174,7 @@ class MediaCache {
                 self.memory.setObject(img, forKey: key as NSString,
                                       cost: MediaCache.memoryCost(img, dataCount: data.count))
                 DispatchQueue.main.async {
-                    MediaCache.record("disk hit (\(data.count)B \(MediaCache.dims(img))) \(tag)")
+                    MediaCache.record("disk hit (\(data.count)B \(MediaCache.dims(img))) \(MediaCache.diagTag(urlPath))")
                     completion(img)
                 }
                 return
@@ -176,17 +183,14 @@ class MediaCache {
             // and returns on the main thread, so kick it off from main.
             DispatchQueue.main.async {
                 guard let base = MatrixSession.homeserverURL, let token = MatrixSession.accessToken else {
-                    MediaCache.record("no session (no base/token) \(tag)")
+                    MediaCache.record("no session (no base/token) \(MediaCache.diagTag(urlPath))")
                     completion(nil)
                     return
                 }
                 // Already downloading this key? Just wait on the existing request.
-                // Recorded too, so the diagnostic still shows one line per cell
-                // request — otherwise a coalesced request would look like a cell
-                // that never asked for its image at all.
                 if self.inFlight[key] != nil {
                     self.inFlight[key]?.append(completion)
-                    MediaCache.record("coalesced \(tag)")
+                    MediaCache.record("coalesced \(MediaCache.diagTag(urlPath))")
                     return
                 }
                 self.inFlight[key] = [completion]
@@ -204,14 +208,14 @@ class MediaCache {
                         // ({errcode,error}, e.g. M_UNKNOWN_TOKEN) or an HTML error page.
                         if let data = data {
                             let preview = String(data: data.prefix(160), encoding: .utf8) ?? "<\(data.count) non-utf8 bytes>"
-                            MediaCache.record("not an image (\(data.count)B) \(tag)\n\(preview)")
+                            MediaCache.record("not an image (\(data.count)B) \(MediaCache.diagTag(urlPath))\n\(preview)")
                         } else {
-                            MediaCache.record("no data (connect/TLS/timeout) \(tag)")
+                            MediaCache.record("no data (connect/TLS/timeout) \(MediaCache.diagTag(urlPath))")
                         }
                         waiters.forEach { $0(nil) }
                         return
                     }
-                    MediaCache.record("ok (\(data.count)B \(MediaCache.dims(img))) \(tag)")
+                    MediaCache.record("ok (\(data.count)B \(MediaCache.dims(img))) \(MediaCache.diagTag(urlPath))")
                     self.memory.setObject(img, forKey: key as NSString,
                                           cost: MediaCache.memoryCost(img, dataCount: data.count))
                     self.ioQueue.async {
