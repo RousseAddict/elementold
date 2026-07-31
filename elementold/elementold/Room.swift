@@ -202,3 +202,219 @@ struct Room {
                     topic: topic)
     }
 }
+
+// MARK: - Persisted room list
+
+// The room list plus the /sync delta token it corresponds to, kept on disk so a
+// cold start can resume with an *incremental* sync instead of paying for a full
+// initial one. That cost is not small: the initial sync builds full state and a
+// timeline for every joined room, which is why it needs its own 180s budget (see
+// SyncEngine) and why a large room list made the first load take minutes.
+//
+// Only the room LIST is persisted, no timeline events — opening a room still
+// backfills, exactly as it already does for any room that wasn't opened this
+// session. But every *other* field of Room is kept, including the ones the list
+// never draws: an incremental sync returns only the rooms that CHANGED, and
+// name / avatar / members / space / bridge / topic all come from *state*, which
+// the server sends once. Drop them and a quiet room would come back nameless,
+// avatar-less and outside its filter bucket, permanently.
+//
+// Known gap: `prevBatch` is persisted at whatever position it had, so if a room
+// received so much while the app was closed that the catch-up sync truncates its
+// timeline (`limited: true`), scrollback can skip the slice between the two.
+// Nothing is lost that we had before — this is the same shape of gap a limited
+// timeline already produces mid-session — and no cached event is discarded.
+final class RoomStore {
+
+    static let shared = RoomStore()
+
+    struct Snapshot {
+        let since: String
+        let rooms: [Room]
+        let invites: [Invitation]
+    }
+
+    // Bumped whenever the encoding below changes. A file written by a different
+    // version is discarded whole rather than half-read; the only cost is one
+    // full sync.
+    private static let version = 1
+
+    // Documents, not Caches: iOS evicts Caches at will and MediaCache's own
+    // 100MB oldest-first trim lives there. Losing the file is *safe* — it just
+    // forces a full sync — but it isn't free, so it goes somewhere durable.
+    private let path: String
+
+    // Encoding and writing happen here, never on the main thread: save() is
+    // called after every /sync, and a main-thread JSON encode over every joined
+    // room per sync is precisely the class of cost the last three rounds of
+    // audits removed.
+    private let queue = DispatchQueue(label: "com.jellyold.roomstore")
+
+    // Debounce, same shape as MediaCache.scheduleTrim. A long-poll returns
+    // instantly on any event — including a typing notice — so /sync can complete
+    // several times a second, and each one would otherwise be a full re-encode
+    // plus a disk write. `pending`/`writeScheduled` are touched only from the
+    // main thread (handleSync and the background/terminate notifications both
+    // run there).
+    private var pending: Snapshot?
+    private var writeScheduled = false
+    private let writeDelay: TimeInterval = 4
+
+    private init() {
+        let documents = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
+            ?? NSTemporaryDirectory()
+        path = (documents as NSString).appendingPathComponent("elementold-roomlist.json")
+    }
+
+    // MARK: reading
+
+    // nil whenever there's nothing usable: no file, a file from another account
+    // or another encoding version, or anything unreadable. Every one of those
+    // just means "do a full sync", i.e. the behaviour before any of this existed.
+    func load() -> Snapshot? {
+        guard let userId = MatrixSession.userId else { return nil }
+        // FileManager, not Data(contentsOf:) — the URL-based reader hangs on this
+        // runtime.
+        guard let data = FileManager.default.contents(atPath: path),
+              let json = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any],
+              (json["version"] as? NSNumber)?.intValue == RoomStore.version,
+              json["userId"] as? String == userId,
+              let since = json["since"] as? String, !since.isEmpty else { return nil }
+        let rooms = (json["rooms"] as? [[String: Any]] ?? []).compactMap { RoomStore.decodeRoom($0) }
+        let invites = (json["invites"] as? [[String: Any]] ?? []).compactMap { RoomStore.decodeInvite($0) }
+        guard !rooms.isEmpty else { return nil }
+        return Snapshot(since: since, rooms: rooms, invites: invites)
+    }
+
+    // MARK: writing
+
+    // Debounced — safe to call after every /sync.
+    func save(since: String, rooms: [Room], invites: [Invitation]) {
+        pending = Snapshot(since: since, rooms: rooms, invites: invites)
+        guard !writeScheduled else { return }
+        writeScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + writeDelay) { [weak self] in
+            guard let self = self else { return }
+            self.writeScheduled = false
+            guard let snapshot = self.pending else { return }
+            self.pending = nil
+            self.queue.async { self.write(snapshot) }
+        }
+    }
+
+    // Immediate and synchronous, for backgrounding and termination where a
+    // queued write may never get to run. The file is tens of KB, so paying for
+    // it on the caller's thread at that one moment is the right trade for
+    // actually landing on disk.
+    func flush(since: String, rooms: [Room], invites: [Invitation]) {
+        pending = nil
+        writeScheduled = false
+        write(Snapshot(since: since, rooms: rooms, invites: invites))
+    }
+
+    // Forget the snapshot, so the next cold start does a full sync. Used by
+    // Reset Cache and by logout, and as the recovery path when the homeserver
+    // won't accept our stored token.
+    func discard() {
+        pending = nil
+        writeScheduled = false
+        let path = self.path
+        queue.async { try? FileManager.default.removeItem(atPath: path) }
+    }
+
+    private func write(_ snapshot: Snapshot) {
+        guard let userId = MatrixSession.userId else { return }
+        let json: [String: Any] = [
+            "version": RoomStore.version,
+            "userId": userId,
+            "since": snapshot.since,
+            "rooms": snapshot.rooms.map { RoomStore.encodeRoom($0) },
+            "invites": snapshot.invites.map { RoomStore.encodeInvite($0) },
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: json, options: []) else { return }
+        // Path-based NSData write: Data.write(to:) hangs on this runtime. The
+        // `atomically` is what keeps the token and the rooms inseparable —
+        // storing `since = T` without the state derived from the batch ending at
+        // T would lose those messages for good, since the server treats
+        // everything up to T as delivered and no retry replays it. A kill
+        // mid-write leaves the previous snapshot intact, never a torn one.
+        (data as NSData).write(toFile: path, atomically: true)
+    }
+
+    // MARK: encoding
+    //
+    // Hand-rolled [String: Any] both ways, like every other model here: no
+    // Codable, and numbers read back through NSNumber because `as? Int` /
+    // `as? Double` silently fail on this runtime. Keys are short because they
+    // repeat once per room. nil/empty fields are omitted rather than encoded as
+    // null, which JSONSerialization would reject anyway.
+
+    private static func encodeRoom(_ room: Room) -> [String: Any] {
+        var d: [String: Any] = [
+            "id": room.roomId,
+            "name": room.name,
+            "last": room.lastMessage,
+            "ts": room.lastMessageTimestamp,
+            "unread": room.unreadCount,
+        ]
+        if let v = room.prevBatch { d["prev"] = v }
+        if let v = room.avatarMxc { d["avatar"] = v }
+        if !room.memberNames.isEmpty { d["names"] = room.memberNames }
+        if !room.memberAvatars.isEmpty { d["avatars"] = room.memberAvatars }
+        if let v = room.roomType { d["type"] = v }
+        if !room.spaceChildren.isEmpty { d["children"] = Array(room.spaceChildren) }
+        if let v = room.bridgeNetwork { d["bridge"] = v }
+        if let v = room.bridgeAvatarMxc { d["bridgeAvatar"] = v }
+        if let v = room.topic { d["topic"] = v }
+        return d
+    }
+
+    private static func decodeRoom(_ d: [String: Any]) -> Room? {
+        guard let roomId = d["id"] as? String, !roomId.isEmpty else { return nil }
+        return Room(roomId: roomId,
+                    name: d["name"] as? String ?? roomId,
+                    lastMessage: d["last"] as? String ?? "",
+                    lastMessageTimestamp: (d["ts"] as? NSNumber)?.doubleValue ?? 0,
+                    prevBatch: d["prev"] as? String,
+                    timelineEvents: [],
+                    avatarMxc: d["avatar"] as? String,
+                    memberNames: stringMap(d["names"]),
+                    memberAvatars: stringMap(d["avatars"]),
+                    unreadCount: (d["unread"] as? NSNumber)?.intValue ?? 0,
+                    roomType: d["type"] as? String,
+                    spaceChildren: Set(stringArray(d["children"])),
+                    bridgeNetwork: d["bridge"] as? String,
+                    bridgeAvatarMxc: d["bridgeAvatar"] as? String,
+                    topic: d["topic"] as? String)
+    }
+
+    private static func encodeInvite(_ invite: Invitation) -> [String: Any] {
+        var d: [String: Any] = ["id": invite.roomId, "name": invite.name]
+        if let v = invite.inviter { d["by"] = v }
+        return d
+    }
+
+    private static func decodeInvite(_ d: [String: Any]) -> Invitation? {
+        guard let roomId = d["id"] as? String, !roomId.isEmpty else { return nil }
+        return Invitation(roomId: roomId, name: d["name"] as? String ?? roomId,
+                          inviter: d["by"] as? String)
+    }
+
+    // Element-wise rather than a straight `as? [String: String]` / `as? [String]`:
+    // those collection casts have to bridge-check every value, and this project
+    // has a history of Foundation convenience casts behaving differently here
+    // than they read. Cheap insurance on a path that runs once per launch.
+    private static func stringMap(_ any: Any?) -> [String: String] {
+        guard let raw = any as? [String: Any] else { return [:] }
+        var out: [String: String] = [:]
+        for (key, value) in raw {
+            if let s = value as? String { out[key] = s }
+        }
+        return out
+    }
+
+    private static func stringArray(_ any: Any?) -> [String] {
+        guard let raw = any as? [Any] else { return [] }
+        return raw.compactMap { $0 as? String }
+    }
+}

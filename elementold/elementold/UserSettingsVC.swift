@@ -106,7 +106,7 @@ class UserSettingsVC: UIViewController {
 
     private func confirmClearCache() {
         let title = "Reset cache?"
-        let message = "This deletes all downloaded images. They'll be fetched again when needed."
+        let message = "This deletes all downloaded images and the saved room list. Everything is fetched again when needed."
 #if IOS6_TARGET
         let sheet = UIActionSheet()
         sheet.title = message
@@ -129,6 +129,11 @@ class UserSettingsVC: UIViewController {
     }
 
     private func performClearCache() {
+        // Also forget the persisted room list, so "Reset Cache" means one thing.
+        // Harmless mid-session: the live list and the in-memory delta token are
+        // untouched, so nothing on screen changes — the next cold start just pays
+        // for a full sync again.
+        RoomStore.shared.discard()
         MediaCache.shared.clear { [weak self] in
             self?.refreshUsage()
         }

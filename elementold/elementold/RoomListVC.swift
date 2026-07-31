@@ -50,6 +50,14 @@ class RoomListVC: UIViewController {
     private let client: MatrixAPIClient
     private let syncEngine: SyncEngine
 
+    // The delta token matching the room list as it currently stands, persisted
+    // alongside it (see RoomStore) so the next cold start resumes incrementally.
+    private var lastSyncToken: String?
+    // True from the moment we render a snapshot from disk until the first /sync
+    // response of this launch lands. It CANNOT be driven off "a request is in
+    // flight" — the long-poll always is, so the indicator would never turn off.
+    private var isCatchingUp = false
+
     private let cellId = "RoomCell"
     private let inviteCellId = "InviteBannerCell"
 
@@ -175,14 +183,74 @@ class RoomListVC: UIViewController {
             NotificationManager.shared.handleSync(json, isInitial: isInitial)
         }
 
+        // Render the last known room list immediately and hand its delta token to
+        // the engine, so the first /sync is an incremental catch-up rather than a
+        // full initial sync. Must happen before start().
+        let seeded = seedFromSnapshot()
+
+        // Persist on the way out as well as on the debounce timer: a queued write
+        // may never run once we're suspended, and being killed while backgrounded
+        // is the normal way this app ends.
+        NotificationCenter.default.addObserver(self, selector: #selector(persistNow),
+                                                name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(persistNow),
+                                                name: UIApplication.willTerminateNotification, object: nil)
+
         syncEngine.start()
 
         // Diagnostic: if this ticker itself stalls, the main thread is deadlocked
         // (not just waiting on the network). If it keeps ticking with no sync
         // response ever arriving, the request itself is what's stuck.
         // (Selector-based Timer, not the block-based iOS10+ API — iOS 6/7 target.)
-        loadingTimer = Timer.scheduledTimer(timeInterval: 1, target: self,
-                                             selector: #selector(loadingTick), userInfo: nil, repeats: true)
+        // Pointless when we already have a list on screen; the "Updating…" title
+        // is the indicator in that case.
+        if !seeded {
+            loadingTimer = Timer.scheduledTimer(timeInterval: 1, target: self,
+                                                 selector: #selector(loadingTick), userInfo: nil, repeats: true)
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    // MARK: - Persistence
+
+    // Populates the list from the on-disk snapshot and seeds the engine's delta
+    // token. Returns whether anything was restored.
+    private func seedFromSnapshot() -> Bool {
+        guard let snapshot = RoomStore.shared.load() else { return false }
+
+        for room in snapshot.rooms { roomsById[room.roomId] = room }
+        for invite in snapshot.invites { invitesById[invite.roomId] = invite }
+        sortedRooms = roomsById.values.sorted { $0.lastMessageTimestamp > $1.lastMessageTimestamp }
+        invitations = invitesById.values.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        rebuildFilters()
+        rebuildDisplayedRooms()
+
+        lastSyncToken = snapshot.since
+        syncEngine.resume(since: snapshot.since)
+
+        tableView.reloadData()
+        statusLabel.isHidden = true
+        updateFilterControl()
+        UIApplication.shared.applicationIconBadgeNumber = totalUnreadCount()
+        setCatchingUp(true)
+        return true
+    }
+
+    // The catch-up indicator: a title swap plus the status-bar network spinner,
+    // shown only between restoring a snapshot and the first /sync of this launch.
+    private func setCatchingUp(_ active: Bool) {
+        isCatchingUp = active
+        title = active ? "Updating\u{2026}" : "Chats"
+        UIApplication.shared.isNetworkActivityIndicatorVisible = active
+    }
+
+    @objc private func persistNow() {
+        guard let token = lastSyncToken else { return }
+        RoomStore.shared.flush(since: token, rooms: Array(roomsById.values),
+                               invites: Array(invitesById.values))
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -234,14 +302,26 @@ class RoomListVC: UIViewController {
         rebuildDisplayedRooms()
 
         hasSyncedOnce = true
+
+        // Persist the list together with the token this exact state corresponds to.
+        // Read from the response rather than asking the engine, so the pairing
+        // can't drift: storing a token without the state derived from the batch it
+        // ends at would silently lose those messages, since the server treats
+        // everything up to that token as delivered and nothing replays it.
+        if let token = json["next_batch"] as? String, !token.isEmpty {
+            lastSyncToken = token
+            RoomStore.shared.save(since: token, rooms: Array(roomsById.values),
+                                  invites: Array(invitesById.values))
+        }
+
         // Total unread across all joined rooms, mirrored on the app icon badge.
-        // Computed here (off-main, right after the roomsById mutation) so the
-        // main-thread block below only reads a captured Int, never roomsById.
         let totalUnread = totalUnreadCount()
         DispatchQueue.main.async { [weak self] in
-            self?.tableView.reloadData()
-            self?.updateStatusLabel()
-            self?.updateFilterControl()
+            guard let self = self else { return }
+            if self.isCatchingUp { self.setCatchingUp(false) }
+            self.tableView.reloadData()
+            self.updateStatusLabel()
+            self.updateFilterControl()
             UIApplication.shared.applicationIconBadgeNumber = totalUnread
         }
     }
@@ -356,6 +436,10 @@ class RoomListVC: UIViewController {
         loadingTimer = nil
         // Clear the app icon badge so the next account doesn't inherit a stale count.
         UIApplication.shared.applicationIconBadgeNumber = 0
+        if isCatchingUp { setCatchingUp(false) }
+        // Drop the persisted room list: it belongs to the account signing out.
+        // (Also cancels any pending write, so nothing can land after this.)
+        RoomStore.shared.discard()
         MatrixSession.clear()
         // Drop cached media too, so a different account signing in on this
         // device doesn't inherit the previous user's downloaded images.

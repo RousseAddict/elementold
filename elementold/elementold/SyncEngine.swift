@@ -15,6 +15,20 @@ class SyncEngine {
     private var isRunning = false
     private var isRequestInFlight = false
 
+    // A `since` restored from disk (see RoomStore) has never been shown to the
+    // homeserver by this process, so unlike a token we obtained ourselves it may
+    // simply not be accepted — the server may have forgotten it, or the session
+    // may have been invalidated while the app was closed. That failure repeats
+    // identically every retry, which would leave the app permanently stuck, so
+    // the FIRST failure with such a token drops it and falls back to a full sync.
+    private var isUnvalidatedResumeToken = false
+
+    // The first poll of a launch needs the generous budget even when it is
+    // technically incremental: resuming after hours away means the server has a
+    // large delta to assemble, and `timeout` doesn't bound that work (it only
+    // bounds how long the server WAITS for new events). Cleared on first success.
+    private var isFirstPoll = true
+
     // Server-requested long-poll duration (ms) passed to /sync?timeout=...
     // The client-side curl timeout (seconds) must stay comfortably above this
     // so our own timeout never races the server's long-poll response.
@@ -135,6 +149,20 @@ class SyncEngine {
         if !NotificationManager.isEnabled { stop() }
     }
 
+    // Seed the delta token from a persisted snapshot so the first /sync of this
+    // launch is a cheap incremental one instead of a full initial sync. Must be
+    // called BEFORE start(), and only makes sense once — a token acquired during
+    // this session is always the better one.
+    //
+    // Note the first response then reports `isInitial == false`, which is correct:
+    // it is not an initial sync, and RoomListVC's client-side unread heuristic
+    // SHOULD count what arrived while the app was closed.
+    func resume(since token: String) {
+        guard !isRunning, since == nil, !token.isEmpty else { return }
+        since = token
+        isUnvalidatedResumeToken = true
+    }
+
     func start() {
         guard !isRunning else { return }
         isRunning = true
@@ -159,12 +187,21 @@ class SyncEngine {
             path += "&since=\(encoded)"
         }
 
-        let timeout = isInitial ? initialSyncTimeoutSeconds : clientTimeoutSeconds
+        let timeout = (isInitial || isFirstPoll) ? initialSyncTimeoutSeconds : clientTimeoutSeconds
         api.get(path, timeout: timeout) { [weak self] json, error in
             guard let self = self else { return }
             self.isRequestInFlight = false
 
             if let error = error {
+                if self.isUnvalidatedResumeToken {
+                    // Deliberately shape-agnostic: a rejected token can surface as
+                    // M_UNKNOWN_TOKEN, as some other errcode, or as a transport
+                    // failure, and guessing wrong here means an app that never
+                    // recovers. Throwing the token away costs one full sync.
+                    self.isUnvalidatedResumeToken = false
+                    self.since = nil
+                    RoomStore.shared.discard()
+                }
                 self.errorListeners.forEach { $0.fn(error) }
                 guard self.isRunning else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + self.retryDelaySeconds) { [weak self] in
@@ -174,6 +211,8 @@ class SyncEngine {
             }
 
             if let json = json {
+                self.isUnvalidatedResumeToken = false
+                self.isFirstPoll = false
                 if let nextBatch = json["next_batch"] as? String {
                     self.since = nextBatch
                 }
