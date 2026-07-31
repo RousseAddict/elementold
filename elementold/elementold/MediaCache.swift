@@ -239,7 +239,11 @@ class MediaCache {
     // limits we keep the frames decoded so far and drop the rest — a truncated
     // loop is a far better outcome than an out-of-memory kill on a 4S.
     private static let maxGifFrames = 120
-    private static let maxGifPixels = 12 * 1024 * 1024
+    // Counted in PIXELS, and each one costs 4 bytes decoded — so this budget is
+    // ~12 MB of bitmap, matching the comment above. (It used to read
+    // 12 * 1024 * 1024, which reads like a byte figure but is 12.6M pixels, i.e.
+    // ~50 MB — over twice the whole memory cache and a jetsam risk on a 4S.)
+    private static let maxGifPixels = 3 * 1024 * 1024
 
     // UIImage(data:) only ever yields the FIRST frame of a GIF, which is why
     // these render frozen. `animated` is set only for the full-size download

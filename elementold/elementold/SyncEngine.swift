@@ -25,6 +25,16 @@ class SyncEngine {
     // server doesn't get hammered in a tight loop.
     private let retryDelaySeconds: TimeInterval = 5
 
+    // Floor between two successful polls. A long-poll normally blocks for the
+    // full serverTimeoutMs, but any event at all — including a typing notice,
+    // which fires every few keystrokes on the other end — returns it instantly.
+    // Since CurlFetcher delivers completions on the main thread, the listeners
+    // (Room.parse for every room, RoomEvent.parse, rebuildRows, reloadData) run
+    // there too, so a burst of fast returns is a burst of main-thread work that
+    // competes with typing and scrolling. This caps that at ~4 rounds/second at
+    // no cost to perceived latency.
+    private let minPollIntervalSeconds: TimeInterval = 0.25
+
     // The Bool is `isInitial`: true only for the very first /sync of this
     // engine's lifetime (the cold-start full sync, when `since` was still nil).
     // RoomListVC uses it to skip its client-side unread heuristic on that batch,
@@ -154,7 +164,9 @@ class SyncEngine {
             }
 
             guard self.isRunning else { return }
-            self.pollOnce()
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.minPollIntervalSeconds) { [weak self] in
+                self?.pollOnce()
+            }
         }
     }
 }

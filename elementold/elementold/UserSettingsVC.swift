@@ -283,21 +283,25 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         guard section == 3 else { return nil }
         // Build time comes off the executable's mtime, so it can't drift out of sync
         // with what's actually installed — the reliable way to spot a stale install.
-        var parts = ["Build: \(UserSettingsVC.buildStamp())"]
+        var parts = ["Build: \(UserSettingsVC.buildStamp)"]
         // Surfaces the last recorded crash (if any) here rather than as a
         // launch-time popup — inspectable on demand without interrupting startup.
         if crashExpanded, let crash = CrashLogger.lastCrash { parts.append("Last crash:\n\(crash)") }
         return parts.joined(separator: "\n\n")
     }
 
-    private static func buildStamp() -> String {
+    // `let`, not a function: UIKit asks for a section's footer text repeatedly
+    // (every reload, every rotation), and this stats the executable and builds a
+    // DateFormatter. The executable's mtime can't change while we're running it,
+    // so resolve it once on first use.
+    private static let buildStamp: String = {
         guard let path = Bundle.main.executablePath,
               let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let date = attrs[.modificationDate] as? Date else { return "unknown" }
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d HH:mm"
         return formatter.string(from: date)
-    }
+    }()
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch section {

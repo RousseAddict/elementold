@@ -45,6 +45,17 @@ void curl_bridge_set_timeout(CurlHandle h, long secs) {
     curl_easy_setopt(h, CURLOPT_TIMEOUT, secs);
 }
 
+/* Stall detector for transfers that legitimately have no total timeout (a large
+ * media upload or download can run for minutes). Aborts once the transfer has
+ * moved fewer than `bytes_per_sec` bytes/second for `secs` consecutive seconds.
+ * Without this, a connection that goes quiet without dropping hangs forever —
+ * and because uploads and downloads each run on a SERIAL queue, one such hang
+ * blocks every later transfer for the rest of the process's life. */
+void curl_bridge_set_low_speed_abort(CurlHandle h, long bytes_per_sec, long secs) {
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, bytes_per_sec);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, secs);
+}
+
 void curl_bridge_set_write_fn(CurlHandle h, CurlBridgeWriteFn fn, void *userdata) {
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, fn);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, userdata);

@@ -84,6 +84,13 @@ class CurlFetcher {
     // serial, so a media upload would otherwise sit behind an in-progress file
     // download (and vice versa) for the whole transfer.
     private static let uploadQueue = DispatchQueue(label: "com.jellyold.curl.upload")
+    // Stall thresholds for the two transfers that run without a total timeout
+    // (streamed upload, file download). Both queues above are SERIAL, so a
+    // silently dead connection there doesn't just lose one transfer — it blocks
+    // every upload or download for the rest of the session. 30s below 1 byte/sec
+    // is slow enough that no real transfer trips it, even on 3G.
+    private static let stallBytesPerSecond = 1
+    private static let stallSeconds = 30
     // Thread-safe once-init: Swift static let uses dispatch_once. The first
     // background thread to touch this runs curl_global_init exactly once.
     // Never run from the main thread (crashes — OpenSSL threading init).
@@ -333,6 +340,8 @@ class CurlFetcher {
         CurlFetcher.applyTLS(h)
         // No follow_redirects: replaying the POST would need the body rewound.
         curl_bridge_set_timeout(h, 0)
+        curl_bridge_set_low_speed_abort(h, CurlFetcher.stallBytesPerSecond,
+                                        CurlFetcher.stallSeconds)
         curl_bridge_set_write_fn(h, curlDataWriteCallback, ptr)
 
         let box = CurlTransferBox()
@@ -375,6 +384,8 @@ class CurlFetcher {
         CurlFetcher.applyTLS(h)
         curl_bridge_set_follow_redirects(h)
         curl_bridge_set_timeout(h, 0)
+        curl_bridge_set_low_speed_abort(h, CurlFetcher.stallBytesPerSecond,
+                                        CurlFetcher.stallSeconds)
         curl_bridge_set_write_fn(h, curlFileWriteCallback, boxPtr)
         if progress != nil { curl_bridge_set_progress_fn(h, curlProgressCallback, boxPtr) }
 

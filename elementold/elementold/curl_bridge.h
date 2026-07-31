@@ -22,6 +22,11 @@ void        curl_bridge_set_ssl_verify(CurlHandle h);
 void        curl_bridge_set_ca_bundle(CurlHandle h, const char *path);
 void        curl_bridge_set_follow_redirects(CurlHandle h);
 void        curl_bridge_set_timeout(CurlHandle h, long secs);
+
+/* Abort a transfer that has stalled below bytes_per_sec for secs consecutive
+   seconds. For the streamed upload/download paths, which have no total timeout
+   because they may legitimately run for minutes. */
+void        curl_bridge_set_low_speed_abort(CurlHandle h, long bytes_per_sec, long secs);
 void        curl_bridge_set_write_fn(CurlHandle h, CurlBridgeWriteFn fn, void *userdata);
 void        curl_bridge_set_progress_fn(CurlHandle h, CurlBridgeProgressFn fn, void *clientp);
 
