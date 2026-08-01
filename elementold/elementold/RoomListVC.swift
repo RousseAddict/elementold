@@ -35,6 +35,17 @@ class RoomListVC: UIViewController {
     private var listHeaderContainer: UIView!
     private var filterButton: UIButton!
     private let filterButtonWidth: CGFloat = 44
+    // The header starts scrolled just out of sight, Mail-style: it stays part of
+    // the table's content, so pulling the list down brings it back and no scroll
+    // observing is needed. One-shot — once we've had a go at hiding it, it is
+    // never hidden again, so the list can't shuffle itself under the user later.
+    private var didHideListHeader = false
+
+    // Pull-to-refresh. UIRefreshControl exists on iOS 6, but UIScrollView's
+    // `refreshControl` property is iOS 10+, so on a plain UIViewController it has
+    // to be added as a subview of the table.
+    private var refreshControl: UIRefreshControl!
+    private var refreshTimeoutTimer: Timer?
 
     // Bridge/space grouping. A "bucket" is one space (its child rooms) or one
     // bridged network (its portal rooms). Built after each /sync from roomsById;
@@ -137,6 +148,10 @@ class RoomListVC: UIViewController {
 
         listHeaderContainer = container
         tableView.tableHeaderView = container
+
+        refreshControl = UIRefreshControl()
+        refreshControl.addTarget(self, action: #selector(refreshPulled), for: .valueChanged)
+        tableView.addSubview(refreshControl)
 
         // The funnel button opens the filter sheet, becoming a funnel-x (clear)
         // while a filter is active. Hidden (search bar full width) until at least
@@ -253,6 +268,54 @@ class RoomListVC: UIViewController {
                                invites: Array(invitesById.values))
     }
 
+    // MARK: - Header reveal / pull to refresh
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        hideListHeaderIfNeeded()
+    }
+
+    // Scrolls the search + filter header off the top so the list starts on its
+    // first row, the way Mail does it. Deliberately NOT done by removing the
+    // header: leaving it in the content means the reveal is just ordinary
+    // scrolling, so there is no gesture to recognise and nothing to fight the
+    // table's own panning. Pulling further past it reaches the refresh control.
+    //
+    // Waits for content to exist, because contentOffset can't be pushed beyond
+    // contentSize; and latches either way, so a list that grows later (or a
+    // /sync-driven reloadData, which preserves contentOffset) never yanks the
+    // header away while the user has it open.
+    private func hideListHeaderIfNeeded() {
+        guard !didHideListHeader, let header = listHeaderContainer else { return }
+        let barH = header.frame.height
+        guard barH > 0, tableView.contentSize.height > 0 else { return }
+        didHideListHeader = true
+        if tableView.contentSize.height > tableView.bounds.height {
+            tableView.contentOffset = CGPoint(x: 0, y: barH)
+        }
+    }
+
+    @objc private func refreshPulled() {
+        // The room list is push-driven: an open long-poll already delivers changes
+        // the moment they happen, so a pull only has work to do when the loop is
+        // idling between attempts (after an error) or was stopped. refreshNow()
+        // reports which case this is; when there was nothing to force, end the
+        // spinner on a short beat rather than leaving it turning for up to the
+        // long-poll's 30s while implying we're waiting on something.
+        let forced = syncEngine.refreshNow()
+        refreshTimeoutTimer?.invalidate()
+        refreshTimeoutTimer = Timer.scheduledTimer(timeInterval: forced ? 8 : 0.6, target: self,
+                                                   selector: #selector(finishRefresh),
+                                                   userInfo: nil, repeats: false)
+    }
+
+    @objc private func finishRefresh() {
+        refreshTimeoutTimer?.invalidate()
+        refreshTimeoutTimer = nil
+        guard refreshControl != nil, refreshControl.isRefreshing else { return }
+        refreshControl.endRefreshing()
+    }
+
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         // Fires both on first appearance (harmless, already nil) and when
@@ -319,7 +382,9 @@ class RoomListVC: UIViewController {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             if self.isCatchingUp { self.setCatchingUp(false) }
+            self.finishRefresh()
             self.tableView.reloadData()
+            self.hideListHeaderIfNeeded()
             self.updateStatusLabel()
             self.updateFilterControl()
             UIApplication.shared.applicationIconBadgeNumber = totalUnread
@@ -354,6 +419,9 @@ class RoomListVC: UIViewController {
     private func handleSyncError(_ error: Error) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            // A failed attempt is still an answer for a pull-to-refresh, so stop
+            // the spinner before the display guard below bails out.
+            self.finishRefresh()
             // Only surface this if we've never synced successfully — once rooms
             // are showing, a transient retry-loop error shouldn't blank the screen.
             guard self.sortedRooms.isEmpty else { return }

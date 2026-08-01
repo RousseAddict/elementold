@@ -78,6 +78,14 @@ class SyncEngine {
     private var errorListeners: [(token: Int, fn: (Error) -> Void)] = []
     private var nextListenerToken = 0
 
+    // Bumped whenever a poll is forced (refreshNow). The delayed re-poll blocks
+    // capture the value current when they were scheduled and bail if it moved,
+    // which is the only way to cancel them — DispatchQueue.asyncAfter has no
+    // cancel, so without this a forced poll would be followed by the original
+    // delayed one firing too, and pollOnce's in-flight guard would silently
+    // swallow it rather than reschedule, stalling the loop until the next event.
+    private var pollGeneration = 0
+
     // Percent-encode a query value using pure Swift stdlib only — no Foundation/ObjC calls.
     // `String.addingPercentEncoding(withAllowedCharacters:)` itself (the whole method, not
     // just the .urlQueryAllowed constant) bridges to an NSString method that doesn't exist
@@ -173,9 +181,28 @@ class SyncEngine {
         isRunning = false
     }
 
+    // Ask for a poll right now, skipping whatever delay the loop is sitting in.
+    // Returns whether that actually changed anything: when a long-poll is already
+    // open there is nothing to force — the server is holding that request open
+    // precisely so it can answer the instant something happens, and we have no
+    // way to cancel it (CurlFetcher has no cancellation), so a "refresh" then
+    // means the list is already as current as it can be.
+    @discardableResult
+    func refreshNow() -> Bool {
+        guard isRunning else {
+            start()
+            return true
+        }
+        guard !isRequestInFlight else { return false }
+        pollGeneration += 1
+        pollOnce()
+        return true
+    }
+
     private func pollOnce() {
         guard isRunning, !isRequestInFlight else { return }
         isRequestInFlight = true
+        let generation = pollGeneration
 
         // Captured before the response updates `since`: a nil `since` here means
         // this is the cold-start full sync (no incremental delta token yet).
@@ -205,7 +232,8 @@ class SyncEngine {
                 self.errorListeners.forEach { $0.fn(error) }
                 guard self.isRunning else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + self.retryDelaySeconds) { [weak self] in
-                    self?.pollOnce()
+                    guard let self = self, self.pollGeneration == generation else { return }
+                    self.pollOnce()
                 }
                 return
             }
@@ -221,7 +249,8 @@ class SyncEngine {
 
             guard self.isRunning else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + self.minPollIntervalSeconds) { [weak self] in
-                self?.pollOnce()
+                guard let self = self, self.pollGeneration == generation else { return }
+                self.pollOnce()
             }
         }
     }

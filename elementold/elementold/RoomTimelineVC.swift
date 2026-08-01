@@ -774,13 +774,28 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
+    // The empty-room message. Only ever says "No messages yet." — loading is
+    // reported by the top-of-table backfill spinner alone, so the two don't stack
+    // (this label used to read "Loading messages…" over that same spinner).
+    //
+    // Compact and centred rather than the full table bounds it used to cover, and
+    // explicitly clear: an iOS 6 UILabel defaults to an OPAQUE WHITE background,
+    // so a full-bounds one painted a white pane over the whole timeline for as
+    // long as the first /messages request was in flight.
     private func buildStatusLabel() {
-        statusLabel = UILabel(frame: tableView.bounds.insetBy(dx: 24, dy: 24))
-        statusLabel.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        let w: CGFloat = 260, h: CGFloat = 72
+        statusLabel = UILabel(frame: CGRect(x: (view.bounds.width - w) / 2,
+                                            y: (view.bounds.height - h) / 2,
+                                            width: w, height: h))
+        statusLabel.autoresizingMask = [.flexibleTopMargin, .flexibleBottomMargin,
+                                        .flexibleLeftMargin, .flexibleRightMargin]
+        statusLabel.backgroundColor = .clear
         statusLabel.numberOfLines = 0
         statusLabel.textAlignment = .center
+        statusLabel.font = UIFont.systemFont(ofSize: 14)
         statusLabel.textColor = .gray
-        statusLabel.text = "Loading messages\u{2026}"
+        statusLabel.text = "No messages yet."
+        statusLabel.isHidden = true
         view.insertSubview(statusLabel, aboveSubview: tableView)
     }
 
@@ -1166,10 +1181,9 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
-    // Shows a "Loading messages…" label until the initial backfill request
-    // completes (success, error, or no-prevBatch no-op), then either hides it
-    // (messages present) or switches to "No messages yet." — previously the
-    // screen just sat blank with no feedback while the first request was in flight.
+    // Latches once the initial backfill request has resolved (success, error, or
+    // no-prevBatch no-op). Until then the empty-state label stays hidden, so a
+    // room still fetching its first page shows the top spinner and nothing else.
     private func markInitialLoadDone() {
         guard !hasLoadedInitial else { return }
         hasLoadedInitial = true
@@ -1178,13 +1192,10 @@ class RoomTimelineVC: UIViewController {
         }
     }
 
+    // Hidden while anything is still loading — a room mid-backfill shows only the
+    // top spinner. Appears once we've finished and there is genuinely nothing.
     private func updateStatusLabel() {
-        if !events.isEmpty {
-            statusLabel.isHidden = true
-        } else if hasLoadedInitial {
-            statusLabel.text = "No messages yet."
-            statusLabel.isHidden = false
-        }
+        statusLabel.isHidden = !(events.isEmpty && hasLoadedInitial)
     }
 
     private func handleSync(_ json: [String: Any]) {
