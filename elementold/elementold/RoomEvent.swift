@@ -44,6 +44,12 @@ enum TimeFormat {
         return f
     }()
 
+    private static let weekdayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "EEEE"
+        return f
+    }()
+
     static func shortTime(msSinceEpoch: Double) -> String {
         guard msSinceEpoch > 0 else { return "" }
         return formatter.string(from: Date(timeIntervalSince1970: msSinceEpoch / 1000))
@@ -66,6 +72,33 @@ enum TimeFormat {
         if key == dayKeyFormatter.string(from: Date(timeIntervalSinceNow: -86400)) { return "Yesterday" }
         let sameYear = yearFormatter.string(from: date) == yearFormatter.string(from: now)
         return (sameYear ? sameYearFormatter : otherYearFormatter).string(from: date)
+    }
+
+    // The room list's per-row stamp: a clock time only while a conversation is
+    // still today's, the day's own name for the rest of the past week, and a
+    // plain numeric date beyond that — so a row's age reads at a glance instead
+    // of every row showing an hour that means a different day on each line.
+    //
+    // Days are matched by comparing day-key strings against fixed 24h steps back
+    // from now, which keeps this free of any NSCalendar component API. A daylight
+    // saving change can make one of those steps land on a day already matched,
+    // in which case the oldest weekday falls through to the numeric date — a day
+    // early, twice a year, on a label that is only ever a rough marker.
+    static func listStamp(msSinceEpoch: Double) -> String {
+        guard msSinceEpoch > 0 else { return "" }
+        let date = Date(timeIntervalSince1970: msSinceEpoch / 1000)
+        let key = dayKeyFormatter.string(from: date)
+        if key == dayKeyFormatter.string(from: Date()) {
+            return shortTime(msSinceEpoch: msSinceEpoch)
+        }
+        for daysAgo in 1...6 {
+            let past = Date(timeIntervalSinceNow: -86400 * Double(daysAgo))
+            if key == dayKeyFormatter.string(from: past) {
+                return weekdayFormatter.string(from: date)
+            }
+        }
+        // dayKeyFormatter is already yyyy-MM-dd, which is the wanted short date.
+        return key
     }
 }
 

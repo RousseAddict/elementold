@@ -757,7 +757,7 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
         cell.detailTextLabel?.text = room.lastMessage
         cell.detailTextLabel?.textColor = .gray
         cell.accessoryType = .disclosureIndicator
-        cell.timeLabel.text = TimeFormat.shortTime(msSinceEpoch: room.lastMessageTimestamp)
+        cell.timeLabel.text = TimeFormat.listStamp(msSinceEpoch: room.lastMessageTimestamp)
         cell.setUnreadCount(room.unreadCount)
         cell.setAvatar(mxc: room.avatarMxc, name: room.name)
         return cell
