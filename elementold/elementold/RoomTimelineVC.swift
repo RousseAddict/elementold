@@ -167,6 +167,9 @@ class RoomTimelineVC: UIViewController {
     // image exactly once (on first appearance in `events`) rather than re-hitting
     // the cache — and re-logging a diagnostic line — on every table reload.
     private var prefetchedMxcs = Set<String>()
+    // Thumbnail requests collected by rebuildRows' single sweep of `events`, so
+    // prefetchImageThumbnails doesn't have to walk the whole timeline again.
+    private var prefetchRequests: [(mxc: String, w: Int, h: Int)] = []
     // Token for our /sync listener so deinit can unregister it — otherwise every
     // conversation opened this session would leave a dead listener that /sync
     // still calls on each response.
@@ -1130,13 +1133,19 @@ class RoomTimelineVC: UIViewController {
         }
         // First page starts at the room's prev_batch; later pages continue from
         // the previous response's `end` token (see below).
-        guard let from = backfillFrom ?? room.prevBatch else {
-            markInitialLoadDone()
-            return
-        }
+        //
+        // With no token at all we ask for the most recent page instead: omitting
+        // `from` means "start at the newest visible event" (the parameter has
+        // been optional since Matrix 1.3; this server speaks 1.12). That is the
+        // right reading of a nil token — prev_batch marks the position just
+        // before the events we have buffered, so without one there is nothing to
+        // page back *from*, and the newest page is what opening a room should
+        // show. Previously this gave up and left the room blank.
+        let from = backfillFrom ?? room.prevBatch
         isLoadingBackfill = true
         setBackfillSpinner(active: true)
-        let path = "/_matrix/client/v3/rooms/\(room.roomId)/messages?dir=b&from=\(from)&limit=30"
+        var path = "/_matrix/client/v3/rooms/\(room.roomId)/messages?dir=b&limit=30"
+        if let from = from { path += "&from=\(from)" }
         client.get(path) { [weak self] json, error in
             guard let self = self else { return }
             self.isLoadingBackfill = false
@@ -1316,24 +1325,73 @@ class RoomTimelineVC: UIViewController {
         var lastDayKey: String?
         var prevEvent: RoomEvent?
 
-        // Everything a redaction took back — a deleted message as much as an
-        // un-done reaction. (A message already redacted before we fetched it
-        // arrives with empty content and is dropped at ingestion by
+        let selfUserId = MatrixSession.userId
+
+        // One sweep of `events` gathers everything the folds below need. It used
+        // to be six separate full passes (redactions, byId, edits, reactions,
+        // bundled totals, read receipt) plus a seventh in
+        // prefetchImageThumbnails — and since `events` only ever grows as the
+        // user pages back through history, every one of them got longer with
+        // each backfill, making a scroll-up cost proportional to everything
+        // loaded so far. Edits, reactions and bundles are a small subset, so
+        // collecting them here lets their folds iterate a handful of events
+        // instead of the whole timeline.
+        //
+        // `redacted` covers everything a redaction took back — a deleted message
+        // as much as an un-done reaction. (A message already redacted before we
+        // fetched it arrives with empty content and is dropped at ingestion by
         // RoomEvent.parse; this covers the ones redacted while we're watching.)
         var redacted = Set<String>()
-        for event in events {
-            if case .redaction(let target) = event.kind { redacted.insert(target) }
-        }
-
         var byId: [String: RoomEvent] = [:]
-        for event in events { byId[event.eventId] = event }
+        var editEvents: [RoomEvent] = []
+        var reactionEvents: [RoomEvent] = []
+        var bundledEvents: [RoomEvent] = []
+        // The most recent of OUR own messages that a peer has read — a single
+        // "Seen" marker goes under it. Assigned on every match, so the last one
+        // in timeline order wins.
+        var seenEventId: String?
+        var mediaToPrefetch: [(mxc: String, w: Int, h: Int)] = []
+        for event in events {
+            byId[event.eventId] = event
+            if !event.bundledReactions.isEmpty { bundledEvents.append(event) }
+            switch event.kind {
+            case .redaction(let target):
+                redacted.insert(target)
+            case .edit:
+                editEvents.append(event)
+            case .reaction:
+                reactionEvents.append(event)
+            case .image(let sender, _, let mxc, let w, let h):
+                mediaToPrefetch.append((mxc, w, h))
+                if sender == selfUserId && othersReadEventIds.contains(event.eventId) {
+                    seenEventId = event.eventId
+                }
+            case .video(let sender, let video):
+                // Videos are prefetched too: their poster frame is an ordinary
+                // thumbnail request, keyed on the thumbnail's own mxc.
+                if let thumb = video.thumbnailMxc {
+                    mediaToPrefetch.append((thumb, video.width, video.height))
+                }
+                if sender == selfUserId && othersReadEventIds.contains(event.eventId) {
+                    seenEventId = event.eventId
+                }
+            case .message(let sender, _, _), .audio(let sender, _, _, _),
+                 .file(let sender, _, _, _, _):
+                if sender == selfUserId && othersReadEventIds.contains(event.eventId) {
+                    seenEventId = event.eventId
+                }
+            case .membership:
+                break
+            }
+        }
         eventsById = byId
+        prefetchRequests = mediaToPrefetch
 
         // Edits rewrite an existing bubble rather than adding one. Keep only the
         // newest edit per target, and only from the target's own sender — the
         // spec says an edit from anyone else is to be ignored.
         var edits: [String: (timestamp: Double, body: String)] = [:]
-        for event in events {
+        for event in editEvents {
             guard case .edit(let sender, let target, let body) = event.kind,
                   !redacted.contains(event.eventId),
                   let original = byId[target],
@@ -1351,7 +1409,7 @@ class RoomTimelineVC: UIViewController {
         // Reactions we know were taken back, so the server's bundled totals
         // (which may predate the redaction) can be corrected below.
         var redactedCounts: [String: [String: Int]] = [:]
-        for event in events {
+        for event in reactionEvents {
             guard case .reaction(let sender, let target, let key) = event.kind else { continue }
             if redacted.contains(event.eventId) {
                 redactedCounts[target, default: [:]][key, default: 0] += 1
@@ -1361,7 +1419,7 @@ class RoomTimelineVC: UIViewController {
                 keyOrder[target] = (keyOrder[target] ?? []) + [key]
             }
             keyCounts[target, default: [:]][key, default: 0] += 1
-            if sender == MatrixSession.userId {
+            if sender == selfUserId {
                 mine[target, default: [:]][key] = event.eventId
             }
         }
@@ -1373,7 +1431,7 @@ class RoomTimelineVC: UIViewController {
         // The bundle carries no event ids, so it can never tell us that one of
         // the reactions is ours: a chip added this way always renders as
         // someone else's until the room is reopened.
-        for event in events where !event.bundledReactions.isEmpty {
+        for event in bundledEvents {
             let target = event.eventId
             for bundled in event.bundledReactions {
                 let live = keyCounts[target]?[bundled.key] ?? 0
@@ -1387,13 +1445,6 @@ class RoomTimelineVC: UIViewController {
             }
         }
 
-        // The most recent of OUR own messages that a peer has read — a single
-        // "Seen" marker goes under it.
-        var seenEventId: String?
-        for event in events where othersReadEventIds.contains(event.eventId)
-            && RoomTimelineVC.senderOf(event) == MatrixSession.userId {
-            seenEventId = event.eventId
-        }
         for event in events {
             // (Content-less/blank messages are already dropped at ingestion in
             // RoomEvent.parse, so they never reach here to create empty-bubble
@@ -1514,20 +1565,13 @@ class RoomTimelineVC: UIViewController {
     // which read as "images above the fold never load". Coalescing in MediaCache
     // dedups against the cell's own later request; `prefetchedMxcs` ensures we
     // fire once per image rather than on every reload.
+    //
+    // The requests themselves are gathered by rebuildRows' single sweep — this
+    // used to be its own full pass over `events`, which grows with every page of
+    // backfill, so scrolling back through a long history paid for it repeatedly.
     private func prefetchImageThumbnails() {
-        for event in events {
-            // Videos are prefetched too: their poster frame is an ordinary
-            // thumbnail request, keyed on the thumbnail's own mxc.
-            var request: (mxc: String, w: Int, h: Int)?
-            switch event.kind {
-            case .image(_, _, let mxc, let w, let h):
-                request = (mxc, w, h)
-            case .video(_, let video):
-                if let thumb = video.thumbnailMxc { request = (thumb, video.width, video.height) }
-            default:
-                break
-            }
-            guard let req = request, !prefetchedMxcs.contains(req.mxc) else { continue }
+        for req in prefetchRequests {
+            guard !prefetchedMxcs.contains(req.mxc) else { continue }
             prefetchedMxcs.insert(req.mxc)
             let (reqW, reqH) = ImageEventCell.thumbnailRequestSize(imageWidth: req.w, imageHeight: req.h)
             MediaCache.shared.loadThumbnail(mxc: req.mxc, width: reqW, height: reqH) { _ in }
@@ -2756,33 +2800,11 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
     // laggy" symptom, since a keystroke's typing notification round-trips through
     // /sync and lands work back on main.
     //
-    // Two fixes, both of which keep this a pure function of (text, font, width):
-    // one reused sizing label instead of a fresh one per row (the same trick
-    // ReactionsCell.sizingLabel already uses further down), and a memo table,
-    // since across reloads the same text is measured at the same width over and
-    // over. Main thread only, like everything else that touches the table.
-    private static let sizingLabel: UILabel = {
-        let label = UILabel()
-        label.numberOfLines = 0
-        return label
-    }()
-    private static var textHeightCache: [String: CGFloat] = [:]
-
+    // Both are answered by EventCell.measureBody, which owns the one reused
+    // sizing label and the one memo table — so the height reserved here and the
+    // size the cell lays itself out to come from the same measurement.
     private func textHeight(_ text: String, font: UIFont, width: CGFloat) -> CGFloat {
-        let w = max(1, width)
-        // Font size is part of the key because the two call sites could diverge
-        // later; today they share one font.
-        let key = "\(Int(w))|\(font.pointSize)|\(text)"
-        if let cached = RoomTimelineVC.textHeightCache[key] { return cached }
-        let label = RoomTimelineVC.sizingLabel
-        label.font = font
-        label.text = text
-        let height = ceil(label.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude)).height)
-        // Bounded rather than evicted cleverly: the keys are message bodies, so
-        // an unbounded map would grow with scrollback for the whole session.
-        if RoomTimelineVC.textHeightCache.count > 800 { RoomTimelineVC.textHeightCache.removeAll() }
-        RoomTimelineVC.textHeightCache[key] = height
-        return height
+        return ceil(EventCell.measureBody(text, font: font, width: width).height)
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -2988,6 +3010,41 @@ private class EventCell: UITableViewCell {
     // meta header (5 minutes, in ms — timestamps are origin_server_ts).
     static let groupingWindowMs: Double = 5 * 60 * 1000
 
+    // The single place a message body is measured. Both rowHeight (before the
+    // cell exists) and layoutSubviews (which needs the width too, to size the
+    // bubble to its content) ask for the same (text, font, width) — so they
+    // share one reused sizing label and one memo table, and can't drift apart.
+    //
+    // Without the memo, layoutSubviews re-ran a full text layout for every cell
+    // scrolling into view even though rowHeight had just measured that exact
+    // string at that exact width, and again on every setRevealOffset (which
+    // forces a synchronous layout). Measurement is a pure function of the three
+    // inputs, so caching it is safe — caching ROW heights would not be, since
+    // those can drift from layoutSubviews and re-create the phantom-gap bug.
+    // Main thread only, like everything else that touches the table.
+    private static let measuringLabel: UILabel = {
+        let label = UILabel()
+        label.numberOfLines = 0
+        return label
+    }()
+    private static var bodySizeCache: [String: CGSize] = [:]
+
+    static func measureBody(_ text: String, font: UIFont, width: CGFloat) -> CGSize {
+        let w = max(1, width)
+        // Font size is part of the key because the call sites could diverge
+        // later; today they share bodyFont.
+        let key = "\(Int(w))|\(font.pointSize)|\(text)"
+        if let cached = bodySizeCache[key] { return cached }
+        measuringLabel.font = font
+        measuringLabel.text = text
+        let size = measuringLabel.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude))
+        // Bounded rather than evicted cleverly: the keys are message bodies, so
+        // an unbounded map would grow with scrollback for the whole session.
+        if bodySizeCache.count > 800 { bodySizeCache.removeAll() }
+        bodySizeCache[key] = size
+        return size
+    }
+
     private let bubble = UIView()
     private let metaLabel = UILabel()
     private let bodyLabel = UILabel()
@@ -3117,8 +3174,11 @@ private class EventCell: UITableViewCell {
         let maxInnerWidth = maxBubbleWidth - EventCell.innerPadding * 2
         // Measure body at the widest allowed width; sizeThatFits returns the
         // tightest width that yields the same wrapping, so the bubble can shrink
-        // to fit short messages while long ones cap out.
-        let bodySize = bodyLabel.sizeThatFits(CGSize(width: maxInnerWidth, height: .greatestFiniteMagnitude))
+        // to fit short messages while long ones cap out. Goes through the shared
+        // memo so rowHeight's measurement of this same string is reused rather
+        // than repeated per appearance.
+        let bodySize = EventCell.measureBody(bodyLabel.text ?? "", font: EventCell.bodyFont,
+                                             width: maxInnerWidth)
         // A quoted reply gets to widen the bubble (it truncates to one line, so
         // it can't change the height) — otherwise a one-word reply to a long
         // message would cut the quote down to nothing.
@@ -4111,29 +4171,38 @@ private class ReactionsCell: UITableViewCell {
     func configure(items: [ReactionItem], isOwn: Bool) {
         self.items = items
         isOwnMessage = isOwn
-        // Rebuild the buttons: the chip set changes with every reaction, so
-        // recycling individual buttons buys nothing but bookkeeping.
-        chips.forEach { $0.removeFromSuperview() }
-        chips = items.enumerated().map { index, item in
+        // Chips are reused, not rebuilt. This runs on every appearance and every
+        // /sync-driven reload, so allocating a UIButton — with its layer, title
+        // label and target — per chip each time is pure churn. Buttons left over
+        // from a longer previous configuration are hidden and kept for later.
+        while chips.count < items.count {
             let button = UIButton(type: .custom)
-            button.tag = index
             button.titleLabel?.font = ReactionsCell.font
-            button.setTitle(ReactionsCell.chipTitle(item), for: .normal)
-            button.setTitleColor(item.mineEventId != nil
-                                    ? UIColor(red: 0.0, green: 0.35, blue: 0.75, alpha: 1.0) : .darkGray,
-                                 for: .normal)
-            // Ours reads as "selected": tinted fill + matching border.
-            button.backgroundColor = item.mineEventId != nil
-                ? UIColor(red: 0.85, green: 0.91, blue: 1.0, alpha: 1.0)
-                : UIColor(white: 0.90, alpha: 1.0)
             button.layer.cornerRadius = ReactionsCell.chipHeight / 2
             button.layer.borderWidth = 1
-            button.layer.borderColor = (item.mineEventId != nil
-                ? UIColor(red: 0.35, green: 0.6, blue: 0.95, alpha: 1.0)
-                : UIColor(white: 0.78, alpha: 1.0)).cgColor
             button.addTarget(self, action: #selector(chipTapped(_:)), for: .touchUpInside)
             contentView.addSubview(button)
-            return button
+            chips.append(button)
+        }
+        for (index, button) in chips.enumerated() {
+            guard index < items.count else {
+                button.isHidden = true
+                continue
+            }
+            let item = items[index]
+            let mine = item.mineEventId != nil
+            button.isHidden = false
+            button.tag = index
+            button.setTitle(ReactionsCell.chipTitle(item), for: .normal)
+            button.setTitleColor(mine ? UIColor(red: 0.0, green: 0.35, blue: 0.75, alpha: 1.0) : .darkGray,
+                                 for: .normal)
+            // Ours reads as "selected": tinted fill + matching border.
+            button.backgroundColor = mine
+                ? UIColor(red: 0.85, green: 0.91, blue: 1.0, alpha: 1.0)
+                : UIColor(white: 0.90, alpha: 1.0)
+            button.layer.borderColor = (mine
+                ? UIColor(red: 0.35, green: 0.6, blue: 0.95, alpha: 1.0)
+                : UIColor(white: 0.78, alpha: 1.0)).cgColor
         }
         setNeedsLayout()
     }
@@ -4207,11 +4276,22 @@ private class ReactionsCell: UITableViewCell {
 
     // UILabel.sizeThatFits rather than any NSString sizing API — those are
     // iOS 7+ selectors on this runtime.
+    //
+    // Memoized because layout() runs from both height() and layoutSubviews, and
+    // height() is asked for every row on every reload (no estimatedRowHeight
+    // before iOS 7). Chip titles are a handful of short strings — an emoji plus
+    // a count — so the cache stays tiny; the cap only guards against a room
+    // whose reactions are unusually varied.
     private static let sizingLabel = UILabel()
+    private static var widthCache: [String: CGFloat] = [:]
     private static func textWidth(_ text: String) -> CGFloat {
+        if let cached = widthCache[text] { return cached }
         sizingLabel.font = font
         sizingLabel.text = text
-        return ceil(sizingLabel.sizeThatFits(CGSize(width: 10000, height: chipHeight)).width)
+        let width = ceil(sizingLabel.sizeThatFits(CGSize(width: 10000, height: chipHeight)).width)
+        if widthCache.count > 200 { widthCache.removeAll() }
+        widthCache[text] = width
+        return width
     }
 }
 

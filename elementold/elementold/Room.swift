@@ -219,11 +219,8 @@ struct Room {
 // the server sends once. Drop them and a quiet room would come back nameless,
 // avatar-less and outside its filter bucket, permanently.
 //
-// Known gap: `prevBatch` is persisted at whatever position it had, so if a room
-// received so much while the app was closed that the catch-up sync truncates its
-// timeline (`limited: true`), scrollback can skip the slice between the two.
-// Nothing is lost that we had before — this is the same shape of gap a limited
-// timeline already produces mid-session — and no cached event is discarded.
+// The one field NOT kept is `prevBatch` (see encodeRoom): it only has meaning
+// relative to the buffered timeline, which isn't kept either.
 final class RoomStore {
 
     static let shared = RoomStore()
@@ -357,7 +354,16 @@ final class RoomStore {
             "ts": room.lastMessageTimestamp,
             "unread": room.unreadCount,
         ]
-        if let v = room.prevBatch { d["prev"] = v }
+        // prevBatch is deliberately NOT persisted. It means "the position just
+        // before the events I have buffered", and the buffer (timelineEvents) is
+        // not persisted — so across a restart the token describes a timeline we
+        // no longer hold. Backfilling from it walks *backwards* from wherever the
+        // app happened to be when it last ran, so opening a quiet room showed an
+        // old slice of the conversation with everything since it missing.
+        // Leaving it nil is what we want: Room.parse assigns it from the first
+        // chunk this launch sees (i.e. just before the catch-up events), and a
+        // room that syncs nothing keeps a nil token, which RoomTimelineVC reads
+        // as "fetch the newest page".
         if let v = room.avatarMxc { d["avatar"] = v }
         if !room.memberNames.isEmpty { d["names"] = room.memberNames }
         if !room.memberAvatars.isEmpty { d["avatars"] = room.memberAvatars }
@@ -375,7 +381,9 @@ final class RoomStore {
                     name: d["name"] as? String ?? roomId,
                     lastMessage: d["last"] as? String ?? "",
                     lastMessageTimestamp: (d["ts"] as? NSNumber)?.doubleValue ?? 0,
-                    prevBatch: d["prev"] as? String,
+                    // Not read even from a file that still carries "prev" (older
+                    // versions wrote it) — see encodeRoom.
+                    prevBatch: nil,
                     timelineEvents: [],
                     avatarMxc: d["avatar"] as? String,
                     memberNames: stringMap(d["names"]),

@@ -109,6 +109,14 @@ class MediaCache {
     // reuse). Main thread only, like `inFlight`.
     private var fileWaiters: [String: [(progress: ((Float) -> Void)?, completion: (String?) -> Void)]] = [:]
 
+    // Names of the attachments currently on disk, so downloadedFilePath can
+    // answer without touching the filesystem: it's called from cellForRowAt for
+    // every attachment row on every reload, and a stat per row per reload adds
+    // up on device flash. Safe as a cache because nothing but this class writes
+    // to filesDir and, being under Documents, iOS never evicts it behind our
+    // back. Read and written on the main thread only.
+    private var presentFileNames = Set<String>()
+
     private init() {
         let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
             ?? NSTemporaryDirectory()
@@ -118,6 +126,11 @@ class MediaCache {
             ?? NSTemporaryDirectory()
         filesDir = (documents as NSString).appendingPathComponent("elementold-files")
         try? FileManager.default.createDirectory(atPath: filesDir, withIntermediateDirectories: true, attributes: nil)
+        // One directory listing at launch seeds the attachment snapshot. Done
+        // synchronously on purpose: a timeline shown before it landed would
+        // report every downloaded attachment as missing.
+        presentFileNames = Set(((try? FileManager.default.contentsOfDirectory(atPath: filesDir)) ?? [])
+            .filter { !$0.hasSuffix(".part") })
         // Trim once at launch to reclaim space left by previous runs.
         trimQueue.async { [weak self] in self?.trimDiskCache() }
     }
@@ -455,10 +468,12 @@ class MediaCache {
     // MARK: - Attachments (m.file / m.video)
 
     // Local path for an already-downloaded attachment, nil when it isn't on disk
-    // yet. One stat call — cheap enough for cellForRowAt.
+    // yet. Answered from the in-memory snapshot — no disk access, so it stays
+    // cheap when cellForRowAt asks for every visible attachment on every reload.
     func downloadedFilePath(mxc: String, filename: String, mimeType: String) -> String? {
-        guard let path = filePath(mxc: mxc, filename: filename, mimeType: mimeType) else { return nil }
-        return FileManager.default.fileExists(atPath: path) ? path : nil
+        guard let name = fileName(mxc: mxc, filename: filename, mimeType: mimeType),
+              presentFileNames.contains(name) else { return nil }
+        return (filesDir as NSString).appendingPathComponent(name)
     }
 
     // Streams an attachment straight to disk instead of buffering the whole body
@@ -470,15 +485,20 @@ class MediaCache {
                       progress: ((Float) -> Void)?,
                       completion: @escaping (String?) -> Void) {
         guard let (server, mediaId) = parseMxc(mxc),
-              let path = filePath(mxc: mxc, filename: filename, mimeType: mimeType) else {
+              let name = fileName(mxc: mxc, filename: filename, mimeType: mimeType) else {
             MediaCache.record("bad mxc (file): \(mxc)")
             completion(nil)
             return
         }
+        let path = (filesDir as NSString).appendingPathComponent(name)
+        // A real stat here, unlike downloadedFilePath: this runs once per tap,
+        // so it can afford to be authoritative and to correct the snapshot.
         if FileManager.default.fileExists(atPath: path) {
+            presentFileNames.insert(name)
             completion(path)
             return
         }
+        presentFileNames.remove(name)
         if fileWaiters[path] != nil {
             fileWaiters[path]?.append((progress, completion))
             return
@@ -510,6 +530,7 @@ class MediaCache {
                 try? fm.removeItem(atPath: partPath)
             }
             MediaCache.record(succeeded ? "file ok \(mediaId)" : "file failed \(mediaId)")
+            if succeeded { self.presentFileNames.insert(name) }
             let waiters = self.fileWaiters.removeValue(forKey: path) ?? []
             for waiter in waiters { waiter.completion(succeeded ? path : nil) }
         }
@@ -519,11 +540,10 @@ class MediaCache {
     // extension preserved because the preview/open-in machinery infers the file
     // type from it. The sender-supplied filename is untrusted and never used as
     // a path component — only its extension, sanitized.
-    private func filePath(mxc: String, filename: String, mimeType: String) -> String? {
+    private func fileName(mxc: String, filename: String, mimeType: String) -> String? {
         guard let (server, mediaId) = parseMxc(mxc) else { return nil }
         let ext = fileExtension(filename: filename, mimeType: mimeType)
-        let name = sanitize("\(server)_\(mediaId)") + "." + ext
-        return (filesDir as NSString).appendingPathComponent(name)
+        return sanitize("\(server)_\(mediaId)") + "." + ext
     }
 
     // Mime types whose subtype isn't a usable extension. Getting this right
@@ -594,7 +614,10 @@ class MediaCache {
                     try? fm.removeItem(atPath: (self.filesDir as NSString).appendingPathComponent(name))
                 }
             }
-            DispatchQueue.main.async { completion() }
+            DispatchQueue.main.async {
+                self.presentFileNames.removeAll()
+                completion()
+            }
         }
     }
 
@@ -757,6 +780,13 @@ class AvatarView: UIView {
     }
 
     func setAvatar(mxc: String?, name: String) {
+        // Reconfiguring with the avatar that's already displayed is the common
+        // case: cell reuse and every /sync-driven reload run through here. Bail
+        // out rather than reset to the placeholder and ask MediaCache again —
+        // once the thumbnail has been evicted from the memory cache that repeat
+        // request costs a disk read plus a decode, and the view visibly flashes
+        // back to initials in the meantime.
+        if let mxc = mxc, !mxc.isEmpty, mxc == currentMxc, imageView.image != nil { return }
         currentMxc = mxc
         // Placeholder first (shown while loading, and permanently if no mxc).
         initialsLabel.text = AvatarView.initials(from: name)
