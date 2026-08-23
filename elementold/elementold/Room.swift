@@ -250,10 +250,10 @@ final class RoomStore {
     // Debounce, same shape as MediaCache.scheduleTrim. A long-poll returns
     // instantly on any event — including a typing notice — so /sync can complete
     // several times a second, and each one would otherwise be a full re-encode
-    // plus a disk write. `pending`/`writeScheduled` are touched only from the
-    // main thread (handleSync and the background/terminate notifications both
-    // run there).
-    private var pending: Snapshot?
+    // plus a disk write. These are touched only from the main thread (handleSync
+    // and the background/terminate notifications both run there).
+    private var pendingSince: String?
+    private var pendingProvider: (() -> (rooms: [Room], invites: [Invitation]))?
     private var writeScheduled = false
     private let writeDelay: TimeInterval = 4
 
@@ -286,15 +286,27 @@ final class RoomStore {
     // MARK: writing
 
     // Debounced — safe to call after every /sync.
-    func save(since: String, rooms: [Room], invites: [Invitation]) {
-        pending = Snapshot(since: since, rooms: rooms, invites: invites)
+    //
+    // Takes a provider instead of the arrays themselves. This is called once per
+    // /sync but writes at most once per writeDelay, and `Room` is a large value
+    // type, so handing in `Array(roomsById.values)` meant copying every joined
+    // room several times a second for one eventual write. The provider runs in
+    // the same main-thread turn that reads `pendingSince`, and both are only ever
+    // updated together from handleSync, so the state it returns still belongs to
+    // that token — the pairing the atomic write exists to protect.
+    func save(since: String, provider: @escaping () -> (rooms: [Room], invites: [Invitation])) {
+        pendingSince = since
+        pendingProvider = provider
         guard !writeScheduled else { return }
         writeScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + writeDelay) { [weak self] in
             guard let self = self else { return }
             self.writeScheduled = false
-            guard let snapshot = self.pending else { return }
-            self.pending = nil
+            guard let since = self.pendingSince, let provider = self.pendingProvider else { return }
+            self.pendingSince = nil
+            self.pendingProvider = nil
+            let state = provider()
+            let snapshot = Snapshot(since: since, rooms: state.rooms, invites: state.invites)
             self.queue.async { self.write(snapshot) }
         }
     }
@@ -304,7 +316,8 @@ final class RoomStore {
     // it on the caller's thread at that one moment is the right trade for
     // actually landing on disk.
     func flush(since: String, rooms: [Room], invites: [Invitation]) {
-        pending = nil
+        pendingSince = nil
+        pendingProvider = nil
         writeScheduled = false
         write(Snapshot(since: since, rooms: rooms, invites: invites))
     }
@@ -313,7 +326,8 @@ final class RoomStore {
     // Reset Cache and by logout, and as the recovery path when the homeserver
     // won't accept our stored token.
     func discard() {
-        pending = nil
+        pendingSince = nil
+        pendingProvider = nil
         writeScheduled = false
         let path = self.path
         queue.async { try? FileManager.default.removeItem(atPath: path) }

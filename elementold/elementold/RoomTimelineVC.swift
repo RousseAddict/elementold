@@ -89,13 +89,19 @@ class RoomTimelineVC: UIViewController {
     private var memberNames: [String: String] = [:]
     private var memberAvatars: [String: String] = [:]
 
-    // Event IDs that at least one OTHER user has sent an m.read receipt for.
-    // Used to place a "Seen" marker under the most recent of our own messages
-    // that a peer has read.
+    // Event IDs of OUR OWN messages that at least one other user has sent an
+    // m.read receipt for. Used to place a "Seen" marker under the most recent
+    // of them. Receipts on anyone else's messages are discarded on arrival —
+    // see applyReceipts for why that matters.
     private var othersReadEventIds = Set<String>()
 
     private var events: [RoomEvent] = []
     private var seenEventIds = Set<String>()
+    // The subset of seenEventIds that we sent. Lets a read receipt be judged
+    // relevant the moment it arrives, without a scan of the timeline and
+    // without depending on eventsById, which is only refreshed by rebuildRows
+    // and so is a rebuild behind at the point receipts are processed.
+    private var ownEventIds = Set<String>()
     private var isLoadingBackfill = false
     private var hasLoadedInitial = false
     private var isSending = false
@@ -374,7 +380,7 @@ class RoomTimelineVC: UIViewController {
     private func seedInitialEvents() {
         guard !room.timelineEvents.isEmpty else { return }
         for event in room.timelineEvents where !seenEventIds.contains(event.eventId) {
-            seenEventIds.insert(event.eventId)
+            noteIngested(event)
             events.append(event)
         }
         reloadTable()
@@ -382,6 +388,15 @@ class RoomTimelineVC: UIViewController {
         scrollToBottom(animated: false)
         if let latest = events.last {
             sendReadReceipt(for: latest.eventId)
+        }
+    }
+
+    // Records an event as loaded. Every path that appends to `events` goes
+    // through here so the two id sets can't drift apart.
+    private func noteIngested(_ event: RoomEvent) {
+        seenEventIds.insert(event.eventId)
+        if RoomTimelineVC.senderOf(event) == MatrixSession.userId {
+            ownEventIds.insert(event.eventId)
         }
     }
 
@@ -1166,7 +1181,7 @@ class RoomTimelineVC: UIViewController {
             let parsed = chunk.reversed().compactMap { RoomEvent.parse($0) }
             let newOnes = parsed.filter { !self.seenEventIds.contains($0.eventId) }
             guard !newOnes.isEmpty else { return }
-            newOnes.forEach { self.seenEventIds.insert($0.eventId) }
+            newOnes.forEach { self.noteIngested($0) }
             let wasEmpty = self.events.isEmpty
             self.events.insert(contentsOf: newOnes, at: 0)
             DispatchQueue.main.async {
@@ -1228,7 +1243,7 @@ class RoomTimelineVC: UIViewController {
             updateMembers(from: rawEvents)
             let parsed = rawEvents.compactMap { RoomEvent.parse($0) }
             newOnes = parsed.filter { !seenEventIds.contains($0.eventId) }
-            newOnes.forEach { seenEventIds.insert($0.eventId) }
+            newOnes.forEach { noteIngested($0) }
             events.append(contentsOf: newOnes)
         }
 
@@ -1304,10 +1319,24 @@ class RoomTimelineVC: UIViewController {
     // Records which of our own events peers have read. m.receipt content is
     // { eventId: { "m.read": { userId: { ts } } } }. Returns true if a new
     // (event, other-user) pair was seen, so the "Seen" marker can be recomputed.
+    //
+    // Receipts on events we did NOT send are ignored outright. The only thing
+    // this set feeds is the "Seen" marker under our own latest read message, so
+    // recording them bought nothing — but reporting them as a change made every
+    // peer's read receipt (they arrive constantly, on every message anyone reads
+    // in this room) trigger a full rebuildRows + reloadData, which on this
+    // runtime also means heightForRowAt for every row. Ignoring them also keeps
+    // the set bounded by our own message count instead of the room's.
+    //
+    // Edge case, accepted: a receipt for one of our messages older than the
+    // loaded window is dropped, since ownEventIds only covers loaded events. The
+    // marker tracks the LATEST read own message, which is by definition one we
+    // have loaded, so this cannot move the marker anywhere it should have gone.
     private func applyReceipts(_ content: [String: Any]) -> Bool {
         var changed = false
         for (eventId, raw) in content {
-            guard let data = raw as? [String: Any],
+            guard ownEventIds.contains(eventId),
+                  let data = raw as? [String: Any],
                   let read = data["m.read"] as? [String: Any] else { continue }
             for userId in read.keys where userId != MatrixSession.userId {
                 if othersReadEventIds.insert(eventId).inserted { changed = true }

@@ -8,7 +8,13 @@ class RoomListVC: UIViewController {
     private var tableView: UITableView!
     private var statusLabel: UILabel!
     private var roomsById: [String: Room] = [:]
-    private var sortedRooms: [Room] = []
+    // Room *ids* in display order, not the rooms themselves. `Room` is a large
+    // value type (three dictionaries, an array and a set), so an array of them
+    // costs a full structural copy per element every time it's sorted or
+    // filtered — and, worse, holds stale copies of anything that changed since,
+    // which markRoomRead used to have to hand-patch. Ids keep roomsById the one
+    // source of truth and make these lists cheap to rebuild.
+    private var sortedRoomIds: [String] = []
     // Pending invites, keyed by roomId. Kept as a running map (not replaced per
     // sync) because incremental syncs only report *changed* invites; an invite
     // is cleared when the room later shows up under join (accepted) or leave
@@ -16,8 +22,8 @@ class RoomListVC: UIViewController {
     private var invitesById: [String: Invitation] = [:]
     private var invitations: [Invitation] = []
     // The rooms actually rendered, after the space/bucket/search filters. Kept as
-    // stored state and refreshed via rebuildDisplayedRooms() — see there for why.
-    private var displayedRooms: [Room] = []
+    // stored state and refreshed via rebuildDisplayedRoomIds() — see there for why.
+    private var displayedRoomIds: [String] = []
     private var hasSyncedOnce = false
     private var loadingTimer: Timer?
     private var loadingSeconds = 0
@@ -50,7 +56,7 @@ class RoomListVC: UIViewController {
     // Bridge/space grouping. A "bucket" is one space (its child rooms) or one
     // bridged network (its portal rooms). Built after each /sync from roomsById;
     // `selectedFilterId == nil` means "All conversations". The filter is applied
-    // on top of the space-room exclusion + search text in `displayedRooms`.
+    // on top of the space-room exclusion + search text in `displayedRoomIds`.
     private struct RoomFilter { let id: String; let label: String; let roomIds: Set<String> }
     private var filters: [RoomFilter] = []
     private var selectedFilterId: String?
@@ -238,10 +244,10 @@ class RoomListVC: UIViewController {
 
         for room in snapshot.rooms { roomsById[room.roomId] = room }
         for invite in snapshot.invites { invitesById[invite.roomId] = invite }
-        sortedRooms = roomsById.values.sorted { $0.lastMessageTimestamp > $1.lastMessageTimestamp }
+        rebuildSortedRoomIds()
         invitations = invitesById.values.sorted { $0.name.lowercased() < $1.name.lowercased() }
         rebuildFilters()
-        rebuildDisplayedRooms()
+        rebuildDisplayedRoomIds()
 
         lastSyncToken = snapshot.since
         syncEngine.resume(since: snapshot.since)
@@ -264,8 +270,12 @@ class RoomListVC: UIViewController {
 
     @objc private func persistNow() {
         guard let token = lastSyncToken else { return }
-        RoomStore.shared.flush(since: token, rooms: Array(roomsById.values),
-                               invites: Array(invitesById.values))
+        let state = snapshotState()
+        RoomStore.shared.flush(since: token, rooms: state.rooms, invites: state.invites)
+    }
+
+    private func snapshotState() -> (rooms: [Room], invites: [Invitation]) {
+        return (Array(roomsById.values), Array(invitesById.values))
     }
 
     // MARK: - Header reveal / pull to refresh
@@ -333,18 +343,38 @@ class RoomListVC: UIViewController {
 
     private func handleSync(_ json: [String: Any], isInitial: Bool) {
         let rooms = json["rooms"] as? [String: Any]
-        updateInvitations(from: rooms)
+        let invitesChanged = updateInvitations(from: rooms)
 
-        var roomsChanged = false
+        // A /sync arrives for anything at all — most often a typing notice, which
+        // returns the long-poll instantly and so can land several times a second.
+        // The list only has work to do when a room actually changed, so each kind
+        // of downstream rebuild is gated on the specific fields it depends on.
+        var orderChanged = false     // room set, or a sort key (lastMessageTimestamp)
+        var contentChanged = false   // anything RoomCell draws
+        var filtersChanged = false   // anything rebuildFilters buckets on
         if let join = rooms?["join"] as? [String: Any] {
             for (roomId, rawRoom) in join {
                 guard let roomJSON = rawRoom as? [String: Any] else { continue }
                 let existing = roomsById[roomId]
-                roomsById[roomId] = Room.parse(roomId: roomId, json: roomJSON, existing: existing,
-                                                selfUserId: MatrixSession.userId, isOpen: roomId == openRoomId,
-                                                isInitialSync: isInitial)
+                let updated = Room.parse(roomId: roomId, json: roomJSON, existing: existing,
+                                          selfUserId: MatrixSession.userId, isOpen: roomId == openRoomId,
+                                          isInitialSync: isInitial)
+                roomsById[roomId] = updated
+                guard let before = existing else {
+                    orderChanged = true; contentChanged = true; filtersChanged = true
+                    continue
+                }
+                if before.lastMessageTimestamp != updated.lastMessageTimestamp { orderChanged = true }
+                if before.name != updated.name || before.lastMessage != updated.lastMessage
+                    || before.unreadCount != updated.unreadCount || before.avatarMxc != updated.avatarMxc
+                    || before.lastMessageTimestamp != updated.lastMessageTimestamp {
+                    contentChanged = true
+                }
+                if before.roomType != updated.roomType || before.bridgeNetwork != updated.bridgeNetwork
+                    || before.spaceChildren != updated.spaceChildren {
+                    filtersChanged = true
+                }
             }
-            roomsChanged = true
         }
         // Rooms we've left (or been kicked from) — including ones we just left
         // from Room Settings. Without this they lingered in the list until the
@@ -352,18 +382,17 @@ class RoomListVC: UIViewController {
         if let leave = rooms?["leave"] as? [String: Any] {
             for roomId in leave.keys where roomsById[roomId] != nil {
                 roomsById[roomId] = nil
-                roomsChanged = true
+                orderChanged = true; contentChanged = true; filtersChanged = true
             }
         }
-        if roomsChanged {
-            sortedRooms = roomsById.values.sorted { $0.lastMessageTimestamp > $1.lastMessageTimestamp }
-        }
-
+        if orderChanged { rebuildSortedRoomIds() }
         // Rebuild the bridge/space filter buckets from the (just-updated) rooms,
-        // then the rendered list, which depends on both.
-        rebuildFilters()
-        rebuildDisplayedRooms()
+        // then the rendered list, which depends on the order and the buckets.
+        // rebuildFilters can also clear a selection whose bucket disappeared.
+        if filtersChanged { rebuildFilters() }
+        if orderChanged || filtersChanged { rebuildDisplayedRoomIds() }
 
+        let firstSync = !hasSyncedOnce
         hasSyncedOnce = true
 
         // Persist the list together with the token this exact state corresponds to.
@@ -373,21 +402,28 @@ class RoomListVC: UIViewController {
         // everything up to that token as delivered and nothing replays it.
         if let token = json["next_batch"] as? String, !token.isEmpty {
             lastSyncToken = token
-            RoomStore.shared.save(since: token, rooms: Array(roomsById.values),
-                                  invites: Array(invitesById.values))
+            RoomStore.shared.save(since: token) { [weak self] in
+                return self?.snapshotState() ?? (rooms: [], invites: [])
+            }
         }
 
         // Total unread across all joined rooms, mirrored on the app icon badge.
-        let totalUnread = totalUnreadCount()
+        // Only worth recomputing (a pass over every Room) when a count moved.
+        let totalUnread = contentChanged ? totalUnreadCount() : nil
+        let needsReload = contentChanged || orderChanged || filtersChanged || invitesChanged || firstSync
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             if self.isCatchingUp { self.setCatchingUp(false) }
             self.finishRefresh()
-            self.tableView.reloadData()
-            self.hideListHeaderIfNeeded()
-            self.updateStatusLabel()
-            self.updateFilterControl()
-            UIApplication.shared.applicationIconBadgeNumber = totalUnread
+            if needsReload {
+                self.tableView.reloadData()
+                self.hideListHeaderIfNeeded()
+                self.updateStatusLabel()
+                self.updateFilterControl()
+            }
+            if let totalUnread = totalUnread {
+                UIApplication.shared.applicationIconBadgeNumber = totalUnread
+            }
         }
     }
 
@@ -398,22 +434,31 @@ class RoomListVC: UIViewController {
 
     // Maintains the pending-invite map from a /sync `rooms` object: upserts
     // anything under `invite`, and clears anything that has since moved to
-    // `join` (accepted) or `leave` (declined/left).
-    private func updateInvitations(from rooms: [String: Any]?) {
-        guard let rooms = rooms else { return }
+    // `join` (accepted) or `leave` (declined/left). Returns whether the banner
+    // needs redrawing, so an otherwise-idle sync doesn't reload the table.
+    @discardableResult
+    private func updateInvitations(from rooms: [String: Any]?) -> Bool {
+        guard let rooms = rooms else { return false }
+        var changed = false
         if let invite = rooms["invite"] as? [String: Any] {
             for (roomId, raw) in invite {
                 guard let inviteJSON = raw as? [String: Any] else { continue }
                 invitesById[roomId] = Invitation.parse(roomId: roomId, json: inviteJSON,
                                                         selfUserId: MatrixSession.userId)
+                changed = true
             }
         }
         for key in ["join", "leave"] {
             if let section = rooms[key] as? [String: Any] {
-                for roomId in section.keys { invitesById[roomId] = nil }
+                for roomId in section.keys where invitesById[roomId] != nil {
+                    invitesById[roomId] = nil
+                    changed = true
+                }
             }
         }
+        guard changed else { return false }
         invitations = invitesById.values.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        return true
     }
 
     private func handleSyncError(_ error: Error) {
@@ -424,7 +469,7 @@ class RoomListVC: UIViewController {
             self.finishRefresh()
             // Only surface this if we've never synced successfully — once rooms
             // are showing, a transient retry-loop error shouldn't blank the screen.
-            guard self.sortedRooms.isEmpty else { return }
+            guard self.sortedRoomIds.isEmpty else { return }
             let tokenState = self.client.accessToken.map { token in "present, \(token.count) chars" } ?? "MISSING (nil)"
             self.lastErrorText = "Sync error:\n\(error)\n\n[debug] token: \(tokenState)"
             self.statusLabel.text = self.lastErrorText
@@ -435,7 +480,7 @@ class RoomListVC: UIViewController {
     private func updateStatusLabel() {
         loadingTimer?.invalidate()
         loadingTimer = nil
-        if !sortedRooms.isEmpty {
+        if !sortedRoomIds.isEmpty {
             statusLabel.isHidden = true
         } else if hasSyncedOnce {
             statusLabel.text = "No rooms yet."
@@ -517,7 +562,18 @@ class RoomListVC: UIViewController {
 
     // MARK: - Search / filter
 
-    // Rebuilds `displayedRooms` from `sortedRooms`. Three filters stacked:
+    // Newest-first room order. Sorts (id, timestamp) pairs rather than the rooms
+    // themselves, so the sort's O(n log n) swaps move two words each instead of a
+    // whole Room.
+    private func rebuildSortedRoomIds() {
+        var keyed: [(id: String, ts: Double)] = []
+        keyed.reserveCapacity(roomsById.count)
+        for (id, room) in roomsById { keyed.append((id, room.lastMessageTimestamp)) }
+        keyed.sort { $0.ts > $1.ts }
+        sortedRoomIds = keyed.map { $0.id }
+    }
+
+    // Rebuilds `displayedRoomIds` from `sortedRoomIds`. Three filters stacked:
     //   1. Space rooms (isSpace) are never shown — they're grouping containers
     //      with no timeline, surfaced only as filter buckets.
     //   2. The selected bridge/space bucket, if any (selectedFilterId != nil).
@@ -529,47 +585,57 @@ class RoomListVC: UIViewController {
     // reloadData over every joined room, allocating a new array each time. While
     // typing in the search bar that landed on the main thread per keystroke.
     // Call this whenever one of the three inputs above changes.
-    private func rebuildDisplayedRooms() {
-        var rooms = sortedRooms.filter { !$0.isSpace }
-        if let id = selectedFilterId,
-           let bucket = filters.first(where: { $0.id == id }) {
-            rooms = rooms.filter { bucket.roomIds.contains($0.roomId) }
+    private func rebuildDisplayedRoomIds() {
+        let bucket = selectedFilterId.flatMap { id in filters.first(where: { $0.id == id }) }
+        // Lower-case and unpack the needle ONCE, not once per room compared.
+        let query = searchText.isEmpty ? nil : Array(searchText.lowercased())
+        var result: [String] = []
+        result.reserveCapacity(sortedRoomIds.count)
+        for id in sortedRoomIds {
+            if let bucket = bucket, !bucket.roomIds.contains(id) { continue }
+            guard let room = roomsById[id], !room.isSpace else { continue }
+            if let query = query, !RoomListVC.nameMatches(room.name, query: query) { continue }
+            result.append(id)
         }
-        if !searchText.isEmpty {
-            // Lower-case and unpack the needle ONCE, not once per room compared.
-            let query = Array(searchText.lowercased())
-            rooms = rooms.filter { RoomListVC.nameMatches($0.name, query: query) }
-        }
-        displayedRooms = rooms
+        displayedRoomIds = result
     }
 
-    // Rebuilds the filter buckets from roomsById. Called off-main after every
-    // /sync (only mutates our own filter state, never UIKit).
+    // Rebuilds the filter buckets from roomsById. Only called when a room's
+    // space/bridge state actually changed — the buckets depend on m.room.create,
+    // m.space.child and uk.half-shot.bridge, none of which move once a room has
+    // been seen, so running this on every /sync was three passes over every room
+    // for a result that is the same all session.
     //   Spaces first: one bucket per joined space room, containing the joined,
     //   non-space rooms it lists via m.space.child (spaceChildren).
     //   Bridges second: for every bridged room (bridgeNetwork != nil) not already
     //   claimed by a space bucket, one bucket per distinct network label.
     // Buckets with no currently-joined member rooms are dropped.
     private func rebuildFilters() {
-        let joinedNonSpace = Set(roomsById.values.filter { !$0.isSpace }.map { $0.roomId })
+        // One pass, ids only: pulling Rooms out into arrays to filter/map/sort
+        // them copied every struct several times over.
+        var joinedNonSpace = Set<String>()
+        var spaceIds: [String] = []
+        for (id, room) in roomsById {
+            if room.isSpace { spaceIds.append(id) } else { joinedNonSpace.insert(id) }
+        }
         var built: [RoomFilter] = []
         var claimed = Set<String>()
 
         // 1. Spaces.
-        let spaces = roomsById.values.filter { $0.isSpace }
-            .sorted { $0.name.lowercased() < $1.name.lowercased() }
-        for space in spaces {
+        spaceIds.sort { (roomsById[$0]?.name ?? "").lowercased() < (roomsById[$1]?.name ?? "").lowercased() }
+        for spaceId in spaceIds {
+            guard let space = roomsById[spaceId] else { continue }
             let members = space.spaceChildren.intersection(joinedNonSpace)
             guard !members.isEmpty else { continue }
-            built.append(RoomFilter(id: "space:\(space.roomId)", label: space.name, roomIds: members))
+            built.append(RoomFilter(id: "space:\(spaceId)", label: space.name, roomIds: members))
             claimed.formUnion(members)
         }
 
         // 2. Bridged rooms not already in a space bucket, grouped by network label.
         var byNetwork: [String: Set<String>] = [:]
-        for room in roomsById.values where !room.isSpace {
-            guard let net = room.bridgeNetwork, !claimed.contains(room.roomId) else { continue }
-            byNetwork[net, default: []].insert(room.roomId)
+        for id in joinedNonSpace where !claimed.contains(id) {
+            guard let net = roomsById[id]?.bridgeNetwork else { continue }
+            byNetwork[net, default: []].insert(id)
         }
         for net in byNetwork.keys.sorted(by: { $0.lowercased() < $1.lowercased() }) {
             guard let ids = byNetwork[net], !ids.isEmpty else { continue }
@@ -614,7 +680,7 @@ class RoomListVC: UIViewController {
 
     private func applyFilter(_ id: String?) {
         selectedFilterId = id
-        rebuildDisplayedRooms()
+        rebuildDisplayedRoomIds()
         updateFilterControl()
         tableView.reloadData()
     }
@@ -668,7 +734,15 @@ class RoomListVC: UIViewController {
                                              avatarMxc: nil, memberNames: [:], memberAvatars: [:],
                                              unreadCount: 0, roomType: nil, spaceChildren: [],
                                              bridgeNetwork: nil, bridgeAvatarMxc: nil)
-        if roomsById[roomId] == nil { roomsById[roomId] = room }
+        if roomsById[roomId] == nil {
+            roomsById[roomId] = room
+            // handleSync only re-sorts when a room's timestamp actually moves, so
+            // a locally-seeded room has to enter the id lists here — otherwise it
+            // stays out of the list until something in it changes.
+            rebuildSortedRoomIds()
+            rebuildDisplayedRoomIds()
+            tableView.reloadData()
+        }
         openRoomId = roomId
         // Pop the compose screen, then push the new room's timeline.
         navigationController?.popToRootViewController(animated: false)
@@ -730,7 +804,7 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
             // finding an existing conversation.
             return (searchText.isEmpty && !invitations.isEmpty) ? 1 : 0
         }
-        return displayedRooms.count
+        return displayedRoomIds.count
     }
 
     // Taller rows than the stock ~44pt so the avatar + two lines of text aren't
@@ -752,7 +826,7 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
 
         let cell = (tableView.dequeueReusableCell(withIdentifier: cellId) as? RoomCell) ??
             RoomCell(style: .subtitle, reuseIdentifier: cellId)
-        let room = displayedRooms[indexPath.row]
+        guard let room = roomsById[displayedRoomIds[indexPath.row]] else { return cell }
         cell.textLabel?.text = room.name
         cell.detailTextLabel?.text = room.lastMessage
         cell.detailTextLabel?.textColor = .gray
@@ -770,10 +844,12 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
             navigationController?.pushViewController(vc, animated: true)
             return
         }
-        let room = displayedRooms[indexPath.row]
-        openRoomId = room.roomId
-        markRoomRead(room.roomId)
-        let vc = RoomTimelineVC(room: roomsById[room.roomId] ?? room, client: client, syncEngine: syncEngine)
+        let roomId = displayedRoomIds[indexPath.row]
+        openRoomId = roomId
+        markRoomRead(roomId)
+        // Read after markRoomRead so the timeline gets the cleared unread count.
+        guard let room = roomsById[roomId] else { return }
+        let vc = RoomTimelineVC(room: room, client: client, syncEngine: syncEngine)
         navigationController?.pushViewController(vc, animated: true)
     }
 
@@ -781,14 +857,10 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
         guard var room = roomsById[roomId], room.unreadCount > 0 else { return }
         room.unreadCount = 0
         roomsById[roomId] = room
-        if let sIdx = sortedRooms.firstIndex(where: { $0.roomId == roomId }) {
-            sortedRooms[sIdx].unreadCount = 0
-        }
-        // displayedRooms holds copies of these structs, so it has to be refreshed
-        // or the row below would redraw from the stale (non-zero) unreadCount.
-        rebuildDisplayedRooms()
-        // Reload against the currently DISPLAYED (possibly filtered) index.
-        if let idx = displayedRooms.firstIndex(where: { $0.roomId == roomId }) {
+        // The order and filter lists hold ids, so they still point at the room we
+        // just changed — nothing to refresh, just redraw the row against the
+        // currently DISPLAYED (possibly filtered) index.
+        if let idx = displayedRoomIds.firstIndex(of: roomId) {
             tableView.reloadRows(at: [IndexPath(row: idx, section: roomSection)], with: .none)
         }
         // Opening a room clears its badge locally — reflect that on the icon
@@ -800,7 +872,7 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
 extension RoomListVC: UISearchBarDelegate {
     func searchBar(_ searchBar: UISearchBar, textDidChange text: String) {
         searchText = text
-        rebuildDisplayedRooms()
+        rebuildDisplayedRoomIds()
         tableView.reloadData()
     }
 
@@ -815,7 +887,7 @@ extension RoomListVC: UISearchBarDelegate {
     func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
         searchBar.text = ""
         searchText = ""
-        rebuildDisplayedRooms()
+        rebuildDisplayedRoomIds()
         searchBar.setShowsCancelButton(false, animated: true)
         searchBar.resignFirstResponder()
         tableView.reloadData()
