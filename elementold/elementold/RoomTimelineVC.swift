@@ -98,9 +98,8 @@ class RoomTimelineVC: UIViewController {
     private var events: [RoomEvent] = []
     private var seenEventIds = Set<String>()
     // The subset of seenEventIds that we sent. Lets a read receipt be judged
-    // relevant the moment it arrives, without a scan of the timeline and
-    // without depending on eventsById, which is only refreshed by rebuildRows
-    // and so is a rebuild behind at the point receipts are processed.
+    // relevant on arrival with a set lookup, rather than resolving the event and
+    // switching on its kind to find a sender.
     private var ownEventIds = Set<String>()
     private var isLoadingBackfill = false
     private var hasLoadedInitial = false
@@ -269,8 +268,11 @@ class RoomTimelineVC: UIViewController {
     // id to redact) without re-scanning `events`.
     private var myReactions: [String: [String: String]] = [:]
 
-    // Every loaded event by id, rebuilt with the rows. Lets a reply resolve the
-    // message it answers without a linear scan of `events` per row.
+    // Every loaded event by id. Lets a reply resolve the message it answers
+    // without a linear scan of `events` per row. Maintained at ingestion (see
+    // noteIngested) rather than rebuilt with the rows: it mirrors `events`,
+    // which only ever grows, so re-deriving it per rebuild made every sync more
+    // expensive the further back the user had paged.
     private var eventsById: [String: RoomEvent] = [:]
 
     private let cellId = "EventCell"
@@ -392,9 +394,10 @@ class RoomTimelineVC: UIViewController {
     }
 
     // Records an event as loaded. Every path that appends to `events` goes
-    // through here so the two id sets can't drift apart.
+    // through here so the id sets and the by-id map can't drift apart.
     private func noteIngested(_ event: RoomEvent) {
         seenEventIds.insert(event.eventId)
+        eventsById[event.eventId] = event
         if RoomTimelineVC.senderOf(event) == MatrixSession.userId {
             ownEventIds.insert(event.eventId)
         }
@@ -1357,7 +1360,7 @@ class RoomTimelineVC: UIViewController {
         let selfUserId = MatrixSession.userId
 
         // One sweep of `events` gathers everything the folds below need. It used
-        // to be six separate full passes (redactions, byId, edits, reactions,
+        // to be six separate full passes (redactions, by-id, edits, reactions,
         // bundled totals, read receipt) plus a seventh in
         // prefetchImageThumbnails — and since `events` only ever grows as the
         // user pages back through history, every one of them got longer with
@@ -1371,7 +1374,6 @@ class RoomTimelineVC: UIViewController {
         // fetched it arrives with empty content and is dropped at ingestion by
         // RoomEvent.parse; this covers the ones redacted while we're watching.)
         var redacted = Set<String>()
-        var byId: [String: RoomEvent] = [:]
         var editEvents: [RoomEvent] = []
         var reactionEvents: [RoomEvent] = []
         var bundledEvents: [RoomEvent] = []
@@ -1381,7 +1383,6 @@ class RoomTimelineVC: UIViewController {
         var seenEventId: String?
         var mediaToPrefetch: [(mxc: String, w: Int, h: Int)] = []
         for event in events {
-            byId[event.eventId] = event
             if !event.bundledReactions.isEmpty { bundledEvents.append(event) }
             switch event.kind {
             case .redaction(let target):
@@ -1413,7 +1414,6 @@ class RoomTimelineVC: UIViewController {
                 break
             }
         }
-        eventsById = byId
         prefetchRequests = mediaToPrefetch
 
         // Edits rewrite an existing bubble rather than adding one. Keep only the
@@ -1423,7 +1423,7 @@ class RoomTimelineVC: UIViewController {
         for event in editEvents {
             guard case .edit(let sender, let target, let body) = event.kind,
                   !redacted.contains(event.eventId),
-                  let original = byId[target],
+                  let original = eventsById[target],
                   RoomTimelineVC.senderOf(original) == sender else { continue }
             if let existing = edits[target], existing.timestamp >= event.timestamp { continue }
             edits[target] = (event.timestamp, body)
