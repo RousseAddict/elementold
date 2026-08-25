@@ -5,7 +5,16 @@ import UIKit
 // (no UIAlertController). Adapted from jellyold's ServerSetupVC.swift.
 class LoginVC: UIViewController {
 
+    // Soft logout: the stored access token was rejected by the homeserver, so
+    // the user has to sign in again — but the server and the account are known,
+    // and everything cached for them is still valid. This is what Element shows
+    // in the same situation. A recovery key cannot help here: it unlocks secret
+    // storage (message keys), and an access token comes only from /login.
+    private let softLogoutUserId: String?
+    private var isSoftLogout: Bool { softLogoutUserId != nil }
+
     private var scrollView: UIScrollView!
+    private var headlineLabel: UILabel!
     private var logoView: UIImageView!
     private var serverField: UITextField!
     private var usernameField: UITextField!
@@ -33,8 +42,18 @@ class LoginVC: UIViewController {
     // and stranded; cap them and centre the column instead.
     private let maxContentWidth: CGFloat = 420
 
+    private let headlineHeight: CGFloat = 52
+    private let headlineGap: CGFloat = 16
+
     private let bgColor = UIColor(red: 0.10, green: 0.10, blue: 0.14, alpha: 1.0)
     private let accentColor = UIColor(red: 0.13, green: 0.55, blue: 0.60, alpha: 1.0)
+
+    init(softLogoutUserId: String? = nil) {
+        self.softLogoutUserId = softLogoutUserId
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -56,6 +75,11 @@ class LoginVC: UIViewController {
         // definitely on screen costs nothing and can't leave the form measured
         // against an inset of zero.
         layoutContent()
+        // Only in soft logout, where the other two fields are locked and the
+        // password is the single thing left to supply.
+        if isSoftLogout && passwordField.text?.isEmpty != false {
+            passwordField.becomeFirstResponder()
+        }
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
@@ -69,6 +93,19 @@ class LoginVC: UIViewController {
         scrollView.backgroundColor = .clear
         scrollView.showsHorizontalScrollIndicator = false
         view.addSubview(scrollView)
+
+        // Only built in soft-logout mode; a normal login is unchanged.
+        headlineLabel = UILabel(frame: .zero)
+        headlineLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
+        headlineLabel.numberOfLines = 0
+        headlineLabel.textAlignment = .center
+        headlineLabel.font = UIFont.systemFont(ofSize: 14)
+        headlineLabel.textColor = UIColor(white: 0.72, alpha: 1.0)
+        headlineLabel.isHidden = !isSoftLogout
+        if let userId = softLogoutUserId {
+            headlineLabel.text = "Your session has expired.\nSign in again as \(userId)."
+        }
+        scrollView.addSubview(headlineLabel)
 
         logoView = UIImageView(frame: .zero)
         logoView.image = UIImage(named: "Logo@2x")
@@ -87,6 +124,16 @@ class LoginVC: UIViewController {
 
         passwordField = makeField("Password", secure: true)
         scrollView.addSubview(passwordField)
+
+        // In soft logout the server and account are not the user's to change —
+        // signing in as someone else is a full logout, from the account menu.
+        if let userId = softLogoutUserId {
+            usernameField.text = userId
+            for field in [serverField, usernameField] {
+                field?.isUserInteractionEnabled = false
+                field?.textColor = UIColor(white: 0.6, alpha: 1.0)
+            }
+        }
 
         connectButton = UIButton(type: .custom)
         connectButton.setTitle("Log In", for: .normal)
@@ -119,7 +166,8 @@ class LoginVC: UIViewController {
         let contentWidth = min(bounds.width - edgePadding * 2, maxContentWidth)
         let left = (bounds.width - contentWidth) / 2
 
-        let formHeight = logoSize + logoGap + controlHeight * 3 + fieldGap * 2
+        let headlineBlock = isSoftLogout ? headlineHeight + headlineGap : 0
+        let formHeight = logoSize + logoGap + headlineBlock + controlHeight * 3 + fieldGap * 2
             + buttonGap + controlHeight
 
         // Centre it when there's room, otherwise start at the top and let the
@@ -129,6 +177,11 @@ class LoginVC: UIViewController {
         logoView.frame = CGRect(x: (bounds.width - logoSize) / 2, y: y,
                                 width: logoSize, height: logoSize)
         y += logoSize + logoGap
+
+        if isSoftLogout {
+            headlineLabel.frame = CGRect(x: left, y: y, width: contentWidth, height: headlineHeight)
+            y += headlineBlock
+        }
 
         for field in [serverField, usernameField, passwordField] {
             field?.frame = CGRect(x: left, y: y, width: contentWidth, height: controlHeight)
@@ -220,7 +273,17 @@ class LoginVC: UIViewController {
             showAlert("Please enter your username."); return
         }
         let pass = passwordField.text ?? ""
-        let homeserverURL = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
+
+        // Trim before use, not just for the emptiness check above: a pasted URL
+        // carrying a trailing space produced a base URL that curl could not
+        // resolve, and stripping only ONE trailing slash left "…:8008//" — both
+        // silently malformed, surfacing much later as an opaque failure.
+        var homeserverURL = raw.trimmingCharacters(in: .whitespaces)
+        while homeserverURL.hasSuffix("/") { homeserverURL = String(homeserverURL.dropLast()) }
+        guard homeserverURL.hasPrefix("http://") || homeserverURL.hasPrefix("https://") else {
+            showAlert("The homeserver URL must start with http:// or https://")
+            return
+        }
 
         setLoading(true)
         let client = MatrixAPIClient(homeserverBaseURL: homeserverURL)
@@ -236,9 +299,13 @@ class LoginVC: UIViewController {
                 self.showAlert("\(error)")
                 return
             }
+            // The token must be non-empty, not merely present: an empty string
+            // passes every downstream nil-check, so it would be stored, count as
+            // a configured session, and only reveal itself as M_MISSING_TOKEN
+            // once the sync loop was already running.
             guard let json = json,
-                  let accessToken = json["access_token"] as? String,
-                  let userId = json["user_id"] as? String else {
+                  let accessToken = json["access_token"] as? String, !accessToken.isEmpty,
+                  let userId = json["user_id"] as? String, !userId.isEmpty else {
                 self.showAlert("Unexpected response from server.")
                 return
             }

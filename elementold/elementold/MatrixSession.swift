@@ -32,8 +32,23 @@ struct MatrixSession {
         set { defaults.set(newValue, forKey: "userId") }
     }
 
+    // Empty strings count as unconfigured. A stored "" used to pass this check
+    // and route AppDelegate straight to the room list with nothing usable to
+    // authenticate with, which surfaces minutes later as M_MISSING_TOKEN rather
+    // than at the point the credentials were actually bad.
     static var isConfigured: Bool {
-        return homeserverURL != nil && accessToken != nil && userId != nil
+        guard let h = homeserverURL, !h.isEmpty,
+              let t = accessToken, !t.isEmpty,
+              let u = userId, !u.isEmpty else { return false }
+        return true
+    }
+
+    // Soft logout: the session was rejected by the server, but the account and
+    // the data we hold for it are still valid. Dropping only the token sends the
+    // user back to a pre-filled login screen while leaving the persisted room
+    // list and media cache intact, so re-authenticating is instant.
+    static func clearAccessToken() {
+        defaults.removeObject(forKey: "accessToken")
     }
 
     static func clear() {

@@ -78,6 +78,17 @@ class SyncEngine {
     private var errorListeners: [(token: Int, fn: (Error) -> Void)] = []
     private var nextListenerToken = 0
 
+    // Raised once when the homeserver rejects our access token, after the loop
+    // has already stopped itself. There is no retry that can fix this, so the
+    // only useful response is to ask the user to sign in again.
+    var onAuthFailure: (() -> Void)?
+
+    // Deliberately matched on errcode, and deliberately NARROW — unlike the
+    // shape-agnostic handling of isUnvalidatedResumeToken below. That one
+    // guesses wide because guessing wrong strands the app forever, whereas
+    // guessing wrong here signs the user out of a working session.
+    private static let authErrcodes: Set<String> = ["M_MISSING_TOKEN", "M_UNKNOWN_TOKEN"]
+
     // Bumped whenever a poll is forced (refreshNow). The delayed re-poll blocks
     // capture the value current when they were scheduled and bail if it moved,
     // which is the only way to cancel them — DispatchQueue.asyncAfter has no
@@ -199,6 +210,11 @@ class SyncEngine {
         return true
     }
 
+    private func isAuthFailure(_ error: Error) -> Bool {
+        guard let matrixError = error as? MatrixAPIClient.MatrixError else { return false }
+        return SyncEngine.authErrcodes.contains(matrixError.errcode)
+    }
+
     private func pollOnce() {
         guard isRunning, !isRequestInFlight else { return }
         isRequestInFlight = true
@@ -225,9 +241,22 @@ class SyncEngine {
                     // M_UNKNOWN_TOKEN, as some other errcode, or as a transport
                     // failure, and guessing wrong here means an app that never
                     // recovers. Throwing the token away costs one full sync.
+                    //
+                    // Checked BEFORE the auth-failure branch below and winning
+                    // over it on purpose: a rejected *sync* token is not a
+                    // rejected *access* token, and it reports the same errcode.
                     self.isUnvalidatedResumeToken = false
                     self.since = nil
                     RoomStore.shared.discard()
+                } else if self.isAuthFailure(error) {
+                    // Nothing a retry can fix — the server has rejected this
+                    // access token and will keep rejecting it. Left to the
+                    // normal path it would re-ask every 5 seconds forever,
+                    // burning battery behind a screen that just looks stuck.
+                    self.stop()
+                    self.errorListeners.forEach { $0.fn(error) }
+                    self.onAuthFailure?()
+                    return
                 }
                 self.errorListeners.forEach { $0.fn(error) }
                 guard self.isRunning else { return }

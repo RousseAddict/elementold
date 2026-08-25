@@ -28,6 +28,9 @@ class RoomListVC: UIViewController {
     private var loadingTimer: Timer?
     private var loadingSeconds = 0
     private var lastErrorText: String?
+    // Latched once the re-authentication screen is on its way in, so a late
+    // error listener firing for the same rejected token can't push a second one.
+    private var isSoftLoggingOut = false
     // The room currently pushed on screen, if any — Room.parse uses this to
     // avoid counting messages as unread while the user is already looking at
     // that room's timeline, and markRoomRead zeroes the badge on selection.
@@ -187,6 +190,11 @@ class RoomListVC: UIViewController {
         }
         syncEngine.addErrorListener { [weak self] error in
             self?.handleSyncError(error)
+        }
+        // Raised only after the engine has given up, which it does exactly once
+        // and only for a rejected access token — nothing a retry could fix.
+        syncEngine.onAuthFailure = { [weak self] in
+            self?.performSoftLogout()
         }
 
         // Background notifications (gated by the Settings kill switch; off by
@@ -414,6 +422,11 @@ class RoomListVC: UIViewController {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             if self.isCatchingUp { self.setCatchingUp(false) }
+            // A previous failure may have left the "Sync error" title up; this
+            // response proves it's over. Guarded on the error flag rather than
+            // set unconditionally because /sync can land several times a second.
+            else if self.lastErrorText != nil { self.title = "Chats" }
+            self.lastErrorText = nil
             self.finishRefresh()
             if needsReload {
                 self.tableView.reloadData()
@@ -467,13 +480,23 @@ class RoomListVC: UIViewController {
             // A failed attempt is still an answer for a pull-to-refresh, so stop
             // the spinner before the display guard below bails out.
             self.finishRefresh()
-            // Only surface this if we've never synced successfully — once rooms
-            // are showing, a transient retry-loop error shouldn't blank the screen.
-            guard self.sortedRoomIds.isEmpty else { return }
             let tokenState = self.client.accessToken.map { token in "present, \(token.count) chars" } ?? "MISSING (nil)"
             self.lastErrorText = "Sync error:\n\(error)\n\n[debug] token: \(tokenState)"
-            self.statusLabel.text = self.lastErrorText
-            self.statusLabel.isHidden = false
+
+            // With a list on screen the full-screen status label is the wrong
+            // instrument — it would blank a perfectly readable room list over a
+            // transient retry. But saying NOTHING was worse: since the list is
+            // restored from disk on launch, it is non-empty for any returning
+            // user, so a permanent failure (a rejected token, which retries
+            // identically forever) showed no indication at all and the app just
+            // looked frozen on stale data. Reuse the catch-up title instead.
+            if self.sortedRoomIds.isEmpty {
+                self.statusLabel.text = self.lastErrorText
+                self.statusLabel.isHidden = false
+            } else {
+                if self.isCatchingUp { self.setCatchingUp(false) }
+                self.title = "Sync error"
+            }
         }
     }
 
@@ -558,6 +581,35 @@ class RoomListVC: UIViewController {
         // device doesn't inherit the previous user's downloaded images.
         MediaCache.shared.clear {}
         navigationController?.setViewControllers([LoginVC()], animated: true)
+    }
+
+    // The homeserver rejected our access token. The account is still ours and
+    // everything we hold for it is still valid, so this is Element's soft
+    // logout: drop ONLY the token and send the user back to a login screen
+    // pinned to the same server and user. The persisted room list and the media
+    // cache deliberately survive, which is what makes re-authenticating instant.
+    //
+    // Note a recovery key cannot substitute for this. It unlocks secret storage
+    // (message keys); an access token comes only from /login.
+    private func performSoftLogout() {
+        guard !isSoftLoggingOut else { return }
+        isSoftLoggingOut = true
+
+        // Same teardown as performLogout — the engine has already stopped itself,
+        // but the ticker and the badge would otherwise outlive this screen.
+        syncEngine.stop()
+        loadingTimer?.invalidate()
+        loadingTimer = nil
+        UIApplication.shared.applicationIconBadgeNumber = 0
+        if isCatchingUp { setCatchingUp(false) }
+        // Write the list we have out now: the debounced write would never run
+        // once this screen is replaced, and the whole point is that the next
+        // sign-in resumes from it.
+        persistNow()
+
+        let userId = MatrixSession.userId
+        MatrixSession.clearAccessToken()
+        navigationController?.setViewControllers([LoginVC(softLogoutUserId: userId)], animated: true)
     }
 
     // MARK: - Search / filter

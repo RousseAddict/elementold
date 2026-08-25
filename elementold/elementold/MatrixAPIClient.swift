@@ -88,9 +88,19 @@ class MatrixAPIClient {
         return homeserverBaseURL + path
     }
 
+    // Resolved per request, not once at init. `accessToken` is copied in at
+    // construction and SyncEngine holds its client in a `let`, so a client built
+    // during any window where the token was momentarily absent used to stay
+    // token-less for the rest of the session — every request going out with no
+    // Authorization header, which is the only thing that makes Synapse answer
+    // M_MISSING_TOKEN (an empty or wrong token gives M_UNKNOWN_TOKEN instead).
+    // Reading through to MatrixSession as a fallback makes that unrecoverable
+    // state impossible. An empty token is treated as absent rather than sent as
+    // a bare "Bearer ", which would be indistinguishable from a real failure.
     private func authHeaders() -> [String: String] {
-        guard let token = accessToken else { return [:] }
-        return ["Authorization": "Bearer \(token)"]
+        let token = (accessToken?.isEmpty == false) ? accessToken : MatrixSession.accessToken
+        guard let t = token, !t.isEmpty else { return [:] }
+        return ["Authorization": "Bearer \(t)"]
     }
 
     // Parses a raw HTTPClient response into a JSON dict, mapping Matrix's
