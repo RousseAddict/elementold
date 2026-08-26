@@ -137,6 +137,7 @@ class UserSettingsVC: UIViewController {
         // Restored message keys are cache too: they can always be fetched again
         // from the server-side backup by re-entering the recovery key.
         MegolmKeyStore.shared.discard()
+        E2EEDecryptor.shared.reset()
         reloadEncryptionSection()
         MediaCache.shared.clear { [weak self] in
             self?.refreshUsage()

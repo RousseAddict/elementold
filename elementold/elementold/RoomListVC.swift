@@ -580,6 +580,7 @@ class RoomListVC: UIViewController {
         // history and must not survive into the next sign-in. Deliberately NOT
         // done on a soft logout, where surviving state is the whole point.
         MegolmKeyStore.shared.discard()
+        E2EEDecryptor.shared.reset()
         MatrixSession.clear()
         // Drop cached media too, so a different account signing in on this
         // device doesn't inherit the previous user's downloaded images.

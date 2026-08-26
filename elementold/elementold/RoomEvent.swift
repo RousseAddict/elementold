@@ -241,14 +241,28 @@ struct RoomEvent {
                               replyTo: replyTo, replyQuote: replyQuote, replyAuthor: replyAuthor)
 
         case "m.room.encrypted":
-            // E2EE is out of scope for v1, but silently dropping these events
-            // leaves an encrypted room looking like an empty timeline. Render a
-            // plain text bubble instead so it's obvious why nothing is readable.
-            // Reusing .message keeps every exhaustive switch untouched. The lock
-            // is Unicode 6.0, so it exists in iOS 6's Apple Color Emoji.
+            guard let content = json["content"] as? [String: Any] else { return nil }
+            // Every ingestion path — initial state, backfill and live sync — funnels
+            // through here, so decrypting at this one seam covers all of them.
+            let outcome = E2EEDecryptor.shared.decrypt(eventId: eventId, content: content)
+            if case .decrypted(let payload) = outcome {
+                guard let innerType = payload["type"] as? String,
+                      innerType != "m.room.encrypted" else { return nil }
+                // Re-parse the plaintext as the event it always was, keeping the
+                // envelope (event_id, sender, timestamp, unsigned) intact so
+                // replies, edits and bundled reactions all still resolve.
+                var inner = json
+                inner["type"] = innerType
+                inner["content"] = payload["content"] ?? [:]
+                return parseEvent(inner)
+            }
+            // Still unreadable. Silently dropping it would leave an encrypted room
+            // looking like an empty timeline, so render a plain text bubble saying
+            // why. Reusing .message keeps every exhaustive switch untouched, and
+            // the lock is Unicode 6.0 so it exists in iOS 6's Apple Color Emoji.
             return RoomEvent(eventId: eventId,
                               kind: .message(sender: sender,
-                                             body: "\u{1F512} Encrypted message (not supported)",
+                                             body: E2EEDecryptor.shared.placeholder(for: outcome),
                                              isEmote: false),
                               timestamp: timestamp)
 
