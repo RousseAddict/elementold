@@ -489,6 +489,12 @@ final class MegolmKeyStore {
 
     var count: Int { return sessions.count }
 
+    // Set by RoomListVC. Fired when keys land that we didn't have a moment ago,
+    // because those keys cannot help any event we already parsed: such an event
+    // is a RoomEvent holding a "locked" placeholder, and RoomEvent.parse threw
+    // away the raw JSON it would need to try again.
+    static var onKeysRestored: (() -> Void)?
+
     func session(id: String) -> MegolmSession? { return sessions[id] }
 
     // Keeps whichever copy reaches further back: a session can be backed up
@@ -496,13 +502,20 @@ final class MegolmKeyStore {
     @discardableResult
     func merge(_ incoming: [MegolmSession]) -> Int {
         var added = 0
+        var changed = false
         for session in incoming {
             if let existing = sessions[session.sessionId],
                existing.firstKnownIndex <= session.firstKnownIndex { continue }
             if sessions[session.sessionId] == nil { added += 1 }
             sessions[session.sessionId] = session
+            // Not `added`: replacing a session with one that starts further back
+            // unlocks older messages too, even though the id is not new.
+            changed = true
         }
-        if added > 0 || !incoming.isEmpty { write() }
+        if changed {
+            write()
+            MegolmKeyStore.onKeysRestored?()
+        }
         return added
     }
 

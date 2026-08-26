@@ -134,11 +134,11 @@ class UserSettingsVC: UIViewController {
         // untouched, so nothing on screen changes — the next cold start just pays
         // for a full sync again.
         RoomStore.shared.discard()
-        // Restored message keys are cache too: they can always be fetched again
-        // from the server-side backup by re-entering the recovery key.
-        MegolmKeyStore.shared.discard()
-        E2EEDecryptor.shared.reset()
-        reloadEncryptionSection()
+        // Restored message keys are deliberately kept. They are re-fetchable in
+        // principle, but only by re-entering the recovery key — too high a price
+        // for the few KB they occupy, and losing them silently turns every
+        // encrypted message back into a placeholder. The hard logout still wipes
+        // them, which is the case that actually matters.
         MediaCache.shared.clear { [weak self] in
             self?.refreshUsage()
         }

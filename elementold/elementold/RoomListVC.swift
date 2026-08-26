@@ -212,6 +212,10 @@ class RoomListVC: UIViewController {
             NotificationManager.shared.handleSync(json, isInitial: isInitial)
         }
 
+        MegolmKeyStore.onKeysRestored = { [weak self] in
+            self?.dropBufferedTimelines()
+        }
+
         // Render the last known room list immediately and hand its delta token to
         // the engine, so the first /sync is an incremental catch-up rather than a
         // full initial sync. Must happen before start().
@@ -284,6 +288,28 @@ class RoomListVC: UIViewController {
 
     private func snapshotState() -> (rooms: [Room], invites: [Invitation]) {
         return (Array(roomsById.values), Array(invitesById.values))
+    }
+
+    // Throws away the per-room event buffer so the next room opened fetches its
+    // timeline from the server again instead of seeding from what we parsed
+    // earlier. Called when message keys are restored: events parsed before that
+    // are stuck showing the "locked" placeholder, and refetching is the only way
+    // to run them through RoomEvent.parse again.
+    //
+    // prevBatch has to go with the buffer. It means "the position just before
+    // the events I have buffered", so leaving it pinned to a buffer we just
+    // dropped makes the next backfill page backwards from the wrong place and
+    // skip exactly those messages (see RoomStore.encodeRoom). Both nil is the
+    // state a cold start produces, which RoomTimelineVC reads as "fetch the
+    // newest page".
+    private func dropBufferedTimelines() {
+        for (roomId, room) in roomsById {
+            guard !room.timelineEvents.isEmpty || room.prevBatch != nil else { continue }
+            var updated = room
+            updated.timelineEvents = []
+            updated.prevBatch = nil
+            roomsById[roomId] = updated
+        }
     }
 
     // MARK: - Header reveal / pull to refresh
