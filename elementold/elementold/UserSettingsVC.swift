@@ -230,6 +230,10 @@ class UserSettingsVC: UIViewController {
         }
     }
 
+    private func openRecoveryKey() {
+        navigationController?.pushViewController(RecoveryKeyVC(client: client), animated: true)
+    }
+
     private func showError(_ error: Error) {
         let title = "Couldn't update"
         let message = error.localizedDescription
@@ -268,14 +272,15 @@ class UserSettingsVC: UIViewController {
 
 extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
     // 0 = Account (display name), 1 = Notifications (kill switch), 2 = Storage
-    // (cache), 3 = Diagnostics.
-    func numberOfSections(in tableView: UITableView) -> Int { return 4 }
+    // (cache), 3 = Encryption (recovery key), 4 = Diagnostics.
+    func numberOfSections(in tableView: UITableView) -> Int { return 5 }
 
     func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
         switch section {
         case 0: return "Account"
         case 1: return "Notifications"
         case 2: return "Storage"
+        case 3: return "Encryption"
         default: return "Diagnostics"
         }
     }
@@ -285,7 +290,11 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             return "Keeps syncing in the background to alert you of new messages. "
                  + "Off by default; turning it off stops all background activity."
         }
-        guard section == 3 else { return nil }
+        if section == 3 {
+            return "Your recovery key unlocks the message keys stored on the server, "
+                 + "so encrypted messages can be read here. It cannot be used to sign in."
+        }
+        guard section == 4 else { return nil }
         // Build time comes off the executable's mtime, so it can't drift out of sync
         // with what's actually installed — the reliable way to spot a stale install.
         var parts = ["Build: \(UserSettingsVC.buildStamp)"]
@@ -313,6 +322,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         case 0: return 2                     // photo, display name
         case 1: return 1                     // notifications toggle
         case 2: return 4                     // cache usage, downloads usage, reset, delete
+        case 3: return 1                     // enter recovery key
         default:
             // Diagnostics: crash-log toggle row (+ a copy row when expanded),
             // only when a crash was actually recorded.
@@ -393,7 +403,19 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             return cell
         }
 
-        // Section 3: Diagnostics — crash-log toggle + copy.
+        // Section 3: Encryption — recovery key entry.
+        if indexPath.section == 3 {
+            let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
+                UITableViewCell(style: .default, reuseIdentifier: cellId)
+            cell.textLabel?.text = "Enter Recovery Key"
+            cell.textLabel?.textColor = .black
+            cell.textLabel?.textAlignment = .left
+            cell.selectionStyle = .default
+            cell.accessoryType = .disclosureIndicator
+            return cell
+        }
+
+        // Section 4: Diagnostics — crash-log toggle + copy.
         if indexPath.row == 0 {
             let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
                 UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
@@ -425,10 +447,12 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         case 2:
             if indexPath.row == 2 { confirmClearCache() }
             if indexPath.row == 3 { confirmClearDownloads() }
+        case 3:
+            openRecoveryKey()
         default:
             if indexPath.row == 0 {
                 crashExpanded.toggle()
-                tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+                tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
             } else {
                 copyCrashLog()
             }
@@ -671,3 +695,219 @@ extension AvatarPicker: UIActionSheetDelegate {
     }
 }
 #endif
+
+// Recovery key entry, and the first half of the E2EE recovery chain:
+//
+//     recovery key -> 4S secret storage -> (later) megolm key backup -> decrypt
+//
+// This screen stops at the first arrow. It decodes the key the user typed and
+// checks it against the key description the homeserver stores in account data,
+// which is exactly what turns "wrong recovery key" into a clean error instead
+// of garbage several steps further down. Nothing is persisted yet — that
+// arrives with the key backup itself.
+//
+// A recovery key CANNOT be used to sign in; it has nothing to do with the
+// access token. That distinction is spelled out in the section footer.
+final class RecoveryKeyVC: UIViewController {
+
+    private let client: MatrixAPIClient
+
+    private var promptLabel: UILabel!
+    private var keyView: UITextView!
+    private var statusLabel: UILabel!
+    private var verifyItem: UIBarButtonItem!
+
+    // Guards against a second tap while the two account-data requests are in
+    // flight. Both completions run on main (CurlFetcher marshals them), so a
+    // plain Bool is enough.
+    private var busy = false
+
+    init(client: MatrixAPIClient) {
+        self.client = client
+        super.init(nibName: nil, bundle: nil)
+        title = "Recovery Key"
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = UIColor(white: 0.95, alpha: 1.0)
+
+        verifyItem = UIBarButtonItem(title: "Verify", style: .done,
+                                     target: self, action: #selector(verifyTapped))
+        navigationItem.rightBarButtonItem = verifyItem
+
+        promptLabel = UILabel(frame: .zero)
+        // iOS 6: labels default to an opaque white background.
+        promptLabel.backgroundColor = .clear
+        promptLabel.textColor = UIColor(white: 0.3, alpha: 1.0)
+        promptLabel.font = UIFont.systemFont(ofSize: 13)
+        promptLabel.numberOfLines = 0
+        promptLabel.text = "Enter the recovery key you saved when you set up encryption. "
+                         + "Spaces don't matter, but capitalisation does."
+        view.addSubview(promptLabel)
+
+        // A text view rather than a field: a recovery key is 48+ characters and
+        // is displayed in groups of four, so it wraps over several lines.
+        keyView = UITextView(frame: .zero)
+        keyView.backgroundColor = .white
+        keyView.textColor = .black
+        keyView.font = UIFont.systemFont(ofSize: 15)
+        keyView.autocorrectionType = .no
+        // Base58 is case-sensitive, so autocapitalisation would silently corrupt
+        // the key the user typed.
+        keyView.autocapitalizationType = .none
+        keyView.spellCheckingType = .no
+        view.addSubview(keyView)
+
+        statusLabel = UILabel(frame: .zero)
+        statusLabel.backgroundColor = .clear
+        statusLabel.textColor = UIColor(white: 0.3, alpha: 1.0)
+        statusLabel.font = UIFont.systemFont(ofSize: 13)
+        statusLabel.numberOfLines = 0
+        statusLabel.textAlignment = .center
+        view.addSubview(statusLabel)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // Fixed offsets, no `#available` / `topLayoutGuide` — see TextEditVC.
+        let width = view.bounds.width
+        promptLabel.frame = CGRect(x: 16, y: 76, width: width - 32, height: 52)
+        keyView.frame = CGRect(x: 0, y: 136, width: width, height: 88)
+        statusLabel.frame = CGRect(x: 16, y: 236, width: width - 32,
+                                   height: max(60, view.bounds.height - 236 - 16))
+    }
+
+    // MARK: - Verification
+
+    @objc private func verifyTapped() {
+        guard !busy else { return }
+
+        // Decode locally first: a mistyped key fails here without a round trip.
+        guard let key = RecoveryKey.decode(keyView.text ?? ""), key.count == 32 else {
+            statusLabel.text = "That doesn't look like a recovery key."
+            return
+        }
+        guard let userId = MatrixSession.userId, !userId.isEmpty else {
+            statusLabel.text = "Not signed in."
+            return
+        }
+
+        setBusy(true, status: "Checking…")
+        keyView.resignFirstResponder()
+
+        // Matrix IDs go UNENCODED in the path — percent-encoding via Foundation
+        // crashes on this iOS 6 runtime, and curl accepts the raw path fine.
+        let base = "/_matrix/client/v3/user/\(userId)/account_data/"
+        let defaultKeyPath = base + "m.secret_storage.default_key"
+        client.get(defaultKeyPath) { [weak self] json, error in
+            guard let self = self else { return }
+            if let error = error { self.fail(error, path: defaultKeyPath); return }
+            guard let keyId = json?["key"] as? String, !keyId.isEmpty else {
+                self.setBusy(false, status: "This account has no recovery key set up.")
+                return
+            }
+            // The key id comes from the server and goes into a path SEGMENT, so it
+            // has to be encoded: some clients generate plain base64 ids, and a '/'
+            // in one breaks the route entirely (Synapse answers M_UNRECOGNIZED,
+            // since its account-data pattern matches [^/]* for the type).
+            let keyPath = base + "m.secret_storage.key." + RecoveryKeyVC.pathEncode(keyId)
+            self.client.get(keyPath) { [weak self] json, error in
+                guard let self = self else { return }
+                if let error = error { self.fail(error, path: keyPath); return }
+                guard let keyInfo = json else {
+                    self.setBusy(false, status: "The server didn't return the key description.")
+                    return
+                }
+                self.finish(self.check(key: key, keyInfo: keyInfo))
+            }
+        }
+    }
+
+    // Validates the entered key against the stored key description, per the
+    // m.secret_storage.v1.aes-hmac-sha2 verification procedure: derive an AES
+    // key and a MAC key from it, encrypt 32 zero bytes with the stored IV, MAC
+    // the result, and compare against the stored MAC.
+    //
+    // Returns nil on success, or the reason it failed.
+    private func check(key: [UInt8], keyInfo: [String: Any]) -> String? {
+        let algorithm = keyInfo["algorithm"] as? String ?? ""
+        guard algorithm == "m.secret_storage.v1.aes-hmac-sha2" else {
+            return "Unsupported key algorithm (\(algorithm.isEmpty ? "none" : algorithm))."
+        }
+        guard let ivText = keyInfo["iv"] as? String,
+              let macText = keyInfo["mac"] as? String,
+              let iv = Base64.decode(ivText), iv.count == 16,
+              let expectedMAC = Base64.decode(macText), !expectedMAC.isEmpty else {
+            return "The stored key description is malformed."
+        }
+
+        // The derivation for *verification* uses the empty string as the info,
+        // where decrypting a named secret would use that secret's name.
+        let zeroes = [UInt8](repeating: 0, count: 32)
+        guard let derived = Crypto.hkdfSHA256(ikm: key, salt: zeroes, info: [], length: 64),
+              let ciphertext = Crypto.aes256CTR(key: Array(derived[0..<32]), iv: iv, data: zeroes),
+              let mac = Crypto.hmacSHA256(key: Array(derived[32..<64]), data: ciphertext) else {
+            return "Couldn't derive the keys."
+        }
+        guard mac == expectedMAC else { return "That recovery key is not valid." }
+        return nil
+    }
+
+    private func finish(_ failure: String?) {
+        guard let failure = failure else {
+            setBusy(false, status: "")
+            alert(title: "Recovery key valid",
+                  message: "This key unlocks the message keys stored on your account.")
+            return
+        }
+        setBusy(false, status: failure)
+    }
+
+    // Pure-stdlib percent-encoding for one path segment. Foundation's
+    // addingPercentEncoding(withAllowedCharacters:) bridges to an NSString method
+    // that does not exist on real iOS 6 — see SyncEngine for the same loop.
+    private static let unreservedBytes: Set<UInt8> =
+        Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~".utf8)
+    private static let hexDigits = Array("0123456789ABCDEF")
+
+    private static func pathEncode(_ value: String) -> String {
+        var result = ""
+        result.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            if unreservedBytes.contains(byte) {
+                result.unicodeScalars.append(UnicodeScalar(byte))
+            } else {
+                result.append("%")
+                result.append(hexDigits[Int(byte >> 4)])
+                result.append(hexDigits[Int(byte & 0x0F)])
+            }
+        }
+        return result
+    }
+
+    // The path is included on purpose: both requests share this handler, and an
+    // M_UNRECOGNIZED (no route matched) is only diagnosable if we can see which
+    // path was asked for.
+    private func fail(_ error: Error, path: String) {
+        setBusy(false, status: "Request failed.\n\(path)\n\(error)")
+    }
+
+    private func setBusy(_ value: Bool, status: String) {
+        busy = value
+        verifyItem.isEnabled = !value
+        keyView.isEditable = !value
+        statusLabel.text = status
+    }
+
+    private func alert(title: String, message: String) {
+#if IOS6_TARGET
+        UIAlertView(title: title, message: message, delegate: nil, cancelButtonTitle: "OK").show()
+#else
+        let a = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        a.addAction(UIAlertAction(title: "OK", style: .default))
+        present(a, animated: true)
+#endif
+    }
+}

@@ -46,6 +46,8 @@
 		BB200047 /* cacert.pem in Resources */ = {isa = PBXBuildFile; fileRef = BB200046 /* cacert.pem */; };
 		BB160002 /* curl_bridge.c in Sources */ = {isa = PBXBuildFile; fileRef = BB160001 /* curl_bridge.c */; };
 		BB300002 /* opus_bridge.c in Sources */ = {isa = PBXBuildFile; fileRef = BB300001 /* opus_bridge.c */; };
+		BB400004 /* E2EEDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB400003 /* E2EEDecryptor.swift */; };
+		BB400002 /* crypto_bridge.c in Sources */ = {isa = PBXBuildFile; fileRef = BB400001 /* crypto_bridge.c */; };
 		BB160004 /* CurlFetcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB160003 /* CurlFetcher.swift */; };
 		BB160006 /* atomic_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = BB160005 /* atomic_stubs.c */; settings = {COMPILER_FLAGS = "-fno-builtin"; }; };
 		BB160008 /* atomic_stubs.S in Sources */ = {isa = PBXBuildFile; fileRef = BB160007 /* atomic_stubs.S */; };
@@ -126,6 +128,8 @@
 		BB200046 /* cacert.pem */ = {isa = PBXFileReference; lastKnownFileType = text; path = cacert.pem; sourceTree = "<group>"; };
 		BB160001 /* curl_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = curl_bridge.c; sourceTree = "<group>"; };
 		BB300001 /* opus_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = opus_bridge.c; sourceTree = "<group>"; };
+		BB400003 /* E2EEDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = E2EEDecryptor.swift; sourceTree = "<group>"; };
+		BB400001 /* crypto_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = crypto_bridge.c; sourceTree = "<group>"; };
 		BB160003 /* CurlFetcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CurlFetcher.swift; sourceTree = "<group>"; };
 		BB160005 /* atomic_stubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = atomic_stubs.c; sourceTree = "<group>"; };
 		BB160007 /* atomic_stubs.S */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.asm; path = atomic_stubs.S; sourceTree = "<group>"; };
@@ -217,6 +221,8 @@
 				BB160003 /* CurlFetcher.swift */,
 				BB160001 /* curl_bridge.c */,
 				BB300001 /* opus_bridge.c */,
+				BB400003 /* E2EEDecryptor.swift */,
+				BB400001 /* crypto_bridge.c */,
 				A34363002FD764270064ADE1 /* Default-568h@2x.png */,
 				BB150001 /* Logo@2x.png */,
 				BB200034 /* UserCircle@3x.png */,
@@ -435,6 +441,8 @@
 				BB160004 /* CurlFetcher.swift in Sources */,
 				BB160002 /* curl_bridge.c in Sources */,
 				BB300002 /* opus_bridge.c in Sources */,
+				BB400004 /* E2EEDecryptor.swift in Sources */,
+				BB400002 /* crypto_bridge.c in Sources */,
 				A34362FF2FD764260064ADE1 /* AppDelegate.swift in Sources */,
 				BB200002 /* MatrixAPIClient.swift in Sources */,
 				BB200004 /* SyncEngine.swift in Sources */,
