@@ -134,6 +134,10 @@ class UserSettingsVC: UIViewController {
         // untouched, so nothing on screen changes — the next cold start just pays
         // for a full sync again.
         RoomStore.shared.discard()
+        // Restored message keys are cache too: they can always be fetched again
+        // from the server-side backup by re-entering the recovery key.
+        MegolmKeyStore.shared.discard()
+        reloadEncryptionSection()
         MediaCache.shared.clear { [weak self] in
             self?.refreshUsage()
         }
@@ -231,7 +235,16 @@ class UserSettingsVC: UIViewController {
     }
 
     private func openRecoveryKey() {
-        navigationController?.pushViewController(RecoveryKeyVC(client: client), animated: true)
+        let vc = RecoveryKeyVC(client: client)
+        // The key count is only known after a restore, and the user is still on
+        // the recovery screen when it lands — refresh so the row is right when
+        // they come back.
+        vc.onRestored = { [weak self] in self?.reloadEncryptionSection() }
+        navigationController?.pushViewController(vc, animated: true)
+    }
+
+    private func reloadEncryptionSection() {
+        tableView.reloadSections(IndexSet(integer: 3), with: .none)
     }
 
     private func showError(_ error: Error) {
@@ -322,7 +335,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         case 0: return 2                     // photo, display name
         case 1: return 1                     // notifications toggle
         case 2: return 4                     // cache usage, downloads usage, reset, delete
-        case 3: return 1                     // enter recovery key
+        case 3: return 2                     // enter recovery key, restored key count
         default:
             // Diagnostics: crash-log toggle row (+ a copy row when expanded),
             // only when a crash was actually recorded.
@@ -403,15 +416,27 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             return cell
         }
 
-        // Section 3: Encryption — recovery key entry.
+        // Section 3: Encryption — recovery key entry, then what it recovered.
         if indexPath.section == 3 {
-            let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
-                UITableViewCell(style: .default, reuseIdentifier: cellId)
-            cell.textLabel?.text = "Enter Recovery Key"
+            if indexPath.row == 0 {
+                let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
+                    UITableViewCell(style: .default, reuseIdentifier: cellId)
+                cell.textLabel?.text = "Enter Recovery Key"
+                cell.textLabel?.textColor = .black
+                cell.textLabel?.textAlignment = .left
+                cell.selectionStyle = .default
+                cell.accessoryType = .disclosureIndicator
+                return cell
+            }
+            let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
+                UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
+            let count = MegolmKeyStore.shared.count
+            cell.textLabel?.text = "Message keys"
             cell.textLabel?.textColor = .black
             cell.textLabel?.textAlignment = .left
-            cell.selectionStyle = .default
-            cell.accessoryType = .disclosureIndicator
+            cell.detailTextLabel?.text = count == 0 ? "None" : "\(count) restored"
+            cell.selectionStyle = .none
+            cell.accessoryType = .none
             return cell
         }
 
@@ -448,7 +473,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             if indexPath.row == 2 { confirmClearCache() }
             if indexPath.row == 3 { confirmClearDownloads() }
         case 3:
-            openRecoveryKey()
+            if indexPath.row == 0 { openRecoveryKey() }
         default:
             if indexPath.row == 0 {
                 crashExpanded.toggle()
@@ -700,17 +725,22 @@ extension AvatarPicker: UIActionSheetDelegate {
 //
 //     recovery key -> 4S secret storage -> (later) megolm key backup -> decrypt
 //
-// This screen stops at the first arrow. It decodes the key the user typed and
-// checks it against the key description the homeserver stores in account data,
-// which is exactly what turns "wrong recovery key" into a clean error instead
-// of garbage several steps further down. Nothing is persisted yet — that
-// arrives with the key backup itself.
+// It decodes the key the user typed and checks it against the key description
+// the homeserver stores in account data — which is what turns "wrong recovery
+// key" into a clean error instead of garbage several steps further down — then
+// walks the rest of the chain: unlock the backup's private key out of secret
+// storage, fetch the backed-up megolm sessions, and hand them to
+// MegolmKeyStore.
 //
 // A recovery key CANNOT be used to sign in; it has nothing to do with the
 // access token. That distinction is spelled out in the section footer.
 final class RecoveryKeyVC: UIViewController {
 
     private let client: MatrixAPIClient
+
+    // Fired once message keys have landed in the store, so the settings screen
+    // behind us can refresh its count.
+    var onRestored: (() -> Void)?
 
     private var promptLabel: UILabel!
     private var keyView: UITextView!
@@ -820,7 +850,12 @@ final class RecoveryKeyVC: UIViewController {
                     self.setBusy(false, status: "The server didn't return the key description.")
                     return
                 }
-                self.finish(self.check(key: key, keyInfo: keyInfo))
+                if let failure = self.check(key: key, keyInfo: keyInfo) {
+                    self.setBusy(false, status: failure)
+                    return
+                }
+                // The key is proven at this point; use it to unlock the backup.
+                self.restore(key: key, keyId: keyId, base: base)
             }
         }
     }
@@ -855,14 +890,200 @@ final class RecoveryKeyVC: UIViewController {
         return nil
     }
 
-    private func finish(_ failure: String?) {
-        guard let failure = failure else {
-            setBusy(false, status: "")
-            alert(title: "Recovery key valid",
-                  message: "This key unlocks the message keys stored on your account.")
-            return
+    // MARK: - Message key restore
+
+    // Recovery key -> the backup's X25519 private key (a 4S secret) -> the
+    // server-side megolm backup -> stored sessions. Each step reports its own
+    // failure rather than one generic message: the point of walking the chain in
+    // stages is being able to see which link is broken.
+    private func restore(key: [UInt8], keyId: String, base: String) {
+        setBusy(true, status: "Unlocking message keys…")
+        let secretPath = base + "m.megolm_backup.v1"
+        client.get(secretPath) { [weak self] json, error in
+            guard let self = self else { return }
+            if let error = error { self.fail(error, path: secretPath); return }
+            guard let encrypted = json?["encrypted"] as? [String: Any],
+                  let entry = encrypted[keyId] as? [String: Any] else {
+                self.setBusy(false, status: "No message key backup is stored on this account.")
+                return
+            }
+            // The secret is the backup's private key, itself base64 inside the
+            // decrypted plaintext.
+            guard let text = RecoveryKeyVC.decryptSecret(name: "m.megolm_backup.v1", key: key, entry: entry),
+                  let privateKey = Base64.decode(text), privateKey.count == 32 else {
+                self.setBusy(false, status: "Couldn't unlock the backup key.")
+                return
+            }
+            self.fetchBackupVersion(privateKey: privateKey)
         }
-        setBusy(false, status: failure)
+    }
+
+    private func fetchBackupVersion(privateKey: [UInt8]) {
+        let path = "/_matrix/client/v3/room_keys/version"
+        client.get(path) { [weak self] json, error in
+            guard let self = self else { return }
+            if let error = error { self.fail(error, path: path); return }
+            let algorithm = json?["algorithm"] as? String ?? ""
+            guard algorithm == "m.megolm_backup.v1.curve25519-aes-sha2" else {
+                self.setBusy(false, status: "Unsupported backup algorithm "
+                    + "(\(algorithm.isEmpty ? "none" : algorithm)).")
+                return
+            }
+            guard let version = json?["version"] as? String, !version.isEmpty else {
+                self.setBusy(false, status: "The backup has no version.")
+                return
+            }
+            // Cheap early error: if the key we just unlocked doesn't match the
+            // public key the backup was made against, nothing below can decrypt.
+            guard let auth = json?["auth_data"] as? [String: Any],
+                  let publicText = auth["public_key"] as? String,
+                  let expected = Base64.decode(publicText),
+                  let ours = Crypto.x25519PublicKey(privateKey: privateKey),
+                  ours == expected else {
+                self.setBusy(false, status: "The unlocked key doesn't match this backup.")
+                return
+            }
+            self.fetchKeys(privateKey: privateKey, version: version)
+        }
+    }
+
+    private func fetchKeys(privateKey: [UInt8], version: String) {
+        setBusy(true, status: "Downloading message keys…")
+        let path = "/_matrix/client/v3/room_keys/keys?version=" + RecoveryKeyVC.pathEncode(version)
+        client.get(path) { [weak self] json, error in
+            guard let self = self else { return }
+            if let error = error { self.fail(error, path: path); return }
+            guard let rooms = json?["rooms"] as? [String: Any], !rooms.isEmpty else {
+                self.setBusy(false, status: "The backup is empty.")
+                return
+            }
+            // One X25519 + AES-CBC per session, on main. This is a one-shot the
+            // user asked for and it sits behind the busy state, unlike the
+            // per-event work in the timeline.
+            var recovered: [MegolmSession] = []
+            var unreadable = 0
+            // The first failure's reason, shown alongside the count: with a slow
+            // build cycle, "could not be read" on its own costs a whole round
+            // trip to narrow down.
+            var firstReason: String? = nil
+            for (roomId, rawRoom) in rooms {
+                guard let sessions = (rawRoom as? [String: Any])?["sessions"] as? [String: Any] else { continue }
+                for (sessionId, rawSession) in sessions {
+                    guard let data = (rawSession as? [String: Any])?["session_data"] as? [String: Any] else {
+                        unreadable += 1
+                        if firstReason == nil { firstReason = "no session data" }
+                        continue
+                    }
+                    let outcome = RecoveryKeyVC.decodeSession(roomId: roomId, sessionId: sessionId,
+                                                             data: data, privateKey: privateKey)
+                    if let session = outcome.session {
+                        recovered.append(session)
+                    } else {
+                        unreadable += 1
+                        if firstReason == nil { firstReason = outcome.reason }
+                    }
+                }
+            }
+            MegolmKeyStore.shared.merge(recovered)
+            let total = MegolmKeyStore.shared.count
+            self.setBusy(false, status: unreadable > 0
+                ? "\(unreadable) key\(unreadable == 1 ? "" : "s") in the backup could not be read"
+                  + (firstReason.map { ": \($0)." } ?? ".")
+                : "")
+            self.onRestored?()
+            self.alert(title: "Message keys restored",
+                       message: "\(total) message key\(total == 1 ? "" : "s") "
+                              + "\(total == 1 ? "is" : "are") available on this device.")
+        }
+    }
+
+    // Decrypts one named secret out of 4S storage. Same aes-hmac-sha2 scheme as
+    // the key check above, except the info is the secret's name and the MAC
+    // covers the stored ciphertext.
+    private static func decryptSecret(name: String, key: [UInt8], entry: [String: Any]) -> String? {
+        guard let ivText = entry["iv"] as? String,
+              let cipherText = entry["ciphertext"] as? String,
+              let macText = entry["mac"] as? String,
+              let iv = Base64.decode(ivText), iv.count == 16,
+              let ciphertext = Base64.decode(cipherText), !ciphertext.isEmpty,
+              let expectedMAC = Base64.decode(macText), !expectedMAC.isEmpty else { return nil }
+        let zeroes = [UInt8](repeating: 0, count: 32)
+        guard let derived = Crypto.hkdfSHA256(ikm: key, salt: zeroes,
+                                              info: Array(name.utf8), length: 64),
+              let mac = Crypto.hmacSHA256(key: Array(derived[32..<64]), data: ciphertext),
+              mac == expectedMAC,
+              let plain = Crypto.aes256CTR(key: Array(derived[0..<32]), iv: iv, data: ciphertext) else {
+            return nil
+        }
+        return String(bytes: plain, encoding: .utf8)
+    }
+
+    // One backed-up session: ECDH against the ephemeral key, then the usual
+    // aes-sha2 unwrap, then the exported-megolm-session layout.
+    //
+    // Returns the session, or the reason it could not be read. One silent nil
+    // for the whole chain made every failure look identical, which is the
+    // opposite of the staged-so-you-can-see-the-broken-link approach above.
+    private static func decodeSession(roomId: String, sessionId: String,
+                                      data: [String: Any], privateKey: [UInt8])
+        -> (session: MegolmSession?, reason: String?) {
+        guard let ephemeralText = data["ephemeral"] as? String,
+              let cipherText = data["ciphertext"] as? String,
+              let macText = data["mac"] as? String,
+              let ephemeral = Base64.decode(ephemeralText), ephemeral.count == 32,
+              let ciphertext = Base64.decode(cipherText),
+              !ciphertext.isEmpty, ciphertext.count % 16 == 0,
+              // The stored MAC is TRUNCATED to 8 bytes here, unlike 4S storage.
+              let expectedMAC = Base64.decode(macText), expectedMAC.count >= 8 else {
+            return (nil, "malformed session data")
+        }
+        guard let shared = Crypto.x25519(privateKey: privateKey, peerPublicKey: ephemeral),
+              let derived = Crypto.hkdfSHA256(ikm: shared,
+                                              salt: [UInt8](repeating: 0, count: 32),
+                                              info: [], length: 80) else {
+            return (nil, "key agreement failed")
+        }
+        // ★ The MAC is computed over the EMPTY STRING, not over the ciphertext.
+        // That is a bug in the original libolm implementation that is now baked
+        // into the format, so it is what every real backup actually contains
+        // (matrix-rust-sdk skips this check outright for the same reason). It
+        // still confirms we derived the right key, which is worth keeping as an
+        // early error. A ciphertext MAC is accepted too, since that is what a
+        // spec-literal implementation would have written and it costs nothing.
+        let macKey = Array(derived[32..<64])
+        let expected = Array(expectedMAC[0..<8])
+        let matches: ([UInt8]) -> Bool = { message in
+            guard let mac = Crypto.hmacSHA256(key: macKey, data: message) else { return false }
+            return Array(mac[0..<8]) == expected
+        }
+        guard matches([]) || matches(ciphertext) else { return (nil, "MAC mismatch") }
+        guard let plain = Crypto.aes256CBCDecrypt(key: Array(derived[0..<32]),
+                                                  iv: Array(derived[64..<80]),
+                                                  data: ciphertext) else {
+            return (nil, "could not decrypt")
+        }
+        guard let json = (try? JSONSerialization.jsonObject(with: Data(plain),
+                                                            options: [])) as? [String: Any] else {
+            return (nil, "decrypted data is not JSON")
+        }
+        let algorithm = json["algorithm"] as? String ?? ""
+        guard algorithm == "m.megolm.v1.aes-sha2" else {
+            return (nil, "unsupported algorithm (\(algorithm.isEmpty ? "none" : algorithm))")
+        }
+        // version byte + 4-byte index + 128-byte ratchet + 32-byte Ed25519 key
+        guard let sessionKey = json["session_key"] as? String,
+              let exported = Base64.decode(sessionKey), exported.count >= 165,
+              exported[0] == 0x01 else {
+            return (nil, "unexpected session key format")
+        }
+        let index = (Int(exported[1]) << 24) | (Int(exported[2]) << 16)
+                  | (Int(exported[3]) << 8) | Int(exported[4])
+        return (MegolmSession(sessionId: sessionId,
+                              roomId: roomId,
+                              senderKey: json["sender_key"] as? String ?? "",
+                              firstKnownIndex: index,
+                              ratchet: Array(exported[5..<133]),
+                              signingKey: Array(exported[133..<165])), nil)
     }
 
     // Pure-stdlib percent-encoding for one path segment. Foundation's

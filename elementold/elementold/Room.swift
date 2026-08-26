@@ -440,3 +440,128 @@ final class RoomStore {
         return raw.compactMap { $0 as? String }
     }
 }
+
+// MARK: - Megolm key store
+
+// One megolm session recovered from the server-side key backup.
+//
+// `ratchet` is the PRISTINE exported ratchet at `firstKnownIndex`. Megolm
+// ratchets are forward-only: advancing this one past index i would make every
+// message below i permanently undecryptable, so decryption must always work on
+// a scratch copy and never write back here.
+struct MegolmSession {
+    let sessionId: String
+    let roomId: String
+    let senderKey: String
+    let firstKnownIndex: Int
+    let ratchet: [UInt8]        // 128 bytes, four 32-byte parts
+    let signingKey: [UInt8]     // 32-byte Ed25519 public key
+}
+
+// Persisted megolm sessions, keyed by session id alone. Session ids are unique,
+// and keying on them (rather than room + session) means the decrypt path does
+// not need a room id — which matters because `RoomEvent.parse` never receives
+// one.
+//
+// SECURITY: these are plain bytes in a plain file under Documents. The Keychain
+// is unusable in this ad-hoc signing pipeline (SecItemAdd silently fails with no
+// keychain-access-groups entitlement), so this is the same posture as the access
+// token already sitting in UserDefaults. The file is wiped on a hard logout and
+// on a cache reset.
+final class MegolmKeyStore {
+
+    static let shared = MegolmKeyStore()
+
+    // Bumped whenever the encoding below changes; a file written by another
+    // version is discarded whole, and the user re-enters their recovery key.
+    private static let version = 1
+
+    private let path: String
+    private let queue = DispatchQueue(label: "com.jellyold.megolmkeys")
+    private var sessions: [String: MegolmSession] = [:]
+
+    private init() {
+        let documents = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
+            ?? NSTemporaryDirectory()
+        path = (documents as NSString).appendingPathComponent("elementold-megolm-keys.json")
+        load()
+    }
+
+    var count: Int { return sessions.count }
+
+    func session(id: String) -> MegolmSession? { return sessions[id] }
+
+    // Keeps whichever copy reaches further back: a session can be backed up
+    // twice at different ratchet indices, and the lower one decrypts more.
+    @discardableResult
+    func merge(_ incoming: [MegolmSession]) -> Int {
+        var added = 0
+        for session in incoming {
+            if let existing = sessions[session.sessionId],
+               existing.firstKnownIndex <= session.firstKnownIndex { continue }
+            if sessions[session.sessionId] == nil { added += 1 }
+            sessions[session.sessionId] = session
+        }
+        if added > 0 || !incoming.isEmpty { write() }
+        return added
+    }
+
+    func discard() {
+        sessions = [:]
+        let path = self.path
+        queue.async { try? FileManager.default.removeItem(atPath: path) }
+    }
+
+    // MARK: persistence
+
+    private func load() {
+        // FileManager, not Data(contentsOf:) — the URL-based reader hangs here.
+        guard let data = FileManager.default.contents(atPath: path),
+              let json = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any],
+              (json["version"] as? NSNumber)?.intValue == MegolmKeyStore.version,
+              json["userId"] as? String == MatrixSession.userId,
+              let raw = json["sessions"] as? [[String: Any]] else { return }
+        for entry in raw {
+            guard let session = MegolmKeyStore.decode(entry) else { continue }
+            sessions[session.sessionId] = session
+        }
+    }
+
+    private func write() {
+        guard let userId = MatrixSession.userId else { return }
+        let json: [String: Any] = ["version": MegolmKeyStore.version,
+                                   "userId": userId,
+                                   "sessions": sessions.values.map { MegolmKeyStore.encode($0) }]
+        guard let data = try? JSONSerialization.data(withJSONObject: json, options: []) else { return }
+        let path = self.path
+        queue.async {
+            // Path-based NSData write: Data.write(to:) hangs on this runtime.
+            (data as NSData).write(toFile: path, atomically: true)
+        }
+    }
+
+    // Bytes travel as base64 through our own encoder rather than Foundation's,
+    // which is iOS 7+ on this target.
+    private static func encode(_ session: MegolmSession) -> [String: Any] {
+        return ["id": session.sessionId,
+                "room": session.roomId,
+                "sender": session.senderKey,
+                "index": session.firstKnownIndex,
+                "ratchet": Base64.encode(session.ratchet),
+                "signing": Base64.encode(session.signingKey)]
+    }
+
+    private static func decode(_ d: [String: Any]) -> MegolmSession? {
+        guard let id = d["id"] as? String, !id.isEmpty,
+              let ratchetText = d["ratchet"] as? String,
+              let ratchet = Base64.decode(ratchetText), ratchet.count == 128,
+              let signingText = d["signing"] as? String,
+              let signing = Base64.decode(signingText), signing.count == 32 else { return nil }
+        return MegolmSession(sessionId: id,
+                             roomId: d["room"] as? String ?? "",
+                             senderKey: d["sender"] as? String ?? "",
+                             firstKnownIndex: (d["index"] as? NSNumber)?.intValue ?? 0,
+                             ratchet: ratchet,
+                             signingKey: signing)
+    }
+}

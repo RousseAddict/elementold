@@ -576,6 +576,10 @@ class RoomListVC: UIViewController {
         // Drop the persisted room list: it belongs to the account signing out.
         // (Also cancels any pending write, so nothing can land after this.)
         RoomStore.shared.discard()
+        // Same for the restored message keys — they decrypt this account's
+        // history and must not survive into the next sign-in. Deliberately NOT
+        // done on a soft logout, where surviving state is the whole point.
+        MegolmKeyStore.shared.discard()
         MatrixSession.clear()
         // Drop cached media too, so a different account signing in on this
         // device doesn't inherit the previous user's downloaded images.
