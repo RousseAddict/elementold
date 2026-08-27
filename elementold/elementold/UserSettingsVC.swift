@@ -245,6 +245,9 @@ class UserSettingsVC: UIViewController {
     }
 
     private func reloadEncryptionSection() {
+        // onRestored fires while the user is still on the recovery screen, so the
+        // table may not exist yet — same guard its three sibling reloaders use.
+        guard isViewLoaded else { return }
         tableView.reloadSections(IndexSet(integer: 3), with: .none)
     }
 

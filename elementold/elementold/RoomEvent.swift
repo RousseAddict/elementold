@@ -241,13 +241,18 @@ struct RoomEvent {
                               replyTo: replyTo, replyQuote: replyQuote, replyAuthor: replyAuthor)
 
         case "m.room.encrypted":
-            guard let content = json["content"] as? [String: Any] else { return nil }
             // Every ingestion path — initial state, backfill and live sync — funnels
             // through here, so decrypting at this one seam covers all of them.
+            // Missing content is not a reason to drop the event: it falls through
+            // to the placeholder below like any other unreadable message.
+            let content = json["content"] as? [String: Any] ?? [:]
             let outcome = E2EEDecryptor.shared.decrypt(eventId: eventId, content: content)
-            if case .decrypted(let payload) = outcome {
-                guard let innerType = payload["type"] as? String,
-                      innerType != "m.room.encrypted" else { return nil }
+            // The nesting guard is not paranoia: re-parsing an inner
+            // "m.room.encrypted" would decrypt the same event id again and
+            // recurse forever. Such a payload is treated as unreadable.
+            if case .decrypted(let payload) = outcome,
+               let innerType = payload["type"] as? String,
+               innerType != "m.room.encrypted" {
                 // Re-parse the plaintext as the event it always was, keeping the
                 // envelope (event_id, sender, timestamp, unsigned) intact so
                 // replies, edits and bundled reactions all still resolve.

@@ -147,9 +147,30 @@ struct Room {
             }
             if let events = timeline["events"] as? [[String: Any]] {
                 events.forEach(considerStateEvent)
-                for event in events where event["type"] as? String == "m.room.message" {
-                    if let content = event["content"] as? [String: Any],
-                       let body = content["body"] as? String {
+                for event in events {
+                    let eventType = event["type"] as? String
+                    guard eventType == "m.room.message" || eventType == "m.room.encrypted" else {
+                        continue
+                    }
+                    // An encrypted event opens into the very same {msgtype, body}
+                    // shape, so the preview is read the same way once the keys are
+                    // there. Reading only the plaintext type would leave an
+                    // encrypted room with no preview AND a timestamp stuck at 0 —
+                    // pinning it to the bottom of the list forever — even while
+                    // every one of its messages decrypts fine in the timeline.
+                    // The plaintext is memoized per event id (and RoomEvent.parse
+                    // below wants the same one), so asking here costs nothing.
+                    var content = event["content"] as? [String: Any]
+                    if eventType == "m.room.encrypted" {
+                        var opened: [String: Any]? = nil
+                        if let eventId = event["event_id"] as? String,
+                           case .decrypted(let payload) = E2EEDecryptor.shared.decrypt(
+                               eventId: eventId, content: content ?? [:]) {
+                            opened = payload["content"] as? [String: Any]
+                        }
+                        content = opened
+                    }
+                    if let body = content?["body"] as? String {
                         lastMessage = body
                     }
                     if let ts = (event["origin_server_ts"] as? NSNumber)?.doubleValue {
@@ -466,8 +487,10 @@ struct MegolmSession {
 // SECURITY: these are plain bytes in a plain file under Documents. The Keychain
 // is unusable in this ad-hoc signing pipeline (SecItemAdd silently fails with no
 // keychain-access-groups entitlement), so this is the same posture as the access
-// token already sitting in UserDefaults. The file is wiped on a hard logout and
-// on a cache reset.
+// token already sitting in UserDefaults. The file is wiped on a hard logout, and
+// deliberately NOT on a cache reset — everything else there is re-fetchable on
+// its own, but these come back only by re-entering the recovery key, so clearing
+// them would silently turn every readable message back into a placeholder.
 final class MegolmKeyStore {
 
     static let shared = MegolmKeyStore()

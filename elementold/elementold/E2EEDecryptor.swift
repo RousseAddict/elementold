@@ -319,7 +319,7 @@ final class E2EEDecryptor {
 
     private init() {}
 
-    // Called when the keys go away (hard logout, cache reset). Failures are
+    // Called when the keys go away (hard logout). Failures are
     // never cached, so keys ARRIVING needs no invalidation: a message that
     // reported .locked simply succeeds the next time it is parsed.
     func reset() {
