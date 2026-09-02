@@ -37,7 +37,7 @@ class RoomTimelineVC: UIViewController {
     // Auto-growing input geometry. The field grows from one line up to
     // `inputMaxHeight` (then scrolls internally); the bar height tracks it, with
     // `inputVPad` above/below. Buttons stay pinned to the bar's bottom edge as it
-    // grows, iMessage-style. `keyboardHeight` is tracked so the bar's bottom edge
+    // grows, iMessage-style. `keyboardOverlap` is tracked so the bar's bottom edge
     // sits just above the keyboard (or the screen bottom when dismissed).
     private let inputVPad: CGFloat = 9
     private let inputMinHeight: CGFloat = 36
@@ -47,7 +47,7 @@ class RoomTimelineVC: UIViewController {
     private let hMargin: CGFloat = 12
     private let hSpacing: CGFloat = 8
     private var currentFieldHeight: CGFloat = 36
-    private var keyboardHeight: CGFloat = 0
+    private var keyboardOverlap: CGFloat = 0
     // One-shot latch: the first scroll-to-bottom must wait for the table's FINAL
     // height. seedInitialEvents() (in viewDidLoad) scrolls with the pre-layout
     // bounds, before layoutInputBar() shrinks the table to leave room for the
@@ -1046,7 +1046,7 @@ class RoomTimelineVC: UIViewController {
     private func layoutInputBar() {
         let barWidth = view.bounds.width
         let barHeight = currentFieldHeight + inputVPad * 2
-        let barY = view.bounds.height - keyboardHeight - barHeight
+        let barY = view.bounds.height - keyboardOverlap - barHeight
         inputBar.frame = CGRect(x: 0, y: barY, width: barWidth, height: barHeight)
 
         // Buttons keep a fixed 36pt box pinned to the bar's bottom edge, so they
@@ -2616,7 +2616,7 @@ class RoomTimelineVC: UIViewController {
     @objc private func keyboardWillShow(_ notification: Notification) {
         guard let keyboardFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
         let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
-        keyboardHeight = keyboardFrame.height
+        keyboardOverlap = overlap(with: keyboardFrame)
         UIView.animate(withDuration: duration) {
             self.layoutInputBar()
         }
@@ -2624,10 +2624,23 @@ class RoomTimelineVC: UIViewController {
 
     @objc private func keyboardWillHide(_ notification: Notification) {
         let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
-        keyboardHeight = 0
+        keyboardOverlap = 0
         UIView.animate(withDuration: duration) {
             self.layoutInputBar()
         }
+    }
+
+    // How far up our view the keyboard reaches. The notification carries the
+    // frame in SCREEN coordinates, and before iOS 8 those aren't rotated — so in
+    // landscape its `height` is the screen's LONG side (the unrotated portrait
+    // height), which made barY go far negative and threw the composer off the
+    // top of the screen. Converting screen -> window -> view gets it right on
+    // every version and orientation.
+    private func overlap(with keyboardFrame: CGRect) -> CGFloat {
+        guard let window = view.window else { return keyboardFrame.height }
+        let inWindow = window.convert(keyboardFrame, from: nil)
+        let inView = view.convert(inWindow, from: window)
+        return max(0, view.bounds.maxY - inView.minY)
     }
 }
 
