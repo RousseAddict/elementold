@@ -537,54 +537,18 @@ class RoomListVC: UIViewController {
         }
     }
 
-    // MARK: - Account menu
+    // MARK: - Account
 
+    // The account button used to open a two-item action sheet (User Settings /
+    // Log Out). UIActionSheet has been a compatibility shim over
+    // UIAlertController since iOS 8 and lays out badly on newer systems, and
+    // this was the only site anchoring one to a bar button item — the flakiest
+    // path of all. It now pushes the settings screen directly, with Log Out
+    // living there as a two-tap row.
     @objc private func accountTapped() {
-#if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.addButton(withTitle: "User Settings")   // 0
-        sheet.addButton(withTitle: "Log Out")          // 1
-        sheet.addButton(withTitle: "Cancel")           // 2
-        sheet.cancelButtonIndex = 2
-        sheet.delegate = self
-        sheet.show(from: navigationItem.leftBarButtonItem!, animated: true)
-#else
-        let sheet = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
-        sheet.addAction(UIAlertAction(title: "User Settings", style: .default) { [weak self] _ in
-            self?.openUserSettings()
-        })
-        sheet.addAction(UIAlertAction(title: "Log Out", style: .destructive) { [weak self] _ in
-            self?.confirmLogout()
-        })
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        sheet.popoverPresentationController?.barButtonItem = navigationItem.leftBarButtonItem
-        present(sheet, animated: true)
-#endif
-    }
-
-    private func openUserSettings() {
-        navigationController?.pushViewController(UserSettingsVC(), animated: true)
-    }
-
-    private func confirmLogout() {
-#if IOS6_TARGET
-        let alert = UIAlertView()
-        alert.title = "Log Out"
-        alert.message = "Are you sure you want to log out?"
-        alert.addButton(withTitle: "Cancel")   // 0
-        alert.addButton(withTitle: "Log Out")  // 1
-        alert.cancelButtonIndex = 0
-        alert.delegate = self
-        alert.show()
-#else
-        let alert = UIAlertController(title: "Log Out",
-                                      message: "Are you sure you want to log out?", preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Log Out", style: .destructive) { [weak self] _ in
-            self?.performLogout()
-        })
-        present(alert, animated: true)
-#endif
+        let vc = UserSettingsVC()
+        vc.onLogout = { [weak self] in self?.performLogout() }
+        navigationController?.pushViewController(vc, animated: true)
     }
 
     private func performLogout() {
@@ -853,25 +817,14 @@ class RoomListVC: UIViewController {
 }
 
 #if IOS6_TARGET
-extension RoomListVC: UIActionSheetDelegate, UIAlertViewDelegate {
+extension RoomListVC: UIActionSheetDelegate {
     func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
-        if actionSheet.tag == filterSheetTag {
-            // Filter sheet: buttons map 1:1 to pendingFilterOptions; the trailing
-            // Cancel button is out of range and ignored.
-            if buttonIndex >= 0 && buttonIndex < pendingFilterOptions.count {
-                applyFilter(pendingFilterOptions[buttonIndex].id)
-            }
-            return
+        // The filter sheet is the only one left here: buttons map 1:1 to
+        // pendingFilterOptions; the trailing Cancel button is out of range and
+        // ignored.
+        if buttonIndex >= 0 && buttonIndex < pendingFilterOptions.count {
+            applyFilter(pendingFilterOptions[buttonIndex].id)
         }
-        switch buttonIndex {
-        case 0: openUserSettings()
-        case 1: confirmLogout()
-        default: break
-        }
-    }
-
-    func alertView(_ alertView: UIAlertView, clickedButtonAt buttonIndex: Int) {
-        if buttonIndex == 1 { performLogout() }
     }
 }
 #endif

@@ -38,6 +38,15 @@ class UserSettingsVC: UIViewController {
     // only rendered in the footer while this is true.
     private var crashExpanded = false
 
+    // Logging out tears down the whole session, so it lives on the room list
+    // (which owns the sync engine) and is reached from here through a closure.
+    var onLogout: (() -> Void)?
+
+    // Two-tap confirmation for the Log Out row: the first tap re-labels it and
+    // the second one commits. A modal confirmation would mean a UIAlertView,
+    // which is exactly what this screen exists to get away from.
+    private var logoutArmed = false
+
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "Settings"
@@ -51,6 +60,22 @@ class UserSettingsVC: UIViewController {
 
         refreshUsage()
         fetchProfile()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Never leave the row armed behind us: coming back to a screen that is
+        // already one tap away from logging out would be a nasty surprise.
+        disarmLogout()
+    }
+
+    // Resets the Log Out row to its idle label. Safe to call unconditionally;
+    // it only touches the table when the row was actually armed.
+    private func disarmLogout() {
+        guard logoutArmed else { return }
+        logoutArmed = false
+        guard isViewLoaded else { return }
+        tableView.reloadRows(at: [IndexPath(row: 0, section: 5)], with: .none)
     }
 
     private func refreshUsage() {
@@ -289,8 +314,9 @@ class UserSettingsVC: UIViewController {
 
 extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
     // 0 = Account (display name), 1 = Notifications (kill switch), 2 = Storage
-    // (cache), 3 = Encryption (recovery key), 4 = Diagnostics.
-    func numberOfSections(in tableView: UITableView) -> Int { return 5 }
+    // (cache), 3 = Encryption (recovery key), 4 = Diagnostics, 5 = Log Out.
+    // Log Out is appended last so no existing section index shifts.
+    func numberOfSections(in tableView: UITableView) -> Int { return 6 }
 
     func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
         switch section {
@@ -298,7 +324,8 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         case 1: return "Notifications"
         case 2: return "Storage"
         case 3: return "Encryption"
-        default: return "Diagnostics"
+        case 4: return "Diagnostics"
+        default: return nil                  // Log Out needs no header
         }
     }
 
@@ -340,11 +367,12 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         case 1: return 1                     // notifications toggle
         case 2: return 4                     // cache usage, downloads usage, reset, delete
         case 3: return 2                     // enter recovery key, restored key count
-        default:
+        case 4:
             // Diagnostics: crash-log toggle row (+ a copy row when expanded),
             // only when a crash was actually recorded.
             guard CrashLogger.lastCrash != nil else { return 0 }
             return crashExpanded ? 2 : 1
+        default: return 1                    // Log Out
         }
     }
 
@@ -445,21 +473,33 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         }
 
         // Section 4: Diagnostics — crash-log toggle + copy.
-        if indexPath.row == 0 {
-            let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
-                UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
-            cell.textLabel?.text = "Last crash"
-            cell.textLabel?.textColor = .black
-            cell.textLabel?.textAlignment = .left
-            cell.detailTextLabel?.text = crashExpanded ? "Hide" : "Show"
+        if indexPath.section == 4 {
+            if indexPath.row == 0 {
+                let cell = tableView.dequeueReusableCell(withIdentifier: cellId + "V") ??
+                    UITableViewCell(style: .value1, reuseIdentifier: cellId + "V")
+                cell.textLabel?.text = "Last crash"
+                cell.textLabel?.textColor = .black
+                cell.textLabel?.textAlignment = .left
+                cell.detailTextLabel?.text = crashExpanded ? "Hide" : "Show"
+                cell.selectionStyle = .default
+                cell.accessoryType = .none
+                return cell
+            }
+            let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
+                UITableViewCell(style: .default, reuseIdentifier: cellId)
+            cell.textLabel?.text = "Copy crash log"
+            cell.textLabel?.textColor = UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
+            cell.textLabel?.textAlignment = .center
             cell.selectionStyle = .default
             cell.accessoryType = .none
             return cell
         }
+
+        // Section 5: Log Out — armed by the first tap, committed by the second.
         let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
             UITableViewCell(style: .default, reuseIdentifier: cellId)
-        cell.textLabel?.text = "Copy crash log"
-        cell.textLabel?.textColor = UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
+        cell.textLabel?.text = logoutArmed ? "Tap again to log out" : "Log Out"
+        cell.textLabel?.textColor = UIColor(red: 0.8, green: 0.1, blue: 0.1, alpha: 1.0)
         cell.textLabel?.textAlignment = .center
         cell.selectionStyle = .default
         cell.accessoryType = .none
@@ -468,6 +508,8 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
+        // Touching anything else cancels a pending log out.
+        if indexPath.section != 5 { disarmLogout() }
         switch indexPath.section {
         case 0:
             if indexPath.row == 0 { pickAvatar() } else { promptEditDisplayName() }
@@ -478,12 +520,20 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             if indexPath.row == 3 { confirmClearDownloads() }
         case 3:
             if indexPath.row == 0 { openRecoveryKey() }
-        default:
+        case 4:
             if indexPath.row == 0 {
                 crashExpanded.toggle()
                 tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
             } else {
                 copyCrashLog()
+            }
+        default:
+            if logoutArmed {
+                logoutArmed = false
+                onLogout?()
+            } else {
+                logoutArmed = true
+                tableView.reloadRows(at: [indexPath], with: .none)
             }
         }
     }
