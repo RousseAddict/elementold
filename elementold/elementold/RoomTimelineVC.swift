@@ -1827,32 +1827,14 @@ class RoomTimelineVC: UIViewController {
     @objc private func attachTapped() {
         messageField.resignFirstResponder()
         let hasCamera = UIImagePickerController.isSourceTypeAvailable(.camera)
-#if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.delegate = self
-        sheet.title = "Attach"
-        if hasCamera { sheet.addButton(withTitle: "Take Photo") }
-        sheet.addButton(withTitle: "Choose from Library")
-        sheet.addButton(withTitle: "Voice Message")
-        let cancelIndex = sheet.addButton(withTitle: "Cancel")
-        sheet.cancelButtonIndex = cancelIndex
-        sheet.show(in: view)
-#else
-        let sheet = UIAlertController(title: "Attach", message: nil, preferredStyle: .actionSheet)
+        let sheet = ActionSheet(title: "Attach")
         if hasCamera {
-            sheet.addAction(UIAlertAction(title: "Take Photo", style: .default) { [weak self] _ in
-                self?.presentPicker(source: .camera)
-            })
+            sheet.add("Take Photo") { [weak self] in self?.presentPicker(source: .camera) }
         }
-        sheet.addAction(UIAlertAction(title: "Choose from Library", style: .default) { [weak self] _ in
-            self?.presentPicker(source: .photoLibrary)
-        })
-        sheet.addAction(UIAlertAction(title: "Voice Message", style: .default) { [weak self] _ in
-            self?.enterVoiceMode()
-        })
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        present(sheet, animated: true)
-#endif
+        sheet.add("Choose from Library") { [weak self] in self?.presentPicker(source: .photoLibrary) }
+        sheet.add("Voice Message") { [weak self] in self?.enterVoiceMode() }
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
     private func presentPicker(source: UIImagePickerController.SourceType) {
@@ -4136,14 +4118,6 @@ extension RoomTimelineVC: UIActionSheetDelegate {
             }
             return
         }
-        // Map by title, not index: the button set is dynamic (camera row is
-        // conditional) so a fixed index would break when Voice Message shifted it.
-        switch actionSheet.buttonTitle(at: buttonIndex) {
-        case "Take Photo": presentPicker(source: .camera)
-        case "Choose from Library": presentPicker(source: .photoLibrary)
-        case "Voice Message": enterVoiceMode()
-        default: break
-        }
     }
 }
 #endif
@@ -4860,5 +4834,292 @@ class MemberCell: UITableViewCell {
             dl.frame.origin.x = textLeft
             dl.frame.size.width = contentView.bounds.width - textLeft - avatarMargin
         }
+    }
+}
+
+// MARK: - ActionSheet
+
+/// A bottom action sheet drawn from primitives that behave identically on iOS 6
+/// and iOS 12: UIView, UIButton, UIScrollView and UIView.animate.
+///
+/// Neither system control works across this app's range. UIActionSheet has been
+/// a compatibility shim over UIAlertController since iOS 8 — it lays out
+/// unpredictably there and is gone entirely in iOS 13 — while UIAlertController
+/// can't be referenced at all from the iOS 6 target, because guarding it would
+/// need `#available`, which freezes on the swapped 5.1.5 runtime. So the sheet
+/// is built here instead, once, for both targets.
+///
+/// Usage (handlers run after the dismiss animation, so a push or present made
+/// from one lands on a clean screen):
+///
+///     ActionSheet(title: "Attach")
+///         .add("Take Photo") { [weak self] in self?.takePhoto() }
+///         .addDestructive("Delete") { [weak self] in self?.delete() }
+///         .cancel()
+///         .present(in: self)
+final class ActionSheet: UIView {
+
+    private struct Item {
+        let title: String
+        let destructive: Bool
+        let handler: (() -> Void)?
+    }
+
+    // Layout metrics.
+    private static let rowHeight: CGFloat = 50
+    private static let sideMargin: CGFloat = 10
+    private static let groupGap: CGFloat = 8
+    private static let bottomMargin: CGFloat = 10
+    private static let topLimit: CGFloat = 20
+    // Landscape and iPad are wide enough that a full-width sheet looks stretched;
+    // same cap LoginVC applies to its form.
+    private static let maxWidth: CGFloat = 420
+    private static let corner: CGFloat = 12
+    private static let titleVPad: CGFloat = 14
+    private static let titleHPad: CGFloat = 16
+
+    private static let defaultColor = UIColor(red: 0, green: 0.48, blue: 1, alpha: 1)
+    private static let destructiveColor = UIColor(red: 0.80, green: 0.16, blue: 0.13, alpha: 1)
+
+    /// Solid fill for the pressed state. A background image is used rather than a
+    /// highlighted background colour because UIButton has no such property.
+    private static let highlightImage: UIImage? = {
+        UIGraphicsBeginImageContextWithOptions(CGSize(width: 1, height: 1), true, 0)
+        UIColor(white: 0.90, alpha: 1).setFill()
+        UIRectFill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        let img = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        return img
+    }()
+
+    private let sheetTitle: String?
+    private var items: [Item] = []
+    private var cancelTitle: String?
+    private var cancelHandler: (() -> Void)?
+
+    // A plain button rather than a tap recognizer: a recognizer on the superview
+    // competes with the row buttons for the touch, a sibling button does not.
+    private let backdrop = UIButton(type: .custom)
+    // The rows live in a scroll view so a long sheet (the reaction picker is
+    // seven rows) still fits on a 4-inch screen in landscape. When the content
+    // fits, contentSize equals bounds and it simply never scrolls.
+    private let group = UIScrollView()
+    private let titleLabel = UILabel()
+    private let cancelButton = UIButton(type: .custom)
+    private var buttons: [UIButton] = []
+    private var separators: [UIView] = []
+
+    private var isPresented = false
+    private var built = false
+    private var groupFrame = CGRect.zero
+    private var cancelFrame = CGRect.zero
+
+    init(title: String? = nil) {
+        sheetTitle = title
+        super.init(frame: .zero)
+        backgroundColor = UIColor(white: 0, alpha: 0.4)
+        alpha = 0
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    // MARK: Building
+
+    @discardableResult
+    func add(_ title: String, handler: (() -> Void)? = nil) -> ActionSheet {
+        items.append(Item(title: title, destructive: false, handler: handler))
+        return self
+    }
+
+    @discardableResult
+    func addDestructive(_ title: String, handler: (() -> Void)? = nil) -> ActionSheet {
+        items.append(Item(title: title, destructive: true, handler: handler))
+        return self
+    }
+
+    @discardableResult
+    func cancel(_ title: String = "Cancel", handler: (() -> Void)? = nil) -> ActionSheet {
+        cancelTitle = title
+        cancelHandler = handler
+        return self
+    }
+
+    /// Attaches to the navigation controller's view rather than the window: the
+    /// window doesn't rotate on iOS 6/7 but does on iOS 8+, whereas the nav
+    /// controller's view rotates on every version. It also dims the nav bar,
+    /// which is what a real sheet does.
+    func present(in vc: UIViewController) {
+        guard !isPresented, let host = vc.navigationController?.view ?? vc.view else { return }
+        build()
+        frame = host.bounds
+        host.addSubview(self)
+        // Lay out once off-screen, then slide in.
+        isPresented = false
+        setNeedsLayout()
+        layoutIfNeeded()
+        isPresented = true
+        UIView.animate(withDuration: 0.25, animations: {
+            self.alpha = 1
+            self.applyFrames(presented: true)
+        })
+    }
+
+    private func build() {
+        guard !built else { return }
+        built = true
+
+        backdrop.frame = bounds
+        backdrop.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        backdrop.backgroundColor = .clear
+        backdrop.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+        addSubview(backdrop)
+
+        group.backgroundColor = .white
+        group.layer.cornerRadius = ActionSheet.corner
+        group.layer.masksToBounds = true
+        group.showsVerticalScrollIndicator = false
+        addSubview(group)
+
+        if let t = sheetTitle, !t.isEmpty {
+            titleLabel.text = t
+            titleLabel.font = UIFont.systemFont(ofSize: 13)
+            titleLabel.textColor = UIColor(white: 0.45, alpha: 1)
+            titleLabel.textAlignment = .center
+            titleLabel.numberOfLines = 0
+            // iOS 6: labels default to an opaque white background.
+            titleLabel.backgroundColor = .clear
+            group.addSubview(titleLabel)
+        }
+
+        let hairline = UIColor(white: 0.85, alpha: 1)
+        for (index, item) in items.enumerated() {
+            let separator = UIView()
+            separator.backgroundColor = hairline
+            group.addSubview(separator)
+            separators.append(separator)
+
+            let button = makeButton(title: item.title,
+                                    color: item.destructive ? ActionSheet.destructiveColor
+                                                            : ActionSheet.defaultColor,
+                                    bold: item.destructive)
+            button.tag = index
+            button.addTarget(self, action: #selector(buttonTapped(_:)), for: .touchUpInside)
+            group.addSubview(button)
+            buttons.append(button)
+        }
+
+        if let t = cancelTitle {
+            let button = cancelButton
+            button.setTitle(t, for: .normal)
+            button.setTitleColor(ActionSheet.defaultColor, for: .normal)
+            button.titleLabel?.font = UIFont.boldSystemFont(ofSize: 18)
+            button.titleLabel?.backgroundColor = .clear
+            button.backgroundColor = .white
+            button.setBackgroundImage(ActionSheet.highlightImage, for: .highlighted)
+            button.layer.cornerRadius = ActionSheet.corner
+            button.layer.masksToBounds = true
+            button.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+            addSubview(button)
+        }
+    }
+
+    private func makeButton(title: String, color: UIColor, bold: Bool) -> UIButton {
+        let button = UIButton(type: .custom)
+        button.setTitle(title, for: .normal)
+        button.setTitleColor(color, for: .normal)
+        button.titleLabel?.font = bold ? UIFont.boldSystemFont(ofSize: 18)
+                                       : UIFont.systemFont(ofSize: 18)
+        button.titleLabel?.backgroundColor = .clear
+        button.backgroundColor = .white
+        button.setBackgroundImage(ActionSheet.highlightImage, for: .highlighted)
+        return button
+    }
+
+    // MARK: Layout
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard built else { return }
+        computeFrames()
+        applyFrames(presented: isPresented)
+    }
+
+    private func computeFrames() {
+        let width = min(bounds.width - ActionSheet.sideMargin * 2, ActionSheet.maxWidth)
+        let left = floor((bounds.width - width) / 2)
+
+        var titleHeight: CGFloat = 0
+        if let t = sheetTitle, !t.isEmpty {
+            let textWidth = width - ActionSheet.titleHPad * 2
+            let fit = titleLabel.sizeThatFits(CGSize(width: textWidth, height: 10000))
+            titleHeight = ceil(fit.height) + ActionSheet.titleVPad * 2
+            titleLabel.frame = CGRect(x: ActionSheet.titleHPad, y: ActionSheet.titleVPad,
+                                      width: textWidth, height: titleHeight - ActionSheet.titleVPad * 2)
+        }
+
+        let hair = 1 / UIScreen.main.scale
+        var y = titleHeight
+        for (index, button) in buttons.enumerated() {
+            let separator = separators[index]
+            // No rule above the very first row when there's no title to divide it from.
+            separator.isHidden = (index == 0 && titleHeight == 0)
+            separator.frame = CGRect(x: 0, y: y, width: width, height: hair)
+            button.frame = CGRect(x: 0, y: y, width: width, height: ActionSheet.rowHeight)
+            y += ActionSheet.rowHeight
+        }
+        let contentHeight = y
+        group.contentSize = CGSize(width: width, height: contentHeight)
+
+        let cancelHeight: CGFloat = (cancelTitle == nil) ? 0 : ActionSheet.rowHeight
+        let gap: CGFloat = cancelHeight > 0 ? ActionSheet.groupGap : 0
+        let available = bounds.height - ActionSheet.topLimit - ActionSheet.bottomMargin
+            - cancelHeight - gap
+        let groupHeight = max(0, min(contentHeight, available))
+        let bottom = bounds.height - ActionSheet.bottomMargin
+
+        if cancelHeight > 0 {
+            cancelFrame = CGRect(x: left, y: bottom - cancelHeight, width: width, height: cancelHeight)
+            groupFrame = CGRect(x: left, y: cancelFrame.minY - gap - groupHeight,
+                                width: width, height: groupHeight)
+        } else {
+            cancelFrame = .zero
+            groupFrame = CGRect(x: left, y: bottom - groupHeight, width: width, height: groupHeight)
+        }
+    }
+
+    private func applyFrames(presented: Bool) {
+        if presented {
+            group.frame = groupFrame
+            cancelButton.frame = cancelFrame
+        } else {
+            let dy = bounds.height - groupFrame.minY
+            group.frame = groupFrame.offsetBy(dx: 0, dy: dy)
+            cancelButton.frame = cancelFrame.offsetBy(dx: 0, dy: dy)
+        }
+    }
+
+    // MARK: Actions
+
+    @objc private func buttonTapped(_ sender: UIButton) {
+        let index = sender.tag
+        guard index >= 0 && index < items.count else { return }
+        dismiss(then: items[index].handler)
+    }
+
+    @objc private func cancelTapped() {
+        dismiss(then: cancelHandler)
+    }
+
+    private func dismiss(then handler: (() -> Void)?) {
+        guard isPresented else { return }
+        isPresented = false
+        UIView.animate(withDuration: 0.2, animations: {
+            self.alpha = 0
+            self.applyFrames(presented: false)
+        }, completion: { _ in
+            self.removeFromSuperview()
+            handler?()
+        })
     }
 }
