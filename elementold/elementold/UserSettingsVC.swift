@@ -19,11 +19,6 @@ class UserSettingsVC: UIViewController {
     private var filesCount: Int = 0
     private var filesLoading = true
 
-    // Tags distinguishing the two confirmation sheets on the iOS 6 path, where
-    // a single UIActionSheetDelegate handles both.
-    private let cacheSheetTag = 81
-    private let filesSheetTag = 82
-
     // Matrix client for the profile API, plus the current profile once fetched.
     private let client = MatrixSession.makeAPIClient()
     private var displayName: String?
@@ -132,25 +127,10 @@ class UserSettingsVC: UIViewController {
     private func confirmClearCache() {
         let title = "Reset cache?"
         let message = "This deletes all downloaded images and the saved room list. Everything is fetched again when needed."
-#if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.title = message
-        sheet.addButton(withTitle: "Reset Cache")   // index 0 (destructive)
-        sheet.addButton(withTitle: "Cancel")         // index 1
-        sheet.destructiveButtonIndex = 0
-        sheet.cancelButtonIndex = 1
-        sheet.tag = cacheSheetTag
-        sheet.delegate = self
-        sheet.show(in: view)
-        _ = title
-#else
-        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Reset Cache", style: .destructive) { [weak self] _ in
-            self?.performClearCache()
-        })
-        present(alert, animated: true)
-#endif
+        let sheet = ActionSheet(title: title + "\n" + message)
+        sheet.addDestructive("Reset Cache") { [weak self] in self?.performClearCache() }
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
     private func performClearCache() {
@@ -172,25 +152,10 @@ class UserSettingsVC: UIViewController {
     private func confirmClearDownloads() {
         let title = "Delete downloads?"
         let message = "This deletes every attachment you've downloaded. They can be downloaded again."
-#if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.title = message
-        sheet.addButton(withTitle: "Delete Downloads")   // index 0 (destructive)
-        sheet.addButton(withTitle: "Cancel")             // index 1
-        sheet.destructiveButtonIndex = 0
-        sheet.cancelButtonIndex = 1
-        sheet.tag = filesSheetTag
-        sheet.delegate = self
-        sheet.show(in: view)
-        _ = title
-#else
-        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Delete Downloads", style: .destructive) { [weak self] _ in
-            self?.performClearDownloads()
-        })
-        present(alert, animated: true)
-#endif
+        let sheet = ActionSheet(title: title + "\n" + message)
+        sheet.addDestructive("Delete Downloads") { [weak self] in self?.performClearDownloads() }
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
     private func performClearDownloads() {
@@ -238,7 +203,7 @@ class UserSettingsVC: UIViewController {
     private func pickAvatar() {
         let picker = AvatarPicker(client: client)
         avatarPicker = picker
-        picker.start(from: self, anchor: view) { [weak self] mxc, _, error in
+        picker.start(from: self) { [weak self] mxc, _, error in
             guard let self = self else { return }
             self.avatarPicker = nil
             guard let mxc = mxc else {
@@ -539,20 +504,6 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
     }
 }
 
-#if IOS6_TARGET
-extension UserSettingsVC: UIActionSheetDelegate {
-    func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
-        guard buttonIndex == actionSheet.destructiveButtonIndex else { return }
-        if actionSheet.tag == filesSheetTag {
-            performClearDownloads()
-        } else {
-            performClearCache()
-        }
-    }
-}
-
-#endif
-
 // Simple pushed editor for a single text value — the account display name, and
 // (from Room Settings) a room's name or topic. Deliberately built from the most
 // basic iOS 6 primitives — a UITextField/UITextView and a Save bar button —
@@ -642,9 +593,9 @@ class TextEditVC: UIViewController, UITextFieldDelegate {
 // proven in RoomTimelineVC's image sending: source sheet -> UIImagePickerController
 // -> downscale -> JPEG -> POST /media/v3/upload -> content_uri.
 //
-// The caller MUST hold a strong reference for the whole flow: both
-// UIImagePickerController's and UIActionSheet's delegates are weak, so a helper
-// created as a local would be deallocated before the user picks anything.
+// The caller MUST hold a strong reference for the whole flow:
+// UIImagePickerController's delegate is weak, so a helper created as a local
+// would be deallocated before the user picks anything.
 final class AvatarPicker: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
 
     // (mxc, uploaded image, error) — mxc is nil when the user cancelled (error
@@ -664,36 +615,17 @@ final class AvatarPicker: NSObject, UIImagePickerControllerDelegate, UINavigatio
         super.init()
     }
 
-    func start(from presenter: UIViewController, anchor: UIView, completion: @escaping Completion) {
+    func start(from presenter: UIViewController, completion: @escaping Completion) {
         self.presenter = presenter
         self.completion = completion
 
-        let hasCamera = UIImagePickerController.isSourceTypeAvailable(.camera)
-#if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.title = "Photo"
-        if hasCamera { sheet.addButton(withTitle: "Take Photo") }
-        sheet.addButton(withTitle: "Choose from Library")
-        sheet.addButton(withTitle: "Cancel")
-        sheet.cancelButtonIndex = sheet.numberOfButtons - 1
-        sheet.delegate = self
-        sheet.show(in: anchor)
-#else
-        let sheet = UIAlertController(title: "Photo", message: nil, preferredStyle: .actionSheet)
-        if hasCamera {
-            sheet.addAction(UIAlertAction(title: "Take Photo", style: .default) { [weak self] _ in
-                self?.presentPicker(source: .camera)
-            })
+        let sheet = ActionSheet(title: "Photo")
+        if UIImagePickerController.isSourceTypeAvailable(.camera) {
+            sheet.add("Take Photo") { [weak self] in self?.presentPicker(source: .camera) }
         }
-        sheet.addAction(UIAlertAction(title: "Choose from Library", style: .default) { [weak self] _ in
-            self?.presentPicker(source: .photoLibrary)
-        })
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
-            self?.finish(nil, nil, nil)
-        })
-        sheet.popoverPresentationController?.sourceView = anchor
-        presenter.present(sheet, animated: true)
-#endif
+        sheet.add("Choose from Library") { [weak self] in self?.presentPicker(source: .photoLibrary) }
+        sheet.cancel { [weak self] in self?.finish(nil, nil, nil) }
+        sheet.present(in: presenter)
     }
 
     fileprivate func presentPicker(source: UIImagePickerController.SourceType) {
@@ -761,19 +693,6 @@ final class AvatarPicker: NSObject, UIImagePickerControllerDelegate, UINavigatio
         return result ?? image
     }
 }
-
-#if IOS6_TARGET
-extension AvatarPicker: UIActionSheetDelegate {
-    func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
-        if buttonIndex == actionSheet.cancelButtonIndex { finish(nil, nil, nil); return }
-        // Button 0 is "Take Photo" only when a camera exists; otherwise the first
-        // button is the library.
-        let hasCamera = UIImagePickerController.isSourceTypeAvailable(.camera)
-        if hasCamera && buttonIndex == 0 { presentPicker(source: .camera) }
-        else { presentPicker(source: .photoLibrary) }
-    }
-}
-#endif
 
 // Recovery key entry, and the first half of the E2EE recovery chain:
 //

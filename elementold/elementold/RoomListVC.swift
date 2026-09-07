@@ -63,9 +63,6 @@ class RoomListVC: UIViewController {
     private struct RoomFilter { let id: String; let label: String; let roomIds: Set<String> }
     private var filters: [RoomFilter] = []
     private var selectedFilterId: String?
-    // Options captured for the iOS 6 UIActionSheet delegate (index -> filter id).
-    private var pendingFilterOptions: [(label: String, id: String?)] = []
-    private let filterSheetTag = 91
 
     private let client: MatrixAPIClient
     private let syncEngine: SyncEngine
@@ -702,27 +699,14 @@ class RoomListVC: UIViewController {
         // index 0 = "All conversations", then one per bucket.
         var options: [(label: String, id: String?)] = [("All conversations", nil)]
         for f in filters { options.append((f.label, f.id)) }
-        pendingFilterOptions = options
-#if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.tag = filterSheetTag
-        for opt in options { sheet.addButton(withTitle: opt.label) }
-        sheet.addButton(withTitle: "Cancel")
-        sheet.cancelButtonIndex = options.count
-        sheet.delegate = self
-        sheet.show(in: view)
-#else
-        let sheet = UIAlertController(title: "Filter conversations", message: nil, preferredStyle: .actionSheet)
+
+        let sheet = ActionSheet(title: "Filter conversations")
         for opt in options {
-            sheet.addAction(UIAlertAction(title: opt.label, style: .default) { [weak self] _ in
-                self?.applyFilter(opt.id)
-            })
+            let id = opt.id
+            sheet.add(opt.label) { [weak self] in self?.applyFilter(id) }
         }
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        sheet.popoverPresentationController?.sourceView = filterButton
-        sheet.popoverPresentationController?.sourceRect = filterButton.bounds
-        present(sheet, animated: true)
-#endif
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
     private func applyFilter(_ id: String?) {
@@ -815,19 +799,6 @@ class RoomListVC: UIViewController {
         return false
     }
 }
-
-#if IOS6_TARGET
-extension RoomListVC: UIActionSheetDelegate {
-    func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
-        // The filter sheet is the only one left here: buttons map 1:1 to
-        // pendingFilterOptions; the trailing Cancel button is out of range and
-        // ignored.
-        if buttonIndex >= 0 && buttonIndex < pendingFilterOptions.count {
-            applyFilter(pendingFilterOptions[buttonIndex].id)
-        }
-    }
-}
-#endif
 
 extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
     func numberOfSections(in tableView: UITableView) -> Int {

@@ -281,12 +281,6 @@ class RoomTimelineVC: UIViewController {
     private let dateCellId = "DateCell"
     private let reactionsCellId = "ReactionsCell"
 
-    // Tags the emoji picker and the delete confirmation on the iOS 6 path, where
-    // one UIActionSheetDelegate serves them and the "+" attach sheet.
-    private let reactionSheetTag = 93
-    private let deleteSheetTag = 94
-    private let pendingSheetTag = 96
-
     // Offered by the long-press "React" menu item. All Unicode 6.0, so they
     // exist in the Apple Color Emoji font shipped with iOS 6.
     fileprivate static let quickReactions = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}",
@@ -660,25 +654,10 @@ class RoomTimelineVC: UIViewController {
     @objc private func deleteMenuTapped(_ sender: Any?) {
         guard pendingDeleteEventId != nil else { return }
         UIMenuController.shared.setMenuVisible(false, animated: true)
-        #if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.title = "Delete this message?"
-        sheet.delegate = self
-        sheet.tag = deleteSheetTag
-        sheet.destructiveButtonIndex = sheet.addButton(withTitle: "Delete")
-        sheet.cancelButtonIndex = sheet.addButton(withTitle: "Cancel")
-        sheet.show(in: view)
-        #else
-        let sheet = UIAlertController(title: "Delete this message?", message: nil,
-                                      preferredStyle: .actionSheet)
-        sheet.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
-            self?.deleteConfirmed()
-        })
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
-        sheet.popoverPresentationController?.sourceView = view
-        sheet.popoverPresentationController?.sourceRect = view.bounds
-        present(sheet, animated: true, completion: nil)
-        #endif
+        let sheet = ActionSheet(title: "Delete this message?")
+        sheet.addDestructive("Delete") { [weak self] in self?.deleteConfirmed() }
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
     // Deleting a message in Matrix means redacting it: the server strips the
@@ -700,26 +679,12 @@ class RoomTimelineVC: UIViewController {
     @objc private func reactMenuTapped(_ sender: Any?) {
         guard let target = pendingReactionEventId else { return }
         UIMenuController.shared.setMenuVisible(false, animated: true)
-        #if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.title = "React"
-        sheet.delegate = self
-        sheet.tag = reactionSheetTag
-        for key in RoomTimelineVC.quickReactions { sheet.addButton(withTitle: key) }
-        sheet.cancelButtonIndex = sheet.addButton(withTitle: "Cancel")
-        sheet.show(in: view)
-        #else
-        let sheet = UIAlertController(title: "React", message: nil, preferredStyle: .actionSheet)
+        let sheet = ActionSheet(title: "React")
         for key in RoomTimelineVC.quickReactions {
-            sheet.addAction(UIAlertAction(title: key, style: .default) { [weak self] _ in
-                self?.toggleReaction(target: target, key: key)
-            })
+            sheet.add(key) { [weak self] in self?.toggleReaction(target: target, key: key) }
         }
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
-        sheet.popoverPresentationController?.sourceView = view
-        sheet.popoverPresentationController?.sourceRect = view.bounds
-        present(sheet, animated: true, completion: nil)
-        #endif
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
     // Add the reaction, or take ours back if we already sent this one. Matrix has
@@ -1731,30 +1696,14 @@ class RoomTimelineVC: UIViewController {
         guard let message = pending.first(where: { $0.txnId == txnId }), message.state == .failed else { return }
         pendingActionTxnId = txnId
         let reason = message.errorText
-        #if IOS6_TARGET
-        let sheet = UIActionSheet()
-        // UIActionSheet has no separate message field, so the reason goes in the
-        // title under the headline.
-        sheet.title = reason == nil ? "Message not sent" : "Message not sent\n\(reason!)"
-        sheet.delegate = self
-        sheet.tag = pendingSheetTag
-        sheet.addButton(withTitle: "Try Again")
-        sheet.destructiveButtonIndex = sheet.addButton(withTitle: "Delete")
-        sheet.cancelButtonIndex = sheet.addButton(withTitle: "Cancel")
-        sheet.show(in: view)
-        #else
-        let sheet = UIAlertController(title: "Message not sent", message: reason, preferredStyle: .actionSheet)
-        sheet.addAction(UIAlertAction(title: "Try Again", style: .default) { [weak self] _ in
-            self?.retryPending()
-        })
-        sheet.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
-            self?.discardPending()
-        })
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
-        sheet.popoverPresentationController?.sourceView = view
-        sheet.popoverPresentationController?.sourceRect = view.bounds
-        present(sheet, animated: true, completion: nil)
-        #endif
+        // The reason goes in the title under the headline: the sheet has no
+        // separate message field, but its title label wraps.
+        let title = reason == nil ? "Message not sent" : "Message not sent\n\(reason!)"
+        let sheet = ActionSheet(title: title)
+        sheet.add("Try Again") { [weak self] in self?.retryPending() }
+        sheet.addDestructive("Delete") { [weak self] in self?.discardPending() }
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
     private func retryPending() {
@@ -4096,32 +4045,6 @@ extension RoomTimelineVC: UIImagePickerControllerDelegate, UINavigationControlle
     }
 }
 
-#if IOS6_TARGET
-extension RoomTimelineVC: UIActionSheetDelegate {
-    func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
-        if actionSheet.tag == reactionSheetTag {
-            guard buttonIndex != actionSheet.cancelButtonIndex,
-                  let key = actionSheet.buttonTitle(at: buttonIndex),
-                  let target = pendingReactionEventId else { return }
-            toggleReaction(target: target, key: key)
-            return
-        }
-        if actionSheet.tag == deleteSheetTag {
-            if buttonIndex == actionSheet.destructiveButtonIndex { deleteConfirmed() }
-            return
-        }
-        if actionSheet.tag == pendingSheetTag {
-            if buttonIndex == actionSheet.destructiveButtonIndex {
-                discardPending()
-            } else if buttonIndex != actionSheet.cancelButtonIndex {
-                retryPending()
-            }
-            return
-        }
-    }
-}
-#endif
-
 extension RoomTimelineVC: AVAudioRecorderDelegate {
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
         if !flag {
@@ -4432,9 +4355,8 @@ class RoomSettingsVC: UIViewController, UITableViewDataSource, UITableViewDelega
     private var tableView: UITableView!
     private let cellId = "RoomSettingCell"
     // Strongly held for the duration of the pick+upload: UIImagePickerController's
-    // and UIActionSheet's delegates are both weak.
+    // delegate is weak.
     private var avatarPicker: AvatarPicker?
-    private let leaveSheetTag = 95
 
     init(room: Room, client: MatrixAPIClient) {
         self.room = room
@@ -4579,7 +4501,7 @@ class RoomSettingsVC: UIViewController, UITableViewDataSource, UITableViewDelega
     private func pickPhoto() {
         let picker = AvatarPicker(client: client)
         avatarPicker = picker
-        picker.start(from: self, anchor: view) { [weak self] mxc, _, error in
+        picker.start(from: self) { [weak self] mxc, _, error in
             guard let self = self else { return }
             self.avatarPicker = nil
             guard let mxc = mxc else {
@@ -4621,27 +4543,13 @@ class RoomSettingsVC: UIViewController, UITableViewDataSource, UITableViewDelega
 
     private func confirmLeave() {
         let message = "You'll stop receiving messages from this room. You'll need a new invite to rejoin."
-#if IOS6_TARGET
-        let sheet = UIActionSheet()
-        sheet.title = message
-        sheet.addButton(withTitle: "Leave Room")   // index 0 (destructive)
-        sheet.addButton(withTitle: "Cancel")       // index 1
-        sheet.destructiveButtonIndex = 0
-        sheet.cancelButtonIndex = 1
-        sheet.tag = leaveSheetTag
-        sheet.delegate = self
-        sheet.show(in: view)
-#else
-        let alert = UIAlertController(title: "Leave room?", message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Leave Room", style: .destructive) { [weak self] _ in
-            self?.performLeave()
-        })
-        present(alert, animated: true)
-#endif
+        let sheet = ActionSheet(title: "Leave room?\n" + message)
+        sheet.addDestructive("Leave Room") { [weak self] in self?.performLeave() }
+        sheet.cancel()
+        sheet.present(in: self)
     }
 
-    fileprivate func performLeave() {
+    private func performLeave() {
         client.post("/_matrix/client/v3/rooms/\(room.roomId)/leave", body: [:]) { [weak self] _, error in
             guard let self = self else { return }
             if let error = error {
@@ -4668,16 +4576,6 @@ class RoomSettingsVC: UIViewController, UITableViewDataSource, UITableViewDelega
 #endif
     }
 }
-
-#if IOS6_TARGET
-extension RoomSettingsVC: UIActionSheetDelegate {
-    func actionSheet(_ actionSheet: UIActionSheet, clickedButtonAt buttonIndex: Int) {
-        guard actionSheet.tag == leaveSheetTag,
-              buttonIndex == actionSheet.destructiveButtonIndex else { return }
-        performLeave()
-    }
-}
-#endif
 
 private extension String {
     // Pure-Swift whitespace trim (no Foundation CharacterSet — iOS-6-safe rule).
