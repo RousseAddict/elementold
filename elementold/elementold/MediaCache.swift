@@ -717,11 +717,18 @@ class MediaCache {
         return sanitize("\(server)_\(mediaId)_\(width)x\(height)")
     }
 
+    // Hoisted out of sanitize(): building this Set from the literal allocates one
+    // Character per element and hashes each, and sanitize() sits on the avatar /
+    // thumbnail / attachment hot path (via cacheKey and fileName), so it ran per
+    // row per reload.
+    private static let allowedFileNameChars =
+        Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
     // Reduces an arbitrary string to a safe flat filename. Avoids CharacterSet
     // convenience APIs (some are unreliable on the swapped 5.1.5 runtime) — a
     // hand-rolled allow-list over Characters uses only Swift stdlib.
     private func sanitize(_ s: String) -> String {
-        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+        let allowed = MediaCache.allowedFileNameChars
         return String(s.map { allowed.contains($0) ? $0 : "_" })
     }
 }
@@ -736,6 +743,8 @@ class AvatarView: UIView {
     private let imageView = UIImageView()
     private let initialsLabel = UILabel()
     private var currentMxc: String?
+    private var currentName: String?
+    private var currentFontSize: CGFloat = 0
 
     // Thumbnail pixel size requested from the server — comfortably covers the
     // largest on-screen avatar (room-list 40pt @2x, timeline nav ~30pt, sender
@@ -776,7 +785,14 @@ class AvatarView: UIView {
         layer.cornerRadius = bounds.width / 2
         imageView.frame = bounds
         initialsLabel.frame = bounds
-        initialsLabel.font = UIFont.boldSystemFont(ofSize: max(9, bounds.width * 0.42))
+        // Resolving a font is not free, and layout runs on every reload; the size
+        // only changes when the view is resized, which for these fixed-size
+        // avatars is essentially never.
+        let size = max(9, bounds.width * 0.42)
+        if size != currentFontSize {
+            currentFontSize = size
+            initialsLabel.font = UIFont.boldSystemFont(ofSize: size)
+        }
     }
 
     func setAvatar(mxc: String?, name: String) {
@@ -787,7 +803,13 @@ class AvatarView: UIView {
         // request costs a disk read plus a decode, and the view visibly flashes
         // back to initials in the meantime.
         if let mxc = mxc, !mxc.isEmpty, mxc == currentMxc, imageView.image != nil { return }
+        // Same bail-out for the no-avatar case: rebuilding the initials string and
+        // re-hashing the name for the palette colour is pure waste when the
+        // placeholder already on screen was built from this exact name.
+        if (mxc ?? "").isEmpty, (currentMxc ?? "").isEmpty,
+           imageView.image == nil, name == currentName { return }
         currentMxc = mxc
+        currentName = name
         // Placeholder first (shown while loading, and permanently if no mxc).
         initialsLabel.text = AvatarView.initials(from: name)
         backgroundColor = AvatarView.color(for: name)

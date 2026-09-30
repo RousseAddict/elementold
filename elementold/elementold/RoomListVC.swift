@@ -442,24 +442,27 @@ class RoomListVC: UIViewController {
         // Only worth recomputing (a pass over every Room) when a count moved.
         let totalUnread = contentChanged ? totalUnreadCount() : nil
         let needsReload = contentChanged || orderChanged || filtersChanged || invitesChanged || firstSync
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            if self.isCatchingUp { self.setCatchingUp(false) }
-            // A previous failure may have left the "Sync error" title up; this
-            // response proves it's over. Guarded on the error flag rather than
-            // set unconditionally because /sync can land several times a second.
-            else if self.lastErrorText != nil { self.title = "Chats" }
-            self.lastErrorText = nil
-            self.finishRefresh()
-            if needsReload {
-                self.tableView.reloadData()
-                self.hideListHeaderIfNeeded()
-                self.updateStatusLabel()
-                self.updateFilterControl()
-            }
-            if let totalUnread = totalUnread {
-                UIApplication.shared.applicationIconBadgeNumber = totalUnread
-            }
+
+        // No main-thread hop: CurlFetcher wraps every completion in a main
+        // DispatchQueue.async, and HTTPClient / MatrixAPIClient.parse call through
+        // synchronously, so the whole /sync listener fan-out already runs on main.
+        // Hopping again only deferred this work by a runloop turn — at up to four
+        // syncs a second that was a visible extra frame of latency per response.
+        if isCatchingUp { setCatchingUp(false) }
+        // A previous failure may have left the "Sync error" title up; this
+        // response proves it's over. Guarded on the error flag rather than
+        // set unconditionally because /sync can land several times a second.
+        else if lastErrorText != nil { title = "Chats" }
+        lastErrorText = nil
+        finishRefresh()
+        if needsReload {
+            tableView.reloadData()
+            hideListHeaderIfNeeded()
+            updateStatusLabel()
+            updateFilterControl()
+        }
+        if let totalUnread = totalUnread {
+            UIApplication.shared.applicationIconBadgeNumber = totalUnread
         }
     }
 

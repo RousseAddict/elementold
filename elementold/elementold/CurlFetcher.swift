@@ -272,7 +272,6 @@ class CurlFetcher {
             lastFailure = CurlFetcher.describe(rc)
             return nil
         }
-        let code = curl_bridge_response_code(h)
         // Body returned regardless of status: Matrix errors (4xx/5xx) carry a
         // JSON {errcode,error} body that MatrixAPIClient.parse() needs to read.
         // Masking non-2xx here previously turned real server errors into a
@@ -310,7 +309,6 @@ class CurlFetcher {
             lastFailure = CurlFetcher.describe(rc)
             return nil
         }
-        let code = curl_bridge_response_code(h)
         // Body returned regardless of status: Matrix errors (4xx/5xx) carry a
         // JSON {errcode,error} body that MatrixAPIClient.parse() needs to read.
         // Masking non-2xx here previously turned real server errors into a
@@ -348,7 +346,6 @@ class CurlFetcher {
             lastFailure = CurlFetcher.describe(rc)
             return nil
         }
-        let code = curl_bridge_response_code(h)
         // Body returned regardless of status: Matrix errors (4xx/5xx) carry a
         // JSON {errcode,error} body that MatrixAPIClient.parse() needs to read.
         // Masking non-2xx here previously turned real server errors into a

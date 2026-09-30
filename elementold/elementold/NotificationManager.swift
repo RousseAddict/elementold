@@ -41,9 +41,10 @@ final class NotificationManager {
     // the current response would leave us with nothing to resolve. Both come
     // from one Room lookup.
     //
-    // Called on the /sync thread, right after RoomListVC has merged this
-    // response into its rooms: its update listener is registered before ours and
-    // they run in order on the same thread, so the names are already current.
+    // Called on the main thread (CurlFetcher marshals every completion there), right
+    // after RoomListVC has merged this response into its rooms: its update listener
+    // is registered before ours and they run in order, so the names are already
+    // current.
     var contextResolver: ((_ roomId: String, _ userId: String) -> (sender: String?, room: String?))?
 
     private var bgTask: UIBackgroundTaskIdentifier = UIBackgroundTaskIdentifier.invalid
@@ -138,11 +139,12 @@ final class NotificationManager {
     // Posts only while enabled AND backgrounded, and never on the cold-start
     // initial sync (which replays already-read history — see Room.parse).
     //
-    // ⚠️ This runs on CurlFetcher's BACKGROUND queue (the /sync completion thread),
-    // NOT the main thread. Parsing the [String: Any] dictionaries here is fine, but
-    // EVERY UIApplication / UILocalNotification call must be marshalled to the main
-    // thread: doing UIKit work off-main on this iOS 6 runtime crashed SpringBoard
-    // (device respring / boot-logo, no app crash log). Collect first, post on main.
+    // ⚠️ The main hop below is load-bearing and must stay. This method itself now
+    // runs on the main thread (CurlFetcher wraps every completion in a main
+    // DispatchQueue.async), but that guarantee lives in another file: if the
+    // transport ever stops marshalling, doing UIKit work off-main on this iOS 6
+    // runtime crashes SpringBoard (device respring / boot-logo, no app crash log).
+    // Collect first, post on main.
     func handleSync(_ json: [String: Any], isInitial: Bool) {
         guard NotificationManager.isEnabled, isBackground, !isInitial else { return }
         let selfId = MatrixSession.userId
