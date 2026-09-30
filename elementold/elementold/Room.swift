@@ -61,8 +61,26 @@ struct Room {
     // only while we've never seen the state event.
     var topic: String?
 
+    // Encryption algorithm from m.room.encryption state (`content.algorithm`),
+    // e.g. "m.megolm.v1.aes-sha2". nil means the room is not encrypted.
+    //
+    // The algorithm is kept rather than a bare Bool so a room using something
+    // other than megolm can be told apart later. Encryption is one-way and
+    // permanent per spec: once the state event exists it is never removed, so
+    // this is only ever set, never cleared.
+    //
+    // Like every other state-derived field this MUST be persisted (see
+    // RoomStore): an incremental sync only returns rooms that changed, and the
+    // server sends m.room.encryption once. Drop it and a quiet encrypted room
+    // comes back looking unencrypted forever.
+    var encryptionAlgorithm: String?
+
     // Convenience: this room is a Matrix space (grouping container, no timeline).
     var isSpace: Bool { return roomType == "m.space" }
+
+    // Convenience: this room requires m.room.encrypted events. We can decrypt
+    // (see E2EEDecryptor) but cannot yet encrypt, so sending is blocked here.
+    var isEncrypted: Bool { return encryptionAlgorithm != nil }
 
     private static let maxBufferedEvents = 50
 
@@ -82,6 +100,7 @@ struct Room {
         var bridgeNetwork = existing?.bridgeNetwork
         var bridgeAvatarMxc = existing?.bridgeAvatarMxc
         var topic = existing?.topic
+        var encryptionAlgorithm = existing?.encryptionAlgorithm
         var explicitAvatarFound = existing?.avatarMxc != nil
         var fallbackMemberName: String?
         var fallbackMemberAvatar: String?
@@ -98,6 +117,14 @@ struct Room {
                 explicitAvatarFound = true
             } else if type == "m.room.topic", let t = content["topic"] as? String {
                 topic = t
+            } else if type == "m.room.encryption" {
+                // Enabling encryption is permanent, so this is only ever set.
+                // considerStateEvent runs over timeline events too, so a room
+                // that gets encrypted mid-session is picked up without a
+                // restart.
+                if let algorithm = content["algorithm"] as? String, !algorithm.isEmpty {
+                    encryptionAlgorithm = algorithm
+                }
             } else if type == "m.room.create" {
                 // Space detection: m.room.create carries the room's type.
                 if let t = content["type"] as? String, !t.isEmpty { roomType = t }
@@ -220,7 +247,7 @@ struct Room {
                     unreadCount: unreadCount,
                     roomType: roomType, spaceChildren: spaceChildren,
                     bridgeNetwork: bridgeNetwork, bridgeAvatarMxc: bridgeAvatarMxc,
-                    topic: topic)
+                    topic: topic, encryptionAlgorithm: encryptionAlgorithm)
     }
 }
 
@@ -255,7 +282,14 @@ final class RoomStore {
     // Bumped whenever the encoding below changes. A file written by a different
     // version is discarded whole rather than half-read; the only cost is one
     // full sync.
-    private static let version = 1
+    //
+    // 2: added `encryption`. Unlike a REMOVED key (see prevBatch below), a new
+    // state-derived key cannot be tolerated by reading an old file: the missing
+    // value would be indistinguishable from "not encrypted", and since resuming
+    // from a snapshot means an INCREMENTAL sync — which never re-sends state —
+    // every already-known encrypted room would look unencrypted forever. One
+    // discarded snapshot, one full sync, once.
+    private static let version = 2
 
     // Documents, not Caches: iOS evicts Caches at will and MediaCache's own
     // 100MB oldest-first trim lives there. Losing the file is *safe* — it just
@@ -407,6 +441,7 @@ final class RoomStore {
         if let v = room.bridgeNetwork { d["bridge"] = v }
         if let v = room.bridgeAvatarMxc { d["bridgeAvatar"] = v }
         if let v = room.topic { d["topic"] = v }
+        if let v = room.encryptionAlgorithm { d["encryption"] = v }
         return d
     }
 
@@ -428,7 +463,8 @@ final class RoomStore {
                     spaceChildren: Set(stringArray(d["children"])),
                     bridgeNetwork: d["bridge"] as? String,
                     bridgeAvatarMxc: d["bridgeAvatar"] as? String,
-                    topic: d["topic"] as? String)
+                    topic: d["topic"] as? String,
+                    encryptionAlgorithm: d["encryption"] as? String)
     }
 
     private static func encodeInvite(_ invite: Invitation) -> [String: Any] {

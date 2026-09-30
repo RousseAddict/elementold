@@ -33,6 +33,16 @@ class RoomTimelineVC: UIViewController {
     private var sendButton: UIButton!
     private var attachButton: UIButton!
     private var statusLabel: UILabel!
+    // Shown in place of the whole composer in an encrypted room. We can decrypt
+    // (see E2EEDecryptor) but cannot yet encrypt, and a plaintext m.room.message
+    // sent into an encrypted room is rejected by the server/bridge — so the
+    // controls are hidden rather than left to fail after the user has typed.
+    private var encryptedNoticeLabel: UILabel!
+
+    // Encrypted rooms are read-only for now. Every composer control is still
+    // BUILT (roughly a dozen call sites dereference messageField/sendButton
+    // unconditionally) — they are just hidden and their entry points gated.
+    private var isReadOnly: Bool { return room.isEncrypted }
 
     // Auto-growing input geometry. The field grows from one line up to
     // `inputMaxHeight` (then scrolls internally); the bar height tracks it, with
@@ -253,8 +263,9 @@ class RoomTimelineVC: UIViewController {
         // from a dropped connection.
         var errorText: String? = nil
     }
-    // Strictly main-thread: handleSync runs off the sync thread, so it matches
-    // ids there but mutates this inside its existing main-queue hop.
+    // Strictly main-thread. That holds without any explicit hop: CurlFetcher
+    // marshals every completion to main, so both the send callbacks and the
+    // /sync listener fan-out that retires these entries already run there.
     private var pending: [PendingMessage] = []
     // Only one send is in flight at a time. Not for the UI's sake — the input is
     // free the whole time — but because Synapse orders events by receipt, so
@@ -597,6 +608,9 @@ class RoomTimelineVC: UIViewController {
     // input bar and remembers the target's sender + one-line preview, which the
     // outbound reply fallback quotes (see sendTapped).
     private func beginReply(to eventId: String) {
+        // Nothing can be sent from an encrypted room yet, and beginReply focuses
+        // the composer — which is hidden here.
+        guard !isReadOnly else { return }
         // Voice mode has its own controls and send path, and replying is a text
         // action — drop out of it first.
         if inputMode == .voice { exitVoiceMode() }
@@ -1000,6 +1014,19 @@ class RoomTimelineVC: UIViewController {
         voiceRecordButton.isHidden = true
         inputBar.addSubview(voiceRecordButton)
 
+        // Read-only notice, shown in place of every control above when the room is
+        // encrypted. Built unconditionally (like the voice controls) so nothing has
+        // to test for nil; layoutInputBar decides which set is visible.
+        encryptedNoticeLabel = UILabel(frame: .zero)
+        encryptedNoticeLabel.text = "This room is encrypted \u{2014} sending isn't supported yet"
+        encryptedNoticeLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
+        encryptedNoticeLabel.font = UIFont.italicSystemFont(ofSize: 13)
+        encryptedNoticeLabel.textColor = .gray
+        encryptedNoticeLabel.textAlignment = .center
+        encryptedNoticeLabel.numberOfLines = 2
+        encryptedNoticeLabel.isHidden = true
+        inputBar.addSubview(encryptedNoticeLabel)
+
         view.addSubview(inputBar)
         currentFieldHeight = inputMinHeight
         layoutInputBar()
@@ -1021,7 +1048,25 @@ class RoomTimelineVC: UIViewController {
         sendButton.frame = CGRect(x: barWidth - hMargin - sendWidth, y: buttonY,
                                   width: sendWidth, height: buttonH)
 
-        if inputMode == .voice {
+        if isReadOnly {
+            // Encrypted room: every control is hidden and the notice takes the whole
+            // bar. The strips below (reply/upload/typing) and the table height still
+            // fall through to the shared code at the end of this method.
+            attachButton.isHidden = true
+            messageField.isHidden = true
+            placeholderLabel.isHidden = true
+            sendButton.isHidden = true
+            if voiceCancelButton != nil { voiceCancelButton.isHidden = true }
+            if voiceRecordButton != nil { voiceRecordButton.isHidden = true }
+            if encryptedNoticeLabel != nil {
+                encryptedNoticeLabel.isHidden = false
+                encryptedNoticeLabel.frame = CGRect(x: hMargin, y: 0,
+                                                    width: max(0, barWidth - hMargin * 2),
+                                                    height: barHeight)
+            }
+        } else if inputMode == .voice {
+            sendButton.isHidden = false
+            if encryptedNoticeLabel != nil { encryptedNoticeLabel.isHidden = true }
             attachButton.isHidden = true
             messageField.isHidden = true
             placeholderLabel.isHidden = true
@@ -1033,6 +1078,8 @@ class RoomTimelineVC: UIViewController {
             let recW = (barWidth - hMargin - sendWidth - hSpacing) - recX
             voiceRecordButton.frame = CGRect(x: recX, y: buttonY, width: max(0, recW), height: buttonH)
         } else {
+            sendButton.isHidden = false
+            if encryptedNoticeLabel != nil { encryptedNoticeLabel.isHidden = true }
             attachButton.isHidden = false
             messageField.isHidden = false
             if voiceCancelButton != nil { voiceCancelButton.isHidden = true }
@@ -1199,16 +1246,27 @@ class RoomTimelineVC: UIViewController {
               let join = rooms["join"] as? [String: Any],
               let roomJSON = join[room.roomId] as? [String: Any] else { return }
 
-        // Member profiles (display name / avatar) from state + timeline.
-        if let state = roomJSON["state"] as? [String: Any],
-           let stateEvents = state["events"] as? [[String: Any]] {
-            updateMembers(from: stateEvents)
+        var timelineEvents: [[String: Any]]? = nil
+        if let timeline = roomJSON["timeline"] as? [String: Any] {
+            timelineEvents = timeline["events"] as? [[String: Any]]
         }
 
+        // Member profiles (display name / avatar) arrive in both the state block
+        // and the timeline. Merged in ONE pass rather than one call per source.
+        // State first, timeline second, so the newer timeline copy still wins on
+        // a conflict — the merge order is what it always was.
+        var memberSource: [[String: Any]] = []
+        if let state = roomJSON["state"] as? [String: Any],
+           let stateEvents = state["events"] as? [[String: Any]] {
+            memberSource = stateEvents
+        }
+        if let rawEvents = timelineEvents {
+            if memberSource.isEmpty { memberSource = rawEvents } else { memberSource += rawEvents }
+        }
+        if !memberSource.isEmpty { updateMembers(from: memberSource) }
+
         var newOnes: [RoomEvent] = []
-        if let timeline = roomJSON["timeline"] as? [String: Any],
-           let rawEvents = timeline["events"] as? [[String: Any]] {
-            updateMembers(from: rawEvents)
+        if let rawEvents = timelineEvents {
             let parsed = rawEvents.compactMap { RoomEvent.parse($0) }
             newOnes = parsed.filter { !seenEventIds.contains($0.eventId) }
             newOnes.forEach { noteIngested($0) }
@@ -1242,20 +1300,19 @@ class RoomTimelineVC: UIViewController {
             default: return true
             }
         }
+        // No main-thread hop: CurlFetcher wraps every completion in a main
+        // DispatchQueue.async and the listener fan-out runs synchronously inside
+        // it, so this handler is already on main. Hopping again only deferred the
+        // redraw by a runloop turn, four times a second while someone is typing.
+        // `pending` is still only ever touched from main (here and the composer).
         if tableChanged || typingChanged {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                // Retiring a queued message has to happen on the main thread with
-                // the rest of the UI work — `pending` is only ever touched here
-                // and from the composer, both on main.
-                if !newOnes.isEmpty { self.retirePending(matching: newOnes) }
-                if tableChanged {
-                    self.reloadTable()
-                    self.updateStatusLabel()
-                    if hasNewMessages { self.scrollToBottom(animated: true) }
-                }
-                if typingChanged { self.updateTypingIndicator() }
+            if !newOnes.isEmpty { retirePending(matching: newOnes) }
+            if tableChanged {
+                reloadTable()
+                updateStatusLabel()
+                if hasNewMessages { scrollToBottom(animated: true) }
             }
+            if typingChanged { updateTypingIndicator() }
         }
         if hasNewMessages, let latest = events.last(where: { event in
             switch event.kind {
@@ -1410,7 +1467,7 @@ class RoomTimelineVC: UIViewController {
                 continue
             }
             if keyCounts[target]?[key] == nil {
-                keyOrder[target] = (keyOrder[target] ?? []) + [key]
+                keyOrder[target, default: []].append(key)
             }
             keyCounts[target, default: [:]][key, default: 0] += 1
             if sender == selfUserId {
@@ -1433,7 +1490,7 @@ class RoomTimelineVC: UIViewController {
                 let merged = max(live, adjusted)
                 guard merged > 0 else { continue }
                 if keyCounts[target]?[bundled.key] == nil {
-                    keyOrder[target] = (keyOrder[target] ?? []) + [bundled.key]
+                    keyOrder[target, default: []].append(bundled.key)
                 }
                 keyCounts[target, default: [:]][bundled.key] = merged
             }
@@ -1592,6 +1649,9 @@ class RoomTimelineVC: UIViewController {
     // appears at the bottom, and the user can carry on typing while earlier
     // messages are still on the wire.
     @objc private func sendTapped() {
+        // An encrypted room rejects a plaintext m.room.message outright, so there
+        // is nothing to queue. The button is hidden too; this is the backstop.
+        guard !isReadOnly else { return }
         if inputMode == .voice { sendVoiceMessage(); return }
         guard let text = messageField.text, !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         // A media upload still holds the old lock (one shared progress strip
@@ -1774,6 +1834,9 @@ class RoomTimelineVC: UIViewController {
     // MARK: - Image attach / upload / send
 
     @objc private func attachTapped() {
+        // Encrypted media would need an encrypted `content.file`, which we can't
+        // produce; the plaintext mxc:// form is rejected like any other message.
+        guard !isReadOnly else { return }
         messageField.resignFirstResponder()
         let hasCamera = UIImagePickerController.isSourceTypeAvailable(.camera)
         let sheet = ActionSheet(title: "Attach")
@@ -2089,6 +2152,7 @@ class RoomTimelineVC: UIViewController {
     // `requestRecordPermission` is an iOS 7+ selector (crash risk on the iOS 6
     // runtime); iOS 7-9 auto-prompt on record start and iOS 6 needs no prompt.
     private func enterVoiceMode() {
+        guard !isReadOnly else { return }
         guard inputMode == .text else { return }
         // Replying is a text-mode action, so drop any queued reply rather than
         // leave the strip claiming a voice note will answer it.
