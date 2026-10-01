@@ -5,6 +5,12 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
+#include <openssl/rand.h>
+
+int crypto_random_bytes(uint8_t *out, size_t len) {
+    if (!out || len == 0) return -1;
+    return RAND_bytes(out, (int)len) == 1 ? 0 : -2;
+}
 
 int crypto_sha256(const uint8_t *data, size_t len, uint8_t *out32) {
     if (!out32 || (len > 0 && !data)) return -1;
@@ -94,6 +100,25 @@ int crypto_aes256_cbc_decrypt(const uint8_t *key32, const uint8_t *iv16,
     return rc;
 }
 
+int crypto_aes256_cbc_encrypt(const uint8_t *key32, const uint8_t *iv16,
+                              const uint8_t *in, size_t len,
+                              uint8_t *out, size_t *out_len) {
+    if (!key32 || !iv16 || !in || !out || !out_len) return -1;
+    if (len == 0) return -2;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -3;
+    int rc = -4;
+    int written = 0, finalWritten = 0;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key32, iv16) == 1 &&
+        EVP_EncryptUpdate(ctx, out, &written, in, (int)len) == 1 &&
+        EVP_EncryptFinal_ex(ctx, out + written, &finalWritten) == 1) {
+        *out_len = (size_t)written + (size_t)finalWritten;
+        rc = 0;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    return rc;
+}
+
 int crypto_x25519(const uint8_t *private32, const uint8_t *peer_public32,
                   uint8_t *out_shared32) {
     if (!private32 || !peer_public32 || !out_shared32) return -1;
@@ -147,5 +172,39 @@ int crypto_ed25519_verify(const uint8_t *public32,
         EVP_MD_CTX_free(ctx);
     }
     EVP_PKEY_free(pub);
+    return rc;
+}
+
+int crypto_ed25519_sign(const uint8_t *private32,
+                        const uint8_t *msg, size_t msg_len,
+                        uint8_t *out_sig64) {
+    if (!private32 || !out_sig64 || (msg_len > 0 && !msg)) return -1;
+    EVP_PKEY *priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, private32, 32);
+    if (!priv) return -2;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    int rc = -3;
+    if (ctx) {
+        size_t len = 64;
+        /* One-shot, same as verify: EVP_DigestSign, never Update. */
+        if (EVP_DigestSignInit(ctx, NULL, NULL, NULL, priv) == 1 &&
+            EVP_DigestSign(ctx, out_sig64, &len, msg, msg_len) == 1 &&
+            len == 64) {
+            rc = 0;
+        } else {
+            rc = -4;
+        }
+        EVP_MD_CTX_free(ctx);
+    }
+    EVP_PKEY_free(priv);
+    return rc;
+}
+
+int crypto_ed25519_public(const uint8_t *private32, uint8_t *out_public32) {
+    if (!private32 || !out_public32) return -1;
+    EVP_PKEY *priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, private32, 32);
+    if (!priv) return -2;
+    size_t len = 32;
+    int rc = (EVP_PKEY_get_raw_public_key(priv, out_public32, &len) == 1 && len == 32) ? 0 : -3;
+    EVP_PKEY_free(priv);
     return rc;
 }

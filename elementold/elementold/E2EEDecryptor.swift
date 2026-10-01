@@ -121,6 +121,15 @@ enum Base58 {
 // from the server, and both are handled the same way.
 enum Crypto {
 
+    // Every secret we generate starts here. Unlike the rest of this enum a nil
+    // is not "wrong key / bad data" but "the CSPRNG failed", so callers must
+    // abandon whatever they were generating rather than substitute anything.
+    static func randomBytes(_ count: Int) -> [UInt8]? {
+        guard count > 0 else { return nil }
+        var out = [UInt8](repeating: 0, count: count)
+        return crypto_random_bytes(&out, count) == 0 ? out : nil
+    }
+
     static func sha256(_ data: [UInt8]) -> [UInt8]? {
         var out = [UInt8](repeating: 0, count: 32)
         let rc = data.withUnsafeBufferPointer { input in
@@ -187,6 +196,25 @@ enum Crypto {
         return Array(out[0..<written])
     }
 
+    // PKCS7 padding is always added, so the ciphertext is longer than the
+    // plaintext even when the plaintext is already a whole number of blocks.
+    static func aes256CBCEncrypt(key: [UInt8], iv: [UInt8], data: [UInt8]) -> [UInt8]? {
+        guard key.count == 32, iv.count == 16, !data.isEmpty else { return nil }
+        var out = [UInt8](repeating: 0, count: data.count + 16)
+        var written = 0
+        let rc = key.withUnsafeBufferPointer { k in
+            iv.withUnsafeBufferPointer { v in
+                data.withUnsafeBufferPointer { d in
+                    crypto_aes256_cbc_encrypt(k.baseAddress, v.baseAddress,
+                                              d.baseAddress, data.count,
+                                              &out, &written)
+                }
+            }
+        }
+        guard rc == 0, written <= out.count else { return nil }
+        return Array(out[0..<written])
+    }
+
     static func x25519(privateKey: [UInt8], peerPublicKey: [UInt8]) -> [UInt8]? {
         guard privateKey.count == 32, peerPublicKey.count == 32 else { return nil }
         var out = [UInt8](repeating: 0, count: 32)
@@ -217,6 +245,26 @@ enum Crypto {
             }
         }
         return rc == 0
+    }
+
+    static func ed25519Sign(privateKey: [UInt8], message: [UInt8]) -> [UInt8]? {
+        guard privateKey.count == 32 else { return nil }
+        var out = [UInt8](repeating: 0, count: 64)
+        let rc = privateKey.withUnsafeBufferPointer { p in
+            message.withUnsafeBufferPointer { m in
+                crypto_ed25519_sign(p.baseAddress, m.baseAddress, message.count, &out)
+            }
+        }
+        return rc == 0 ? out : nil
+    }
+
+    static func ed25519PublicKey(privateKey: [UInt8]) -> [UInt8]? {
+        guard privateKey.count == 32 else { return nil }
+        var out = [UInt8](repeating: 0, count: 32)
+        let rc = privateKey.withUnsafeBufferPointer { p in
+            crypto_ed25519_public(p.baseAddress, &out)
+        }
+        return rc == 0 ? out : nil
     }
 }
 
@@ -488,5 +536,121 @@ final class E2EEDecryptor {
             shift += 7
         }
         return nil
+    }
+}
+
+// Matrix canonical JSON: UTF-8, no whitespace, object keys sorted by Unicode
+// codepoint, integers only. This is the exact byte string that gets signed, so
+// anything we cannot encode faithfully returns nil rather than a guess — a
+// wrong byte here produces a signature every other client rejects.
+//
+// JSONSerialization.sortedKeys would do the sorting for us but is iOS 11+.
+enum CanonicalJSON {
+
+    static func bytes(_ value: Any) -> [UInt8]? {
+        guard let text = encode(value) else { return nil }
+        return Array(text.utf8)
+    }
+
+    static func encode(_ value: Any) -> String? {
+        var out = ""
+        return write(value, into: &out) ? out : nil
+    }
+
+    private static func write(_ value: Any, into out: inout String) -> Bool {
+        if value is NSNull { out += "null"; return true }
+
+        if let dict = value as? [String: Any] {
+            out += "{"
+            var first = true
+            // Sorting by UTF-8 bytes, not by String's <, which compares using
+            // canonical equivalence rather than codepoint order. UTF-8 byte
+            // order and codepoint order agree, so this is the spec's ordering.
+            let keys = dict.keys.sorted { a, b in
+                Array(a.utf8).lexicographicallyPrecedes(Array(b.utf8))
+            }
+            for key in keys {
+                if !first { out += "," }
+                first = false
+                writeString(key, into: &out)
+                out += ":"
+                guard write(dict[key] as Any, into: &out) else { return false }
+            }
+            out += "}"
+            return true
+        }
+
+        if let array = value as? [Any] {
+            out += "["
+            var first = true
+            for element in array {
+                if !first { out += "," }
+                first = false
+                guard write(element, into: &out) else { return false }
+            }
+            out += "]"
+            return true
+        }
+
+        if let string = value as? String {
+            writeString(string, into: &out)
+            return true
+        }
+
+        if let number = value as? NSNumber {
+            // A Swift Bool bridges to __NSCFBoolean, which is an NSNumber, so
+            // this test has to come before the integer branch or true/false
+            // would be written as 1/0.
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                out += number.boolValue ? "true" : "false"
+                return true
+            }
+            // Canonical JSON has no floats. Rounding would silently sign
+            // something other than what we were handed, so refuse instead.
+            let intValue = number.int64Value
+            guard Double(intValue) == number.doubleValue else { return false }
+            out += String(intValue)
+            return true
+        }
+
+        return false
+    }
+
+    private static func writeString(_ value: String, into out: inout String) {
+        out += "\""
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    out += "\\u"
+                    var digits = ""
+                    var remaining = scalar.value
+                    for _ in 0..<4 {
+                        let nibble = remaining & 0xF
+                        digits = String(hexDigit(UInt8(nibble))) + digits
+                        remaining >>= 4
+                    }
+                    out += digits
+                } else {
+                    // Everything else, including non-ASCII, goes out raw: the
+                    // encoding is UTF-8, so no \u escaping is needed.
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        out += "\""
+    }
+
+    private static func hexDigit(_ value: UInt8) -> Character {
+        let table: [Character] = ["0", "1", "2", "3", "4", "5", "6", "7",
+                                  "8", "9", "a", "b", "c", "d", "e", "f"]
+        return table[Int(value & 0xF)]
     }
 }
