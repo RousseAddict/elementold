@@ -53,6 +53,17 @@ enum Palette {
     /// on it (ours use the accent).
     static let chatBackground = UIColor(red: 0.91, green: 0.92, blue: 0.94, alpha: 1.0)
     static let incomingBubble = UIColor.white
+    /// Settings-style screens, behind grouped tables and forms.
+    static let groupedBackground = UIColor(red: 0.94, green: 0.94, blue: 0.96, alpha: 1.0)
+    /// Leave, log out, delete, record.
+    static let destructive = UIColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0)
+
+    /// Flat grouped-table background. iOS 6 draws its pinstripes in a
+    /// backgroundView, which has to go for the colour to show.
+    static func applyGroupedBackground(to tableView: UITableView) {
+        tableView.backgroundView = nil
+        tableView.backgroundColor = groupedBackground
+    }
 
     /// Light navigation bar with accent-coloured buttons on every runtime.
     static func applyBarAppearance() {

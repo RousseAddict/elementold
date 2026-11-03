@@ -45,12 +45,13 @@ class UserSettingsVC: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "Settings"
-        view.backgroundColor = .white
+        view.backgroundColor = Palette.groupedBackground
 
         tableView = UITableView(frame: view.bounds, style: .grouped)
         tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         tableView.dataSource = self
         tableView.delegate = self
+        Palette.applyGroupedBackground(to: tableView)
         view.addSubview(tableView)
 
         refreshUsage()
@@ -464,7 +465,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
         let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
             UITableViewCell(style: .default, reuseIdentifier: cellId)
         cell.textLabel?.text = logoutArmed ? "Tap again to log out" : "Log Out"
-        cell.textLabel?.textColor = UIColor(red: 0.8, green: 0.1, blue: 0.1, alpha: 1.0)
+        cell.textLabel?.textColor = Palette.destructive
         cell.textLabel?.textAlignment = .center
         cell.selectionStyle = .default
         cell.accessoryType = .none
@@ -528,7 +529,7 @@ class TextEditVC: UIViewController, UITextFieldDelegate {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = UIColor(white: 0.95, alpha: 1.0)
+        view.backgroundColor = Palette.groupedBackground
 
         navigationItem.rightBarButtonItem = UIBarButtonItem(
             title: "Save", style: .done, target: self, action: #selector(saveTapped))
@@ -734,7 +735,7 @@ final class RecoveryKeyVC: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = UIColor(white: 0.95, alpha: 1.0)
+        view.backgroundColor = Palette.groupedBackground
 
         verifyItem = UIBarButtonItem(title: "Verify", style: .done,
                                      target: self, action: #selector(verifyTapped))

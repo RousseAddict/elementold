@@ -45,9 +45,6 @@ class LoginVC: UIViewController {
     private let headlineHeight: CGFloat = 52
     private let headlineGap: CGFloat = 16
 
-    private let bgColor = UIColor(red: 0.10, green: 0.10, blue: 0.14, alpha: 1.0)
-    private let accentColor = UIColor(red: 0.13, green: 0.55, blue: 0.60, alpha: 1.0)
-
     init(softLogoutUserId: String? = nil) {
         self.softLogoutUserId = softLogoutUserId
         super.init(nibName: nil, bundle: nil)
@@ -58,7 +55,7 @@ class LoginVC: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "elementold"
-        view.backgroundColor = bgColor
+        view.backgroundColor = .white
         registerKeyboardObservers()
         buildUI()
     }
@@ -68,9 +65,23 @@ class LoginVC: UIViewController {
         layoutContent()
     }
 
+    // No navigation bar here: the logo already heads the form, so the bar would
+    // only repeat the app's name above it. Login is always the root (it is
+    // swapped in with setViewControllers), so the bar is simply back for
+    // whatever replaces it.
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        navigationController?.setNavigationBarHidden(true, animated: animated)
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        navigationController?.setNavigationBarHidden(false, animated: animated)
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        // Belt and braces: UIKit's nav-bar inset lands around the first layout
+        // Belt and braces: UIKit's top inset lands around the first layout
         // pass, and layoutContent measures against it. Re-running it once we're
         // definitely on screen costs nothing and can't leave the form measured
         // against an inset of zero.
@@ -86,9 +97,10 @@ class LoginVC: UIViewController {
 
     private func buildUI() {
         // Must be the first subview: on iOS 7+ that's what makes UIKit inset the
-        // content for the navigation bar by itself, which is how every table in
-        // this app already clears it. On iOS 6 no inset is applied and none is
-        // needed — the view already starts below the bar.
+        // content for the status bar by itself (the navigation bar is hidden
+        // here), the same mechanism every table in this app relies on. On iOS 6
+        // no inset is applied and none is needed — the view already starts below
+        // the status bar.
         scrollView = UIScrollView(frame: view.bounds)
         scrollView.backgroundColor = .clear
         scrollView.showsHorizontalScrollIndicator = false
@@ -100,7 +112,7 @@ class LoginVC: UIViewController {
         headlineLabel.numberOfLines = 0
         headlineLabel.textAlignment = .center
         headlineLabel.font = UIFont.systemFont(ofSize: 14)
-        headlineLabel.textColor = UIColor(white: 0.72, alpha: 1.0)
+        headlineLabel.textColor = Palette.secondaryText
         headlineLabel.isHidden = !isSoftLogout
         if let userId = softLogoutUserId {
             headlineLabel.text = "Your session has expired.\nSign in again as \(userId)."
@@ -131,7 +143,7 @@ class LoginVC: UIViewController {
             usernameField.text = userId
             for field in [serverField, usernameField] {
                 field?.isUserInteractionEnabled = false
-                field?.textColor = UIColor(white: 0.6, alpha: 1.0)
+                field?.textColor = Palette.secondaryText
             }
         }
 
@@ -140,7 +152,7 @@ class LoginVC: UIViewController {
         connectButton.setTitleColor(.white, for: .normal)
         connectButton.setTitleColor(UIColor(white: 1.0, alpha: 0.5), for: .disabled)
         connectButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 17)
-        connectButton.backgroundColor = accentColor
+        connectButton.backgroundColor = Palette.accent
         connectButton.layer.cornerRadius = 10
         connectButton.addTarget(self, action: #selector(connectTapped), for: .touchUpInside)
         scrollView.addSubview(connectButton)
@@ -148,6 +160,7 @@ class LoginVC: UIViewController {
         // Sits on the view, not the scroll view, so it stays put if the form is
         // scrolled while a login is in flight.
         spinner = UIActivityIndicatorView(style: .whiteLarge)
+        spinner.color = Palette.secondaryText   // white would vanish on white (iOS 5+ API)
         spinner.hidesWhenStopped = true
         view.addSubview(spinner)
     }
@@ -158,7 +171,7 @@ class LoginVC: UIViewController {
         scrollView.frame = CGRect(x: 0, y: 0, width: bounds.width,
                                   height: max(0, bounds.height - keyboardOverlap))
 
-        // UIKit's own nav-bar inset (iOS 7+) — the form has to be measured and
+        // UIKit's own top inset (iOS 7+) — the form has to be measured and
         // centred inside what's left, not the full frame.
         let inset = scrollView.contentInset
         let visibleHeight = scrollView.bounds.height - inset.top - inset.bottom
@@ -198,23 +211,21 @@ class LoginVC: UIViewController {
 
     private func makeField(_ placeholder: String, secure: Bool) -> UITextField {
         let f = UITextField(frame: .zero)
-        f.backgroundColor = UIColor(white: 1.0, alpha: 0.08)
-        f.textColor = .white
+        // Grey fill on the white screen, no border — the grouped-list grey.
+        f.backgroundColor = Palette.groupedBackground
+        f.textColor = .black
         f.contentVerticalAlignment = .center
         f.layer.cornerRadius = 10
-        f.layer.borderColor = UIColor(white: 1.0, alpha: 0.15).cgColor
-        f.layer.borderWidth = 1
         f.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 46))
         f.leftViewMode = .always
         f.isSecureTextEntry = secure
         f.autocapitalizationType = .none
         f.autocorrectionType = .no
-        f.keyboardAppearance = .dark
         f.returnKeyType = .done
         f.delegate = self
         f.attributedPlaceholder = NSAttributedString(
             string: placeholder,
-            attributes: [NSAttributedString.Key.foregroundColor: UIColor(white: 0.5, alpha: 1.0)]
+            attributes: [NSAttributedString.Key.foregroundColor: Palette.secondaryText]
         )
         return f
     }

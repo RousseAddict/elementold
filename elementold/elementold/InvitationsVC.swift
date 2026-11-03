@@ -102,8 +102,10 @@ extension InvitationsVC: UITableViewDataSource, UITableViewDelegate {
 private class InvitationCell: UITableViewCell {
     private let nameLabel = UILabel()
     private let inviterLabel = UILabel()
-    private let acceptButton = UIButton(type: .system)
-    private let declineButton = UIButton(type: .system)
+    private let acceptButton = UIButton(plainTitle: "Accept", color: Palette.accent,
+                                        font: UIFont.boldSystemFont(ofSize: 15))
+    private let declineButton = UIButton(plainTitle: "Decline", color: Palette.destructive,
+                                         font: UIFont.systemFont(ofSize: 15))
 
     var onAccept: (() -> Void)?
     var onDecline: (() -> Void)?
@@ -121,15 +123,9 @@ private class InvitationCell: UITableViewCell {
         inviterLabel.textColor = .gray
         contentView.addSubview(inviterLabel)
 
-        acceptButton.setTitle("Accept", for: .normal)
-        acceptButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 15)
-        acceptButton.setTitleColor(Palette.accent, for: .normal)
         acceptButton.addTarget(self, action: #selector(acceptTapped), for: .touchUpInside)
         contentView.addSubview(acceptButton)
 
-        declineButton.setTitle("Decline", for: .normal)
-        declineButton.titleLabel?.font = UIFont.systemFont(ofSize: 15)
-        declineButton.setTitleColor(UIColor(red: 0.8, green: 0.0, blue: 0.0, alpha: 1.0), for: .normal)
         declineButton.addTarget(self, action: #selector(declineTapped), for: .touchUpInside)
         contentView.addSubview(declineButton)
     }

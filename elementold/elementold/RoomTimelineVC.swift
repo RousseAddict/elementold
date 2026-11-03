@@ -1032,8 +1032,7 @@ class RoomTimelineVC: UIViewController {
         voiceCancelButton.isHidden = true
         inputBar.addSubview(voiceCancelButton)
 
-        voiceRecordButton = UIButton(plainTitle: "\u{25CF} Record",
-                                     color: UIColor(red: 0.85, green: 0.15, blue: 0.15, alpha: 1.0),
+        voiceRecordButton = UIButton(plainTitle: "\u{25CF} Record", color: Palette.destructive,
                                      font: UIFont.systemFont(ofSize: 15))
         voiceRecordButton.addTarget(self, action: #selector(voiceRecordTapped), for: .touchUpInside)
         voiceRecordButton.isHidden = true
@@ -4529,12 +4528,13 @@ class RoomSettingsVC: UIViewController, UITableViewDataSource, UITableViewDelega
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "Room Settings"
-        view.backgroundColor = .white
+        view.backgroundColor = Palette.groupedBackground
 
         tableView = UITableView(frame: view.bounds, style: .grouped)
         tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         tableView.dataSource = self
         tableView.delegate = self
+        Palette.applyGroupedBackground(to: tableView)
         view.addSubview(tableView)
     }
 
@@ -4577,7 +4577,7 @@ class RoomSettingsVC: UIViewController, UITableViewDataSource, UITableViewDelega
             cell.accessoryView = nil
             cell.accessoryType = .none
             cell.textLabel?.text = "Leave Room"
-            cell.textLabel?.textColor = UIColor(red: 0.85, green: 0.15, blue: 0.15, alpha: 1.0)
+            cell.textLabel?.textColor = Palette.destructive
             cell.textLabel?.textAlignment = .center
             cell.selectionStyle = .default
             return cell
@@ -4937,7 +4937,7 @@ final class ActionSheet: UIView {
     private static let titleHPad: CGFloat = 16
 
     private static let defaultColor = Palette.accent
-    private static let destructiveColor = UIColor(red: 0.80, green: 0.16, blue: 0.13, alpha: 1)
+    private static let destructiveColor = Palette.destructive
 
     /// Solid fill for the pressed state. A background image is used rather than a
     /// highlighted background colour because UIButton has no such property.
