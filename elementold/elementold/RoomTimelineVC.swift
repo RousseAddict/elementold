@@ -32,6 +32,9 @@ class RoomTimelineVC: UIViewController {
     private var placeholderLabel: UILabel!
     private var sendButton: UIButton!
     private var attachButton: UIButton!
+    // Hairline along the top of the composer, i.e. of whichever strip is
+    // highest (input bar, upload, reply); positioned in layoutInputBar().
+    private var composerHairline: UIView!
     private var statusLabel: UILabel!
     // Shown in place of the whole composer in an encrypted room. We can decrypt
     // (see E2EEDecryptor) but cannot yet encrypt, and a plaintext m.room.message
@@ -53,7 +56,7 @@ class RoomTimelineVC: UIViewController {
     private let inputMinHeight: CGFloat = 36
     private let inputMaxHeight: CGFloat = 120
     private let attachWidth: CGFloat = 34
-    private let sendWidth: CGFloat = 56
+    private let sendWidth: CGFloat = 36
     private let hMargin: CGFloat = 12
     private let hSpacing: CGFloat = 8
     private var currentFieldHeight: CGFloat = 36
@@ -72,13 +75,15 @@ class RoomTimelineVC: UIViewController {
     private var typingLabel: UILabel!
     private let typingBarHeight: CGFloat = 22
 
-    // "Replying to Alice: …" strip, docked between the typing strip and the input
-    // bar while a reply is queued. Like the typing strip, the table shrinks by
-    // its height so it never covers the newest message.
+    // Reply strip (sender's name over a one-line quote), docked between the
+    // typing strip and the input bar while a reply is queued. Like the typing
+    // strip, the table shrinks by its height so it never covers the newest
+    // message.
     private var replyBar: UIView!
+    private var replyNameLabel: UILabel!
     private var replyLabel: UILabel!
     private var replyCancelButton: UIButton!
-    private let replyBarHeight: CGFloat = 30
+    private let replyBarHeight: CGFloat = 40
 
     // "Uploading… 42%" strip, docked in the same stack as the reply/typing strips
     // while a streamed media upload is in flight. Videos take long enough that a
@@ -604,9 +609,9 @@ class RoomTimelineVC: UIViewController {
         beginReply(to: eventId)
     }
 
-    // Queues a reply to `eventId`: shows the "Replying to …" strip above the
-    // input bar and remembers the target's sender + one-line preview, which the
-    // outbound reply fallback quotes (see sendTapped).
+    // Queues a reply to `eventId`: shows the reply strip above the input bar
+    // and remembers the target's sender + one-line preview, which the outbound
+    // reply fallback quotes (see sendTapped).
     private func beginReply(to eventId: String) {
         // Nothing can be sent from an encrypted room yet, and beginReply focuses
         // the composer — which is hidden here.
@@ -621,11 +626,11 @@ class RoomTimelineVC: UIViewController {
         replyingToSender = source.flatMap { RoomTimelineVC.senderOf($0) }
         replyingToPreview = source.flatMap { RoomTimelineVC.previewText(for: $0) }
         if let sender = replyingToSender {
-            let name = memberNames[sender] ?? shortName(sender)
-            let quote = RoomTimelineVC.oneLine(replyingToPreview ?? "", limit: 80)
-            replyLabel.text = "Replying to \(name): \(quote)"
+            replyNameLabel.text = memberNames[sender] ?? shortName(sender)
+            replyLabel.text = RoomTimelineVC.oneLine(replyingToPreview ?? "", limit: 80)
         } else {
-            replyLabel.text = "Replying to a message"
+            replyNameLabel.text = "Replying to a message"
+            replyLabel.text = nil
         }
         replyBar.isHidden = false
         layoutInputBar()
@@ -864,24 +869,33 @@ class RoomTimelineVC: UIViewController {
         navigationController?.pushViewController(vc, animated: true)
     }
 
-    // "Replying to …" strip; hidden unless a reply is queued. Sits directly above
-    // the input bar, positioned in layoutInputBar() like the typing strip. Added
+    // Reply strip; hidden unless a reply is queued. Sits directly above the
+    // input bar, positioned in layoutInputBar() like the typing strip. Added
     // after the input bar so the table (inserted below the bar) can't cover it.
+    // Same fill as the input bar, so the two read as one panel.
     private func buildReplyBar() {
         replyBar = UIView(frame: .zero)
-        replyBar.backgroundColor = UIColor(white: 0.90, alpha: 1.0)
+        replyBar.backgroundColor = Palette.barBackground
         replyBar.isHidden = true
+        replyBar.addSubview(stripAccentLine(height: replyBarHeight))
+
+        replyNameLabel = UILabel(frame: .zero)
+        replyNameLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
+        replyNameLabel.font = UIFont.boldSystemFont(ofSize: 13)
+        replyNameLabel.textColor = Palette.accent
+        replyNameLabel.lineBreakMode = .byTruncatingTail
+        replyBar.addSubview(replyNameLabel)
 
         replyLabel = UILabel(frame: .zero)
-        replyLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
-        replyLabel.font = UIFont.systemFont(ofSize: 12)
-        replyLabel.textColor = UIColor(white: 0.3, alpha: 1.0)
+        replyLabel.backgroundColor = .clear
+        replyLabel.font = UIFont.systemFont(ofSize: 13)
+        replyLabel.textColor = Palette.secondaryText
         replyLabel.lineBreakMode = .byTruncatingTail
         replyBar.addSubview(replyLabel)
 
-        replyCancelButton = UIButton(type: .system)
-        replyCancelButton.setTitle("\u{2715} Cancel", for: .normal)
-        replyCancelButton.titleLabel?.font = UIFont.systemFont(ofSize: 12)
+        replyCancelButton = UIButton(plainTitle: "\u{2715}", color: Palette.secondaryText,
+                                     font: UIFont.systemFont(ofSize: 16))
+        replyCancelButton.accessibilityLabel = "Cancel reply"
         replyCancelButton.addTarget(self, action: #selector(replyCancelTapped), for: .touchUpInside)
         replyBar.addSubview(replyCancelButton)
 
@@ -889,22 +903,33 @@ class RoomTimelineVC: UIViewController {
     }
 
     // "Uploading… N%" strip; hidden unless a streamed upload is in flight. Same
-    // placement rules as the reply strip.
+    // placement rules and look as the reply strip.
     private func buildUploadBar() {
         uploadBar = UIView(frame: .zero)
-        uploadBar.backgroundColor = UIColor(white: 0.90, alpha: 1.0)
+        uploadBar.backgroundColor = Palette.barBackground
         uploadBar.isHidden = true
+        uploadBar.addSubview(stripAccentLine(height: uploadBarHeight))
 
         uploadLabel = UILabel(frame: .zero)
         uploadLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
-        uploadLabel.font = UIFont.systemFont(ofSize: 12)
-        uploadLabel.textColor = UIColor(white: 0.3, alpha: 1.0)
+        uploadLabel.font = UIFont.systemFont(ofSize: 13)
+        uploadLabel.textColor = Palette.secondaryText
         uploadBar.addSubview(uploadLabel)
 
         uploadProgressView = UIProgressView(progressViewStyle: .default)
+        uploadProgressView.progressTintColor = Palette.accent
+        uploadProgressView.trackTintColor = Palette.separator
         uploadBar.addSubview(uploadProgressView)
 
         view.addSubview(uploadBar)
+    }
+
+    // The accent bar down the left edge of the reply/upload strips. The strips
+    // never change height, so its frame is fixed here.
+    private func stripAccentLine(height: CGFloat) -> UIView {
+        let line = UIView(frame: CGRect(x: hMargin, y: 6, width: 2, height: height - 12))
+        line.backgroundColor = Palette.accent
+        return line
     }
 
     // nil hides the strip; a fraction shows it. Called from the upload's progress
@@ -931,7 +956,7 @@ class RoomTimelineVC: UIViewController {
         typingLabel = UILabel(frame: .zero)
         typingLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
         typingLabel.font = UIFont.italicSystemFont(ofSize: 12)
-        typingLabel.textColor = .gray
+        typingLabel.textColor = Palette.secondaryText
         typingLabel.isHidden = true
         view.addSubview(typingLabel)
     }
@@ -941,28 +966,28 @@ class RoomTimelineVC: UIViewController {
         // grow + on keyboard show/hide), so autoresizing is left off to avoid it
         // fighting the manual layout.
         inputBar = UIView(frame: .zero)
-        inputBar.backgroundColor = UIColor(white: 0.97, alpha: 1.0)
+        inputBar.backgroundColor = Palette.barBackground
 
-        // Attach (photo) button, docked at the far left of the bar.
-        attachButton = UIButton(type: .system)
-        attachButton.setTitle("+", for: .normal)
-        attachButton.titleLabel?.font = UIFont.systemFont(ofSize: 30)
-        // The "+" glyph's optical centre sits low inside the font's line box, so
-        // the button looks bottom-heavy. Lift the title a few points to centre it.
-        attachButton.titleEdgeInsets = UIEdgeInsets(top: -3, left: 0, bottom: 0, right: 0)
+        // Attach (photo) button, docked at the far left of the bar: the Plus icon
+        // recoloured to the accent. Custom rather than `.system`, which is a
+        // white rounded rect on iOS 6.
+        attachButton = UIButton(type: .custom)
+        attachButton.setImage(UIImage(named: "Plus")?.tinted(Palette.accent), for: .normal)
+        attachButton.accessibilityLabel = "Attach"
         attachButton.addTarget(self, action: #selector(attachTapped), for: .touchUpInside)
         inputBar.addSubview(attachButton)
 
         // A UITextView (not UITextField) so the input can hold multiple lines and
         // grow. The Return key inserts a newline (UITextView's default); sending
-        // is the explicit "Send" button only. Kept white with a hairline border +
-        // rounded corners so it reads as a field against the light bar.
+        // is the explicit Send button only. A white pill with a hairline border
+        // so it reads as a field against the light bar; the radius stays fixed
+        // as the field grows.
         messageField = UITextView(frame: .zero)
         messageField.backgroundColor = .white
-        messageField.layer.cornerRadius = 8
+        messageField.layer.cornerRadius = inputMinHeight / 2
         messageField.layer.masksToBounds = true
-        messageField.layer.borderWidth = 0.5
-        messageField.layer.borderColor = UIColor(white: 0.8, alpha: 1.0).cgColor
+        messageField.layer.borderWidth = 1 / UIScreen.main.scale
+        messageField.layer.borderColor = Palette.separator.cgColor
         messageField.font = UIFont.systemFont(ofSize: 16)
         messageField.delegate = self
         // Scrolling stays off while growing; it's flipped on only once the content
@@ -989,26 +1014,29 @@ class RoomTimelineVC: UIViewController {
         placeholderLabel.isUserInteractionEnabled = false
         messageField.addSubview(placeholderLabel)
 
-        sendButton = UIButton(type: .system)
-        sendButton.setTitle("Send", for: .normal)
-        sendButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 15)
+        // Round accent button with a white arrow; paler while disabled (a media
+        // upload in flight, or voice mode with nothing recorded yet).
+        sendButton = UIButton(type: .custom)
+        sendButton.setImage(RoomTimelineVC.sendArrowImage(color: Palette.accent), for: .normal)
+        sendButton.setImage(RoomTimelineVC.sendArrowImage(color: Palette.accent.withAlphaComponent(0.4)),
+                            for: .disabled)
+        sendButton.adjustsImageWhenDisabled = false
+        sendButton.accessibilityLabel = "Send"
         sendButton.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
         inputBar.addSubview(sendButton)
 
         // Voice-mode controls (hidden until the user picks "Voice Message" from
         // the + sheet). They replace the attach button + text field; Send is
         // shared with text mode.
-        voiceCancelButton = UIButton(type: .system)
-        voiceCancelButton.setTitle("Cancel", for: .normal)
-        voiceCancelButton.titleLabel?.font = UIFont.systemFont(ofSize: 15)
+        voiceCancelButton = UIButton(plainTitle: "Cancel", color: Palette.accent,
+                                     font: UIFont.systemFont(ofSize: 15))
         voiceCancelButton.addTarget(self, action: #selector(voiceCancelTapped), for: .touchUpInside)
         voiceCancelButton.isHidden = true
         inputBar.addSubview(voiceCancelButton)
 
-        voiceRecordButton = UIButton(type: .system)
-        voiceRecordButton.setTitle("\u{25CF} Record", for: .normal)
-        voiceRecordButton.setTitleColor(UIColor(red: 0.85, green: 0.15, blue: 0.15, alpha: 1.0), for: .normal)
-        voiceRecordButton.titleLabel?.font = UIFont.systemFont(ofSize: 15)
+        voiceRecordButton = UIButton(plainTitle: "\u{25CF} Record",
+                                     color: UIColor(red: 0.85, green: 0.15, blue: 0.15, alpha: 1.0),
+                                     font: UIFont.systemFont(ofSize: 15))
         voiceRecordButton.addTarget(self, action: #selector(voiceRecordTapped), for: .touchUpInside)
         voiceRecordButton.isHidden = true
         inputBar.addSubview(voiceRecordButton)
@@ -1020,15 +1048,43 @@ class RoomTimelineVC: UIViewController {
         encryptedNoticeLabel.text = "This room is encrypted \u{2014} sending isn't supported yet"
         encryptedNoticeLabel.backgroundColor = .clear   // iOS 6: labels default to white bg
         encryptedNoticeLabel.font = UIFont.italicSystemFont(ofSize: 13)
-        encryptedNoticeLabel.textColor = .gray
+        encryptedNoticeLabel.textColor = Palette.secondaryText
         encryptedNoticeLabel.textAlignment = .center
         encryptedNoticeLabel.numberOfLines = 2
         encryptedNoticeLabel.isHidden = true
         inputBar.addSubview(encryptedNoticeLabel)
 
         view.addSubview(inputBar)
+        // Above the bar in z-order, so the table (inserted below the bar) never
+        // covers it.
+        composerHairline = UIView(frame: .zero)
+        composerHairline.backgroundColor = Palette.barHairline
+        view.addSubview(composerHairline)
         currentFieldHeight = inputMinHeight
         layoutInputBar()
+    }
+
+    // The send button's face: a white upward arrow on an accent disc, sized to
+    // sit inside the one-line field's height.
+    private static func sendArrowImage(color: UIColor) -> UIImage? {
+        let d: CGFloat = 32
+        UIGraphicsBeginImageContextWithOptions(CGSize(width: d, height: d), false, 0)
+        color.setFill()
+        UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: d, height: d)).fill()
+        let arrow = UIBezierPath()
+        arrow.move(to: CGPoint(x: d / 2, y: 23))
+        arrow.addLine(to: CGPoint(x: d / 2, y: 9))
+        arrow.move(to: CGPoint(x: 10, y: 15))
+        arrow.addLine(to: CGPoint(x: d / 2, y: 9))
+        arrow.addLine(to: CGPoint(x: 22, y: 15))
+        arrow.lineWidth = 2.5
+        arrow.lineCapStyle = .round
+        arrow.lineJoinStyle = .round
+        UIColor.white.setStroke()
+        arrow.stroke()
+        let img = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        return img
     }
 
     // Lays out the bar and its subviews for the current field height + keyboard
@@ -1102,11 +1158,14 @@ class RoomTimelineVC: UIViewController {
         // overlaps the newest message.
         let replyVisible = replyBar != nil && !replyBar.isHidden
         let replyH: CGFloat = replyVisible ? replyBarHeight : 0
+        // Strip text starts past the accent line (see stripAccentLine).
+        let stripTextX = hMargin + 10
         if replyVisible {
             replyBar.frame = CGRect(x: 0, y: barY - replyH, width: barWidth, height: replyH)
-            let cancelW: CGFloat = 76
-            replyLabel.frame = CGRect(x: hMargin, y: 0,
-                                      width: max(0, barWidth - hMargin * 2 - cancelW), height: replyH)
+            let cancelW: CGFloat = 36
+            let textW = max(0, barWidth - stripTextX - hMargin - cancelW)
+            replyNameLabel.frame = CGRect(x: stripTextX, y: 4, width: textW, height: 16)
+            replyLabel.frame = CGRect(x: stripTextX, y: 20, width: textW, height: 16)
             replyCancelButton.frame = CGRect(x: barWidth - hMargin - cancelW, y: 0,
                                              width: cancelW, height: replyH)
         }
@@ -1116,12 +1175,21 @@ class RoomTimelineVC: UIViewController {
         if uploadVisible {
             uploadBar.frame = CGRect(x: 0, y: barY - replyH - uploadH, width: barWidth, height: uploadH)
             let labelW: CGFloat = 110
-            uploadLabel.frame = CGRect(x: hMargin, y: 0, width: labelW, height: uploadH)
-            let barX = hMargin + labelW
+            uploadLabel.frame = CGRect(x: stripTextX, y: 0, width: labelW, height: uploadH)
+            let barX = stripTextX + labelW
             // UIProgressView has a fixed intrinsic height, so it's centred rather
             // than stretched to fill the strip.
             uploadProgressView.frame = CGRect(x: barX, y: (uploadH - 2) / 2,
                                               width: max(0, barWidth - barX - hMargin), height: 2)
+        }
+
+        // Just above the top strip rather than on it: the strips are added after
+        // the hairline and would cover it. It overlaps the last point of the
+        // table (or the clear typing strip) instead.
+        if composerHairline != nil {
+            let hairlineH = 1 / UIScreen.main.scale
+            composerHairline.frame = CGRect(x: 0, y: barY - replyH - uploadH - hairlineH,
+                                            width: barWidth, height: hairlineH)
         }
 
         let typingVisible = !typingUsers.isEmpty
@@ -1794,7 +1862,6 @@ class RoomTimelineVC: UIViewController {
         attachButton.isEnabled = !sending
         if voiceCancelButton != nil { voiceCancelButton.isEnabled = !sending }
         if voiceRecordButton != nil { voiceRecordButton.isEnabled = !sending }
-        sendButton.setTitle(sending ? "\u{2026}" : "Send", for: .normal)
     }
 
     // Int64, not Int: on the armv7 (32-bit) build for iPhone 4S/5, `Int` is
@@ -2171,7 +2238,6 @@ class RoomTimelineVC: UIViewController {
         cleanUpRecording(deleteFile: true)
         inputMode = .text
         sendButton.isEnabled = true
-        sendButton.setTitle("Send", for: .normal)
         placeholderLabel.isHidden = !(messageField.text ?? "").isEmpty
         layoutInputBar()
     }
@@ -2816,7 +2882,7 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
 
     // One-line description of a message for a reply quote: its own text, or a
     // short label standing in for a non-text attachment. Shared by the in-bubble
-    // quote line and the composer's "Replying to …" strip so they always agree.
+    // quote line and the composer's reply strip so they always agree.
     private static func previewText(for event: RoomEvent) -> String? {
         switch event.kind {
         case .message(_, let body, _): return body

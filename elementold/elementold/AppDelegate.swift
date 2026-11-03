@@ -164,3 +164,18 @@ extension UIBarButtonItem {
         self.init(customView: button)
     }
 }
+
+extension UIButton {
+    /// A borderless text button in `color`, faded while pressed or disabled.
+    /// Built as `.custom` because `.system` shares its raw value with iOS 6's
+    /// white rounded-rect button.
+    convenience init(plainTitle title: String, color: UIColor, font: UIFont) {
+        self.init(type: .custom)
+        setTitle(title, for: .normal)
+        titleLabel?.font = font
+        titleLabel?.backgroundColor = .clear   // iOS 6: labels default to white bg
+        setTitleColor(color, for: .normal)
+        setTitleColor(color.withAlphaComponent(0.3), for: .highlighted)
+        setTitleColor(color.withAlphaComponent(0.3), for: .disabled)
+    }
+}
