@@ -808,7 +808,7 @@ class RoomTimelineVC: UIViewController {
         label.backgroundColor = .clear
         label.text = room.name
         label.font = UIFont.boldSystemFont(ofSize: 17)
-        label.textColor = .white
+        label.textColor = Palette.barTitle
         label.lineBreakMode = .byTruncatingTail
         label.sizeToFit()
         // Cap the title width well short of the nav bar's edges so a long room
@@ -835,12 +835,11 @@ class RoomTimelineVC: UIViewController {
                                                               action: #selector(openRoomSettings)))
         navigationItem.titleView = container
 
-        // Right-hand button (users icon) opens the member list for this room.
-        // The loose PNG (not asset catalog) is drawn by iOS 6/7 as an alpha-mask
-        // template, so the white glyph auto-tints to the nav bar's tint colour.
+        // Right-hand button (users icon) opens the member list for this room,
+        // recoloured to the accent like the room list's bar icons.
         let membersItem: UIBarButtonItem
         if let icon = UIImage(named: "Users") {
-            membersItem = UIBarButtonItem(image: icon, style: .plain,
+            membersItem = UIBarButtonItem(accentImage: icon,
                                           target: self, action: #selector(openMemberList))
         } else {
             membersItem = UIBarButtonItem(title: "Members", style: .plain,
@@ -3177,8 +3176,7 @@ private class EventCell: UITableViewCell {
                                      : UIColor(white: 0.35, alpha: 1.0)
         bodyLabel.text = body
         bodyLabel.textColor = isOwn ? .white : .black
-        bubble.backgroundColor = isOwn ? UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
-                                        : UIColor(white: 0.85, alpha: 1.0)
+        bubble.backgroundColor = isOwn ? Palette.accent : UIColor(white: 0.85, alpha: 1.0)
         statusLabel.isHidden = status == nil
         statusLabel.text = status
         // A failure has to stand out against the blue bubble, so it's drawn in
@@ -3526,8 +3524,7 @@ private class AudioEventCell: UITableViewCell {
         self.mxc = mxc
         declaredDuration = Double(durationMs) / 1000.0
 
-        bubble.backgroundColor = isOwn ? UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
-                                        : UIColor(white: 0.85, alpha: 1.0)
+        bubble.backgroundColor = isOwn ? Palette.accent : UIColor(white: 0.85, alpha: 1.0)
         let fg: UIColor = isOwn ? .white : .black
         durationLabel.textColor = fg
 
@@ -3717,8 +3714,7 @@ private class FileEventCell: UITableViewCell, AttachmentProgressCell {
         chipLabel.text = FileEventCell.typeTag(filename: filename, mimeType: mimeType)
         setProgress(nil)
 
-        bubble.backgroundColor = isOwn ? UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
-                                        : UIColor(white: 0.85, alpha: 1.0)
+        bubble.backgroundColor = isOwn ? Palette.accent : UIColor(white: 0.85, alpha: 1.0)
         nameLabel.textColor = isOwn ? .white : .black
         detailLabel.textColor = isOwn ? UIColor(white: 1.0, alpha: 0.75) : .darkGray
         chip.backgroundColor = isOwn ? UIColor(white: 1.0, alpha: 0.22) : .white
@@ -4840,7 +4836,7 @@ final class ActionSheet: UIView {
     private static let titleVPad: CGFloat = 14
     private static let titleHPad: CGFloat = 16
 
-    private static let defaultColor = UIColor(red: 0, green: 0.48, blue: 1, alpha: 1)
+    private static let defaultColor = Palette.accent
     private static let destructiveColor = UIColor(red: 0.80, green: 0.16, blue: 0.13, alpha: 1)
 
     /// Solid fill for the pressed state. A background image is used rather than a

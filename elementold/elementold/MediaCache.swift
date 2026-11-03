@@ -746,9 +746,10 @@ class AvatarView: UIView {
     private var currentName: String?
     private var currentFontSize: CGFloat = 0
 
-    // Thumbnail pixel size requested from the server — comfortably covers the
-    // largest on-screen avatar (room-list 40pt @2x, timeline nav ~30pt, sender
-    // ~28pt) at Retina scale without per-view size juggling.
+    // Thumbnail pixel size requested from the server — covers the on-screen
+    // avatars (timeline nav ~30pt, sender ~28pt) at Retina scale without
+    // per-view size juggling; the 52pt room-list one (104px) is a hair over,
+    // too little to show.
     // Non-private so an uploader can prime MediaCache under the exact key this
     // view will later request (a freshly-uploaded mxc 404s for a moment).
     static let thumbPx = 96

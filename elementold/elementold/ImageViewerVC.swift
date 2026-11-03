@@ -53,7 +53,9 @@ class ImageViewerVC: UIViewController {
         doubleTap.numberOfTapsRequired = 2
         scrollView.addGestureRecognizer(doubleTap)
 
-        navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .save,
+        // A title, not the .save system icon: iOS 6 draws bar icons as white
+        // masks, which vanish against the light bar.
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Save", style: .plain,
                                                             target: self, action: #selector(saveTapped))
         loadFull()
     }

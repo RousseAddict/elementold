@@ -44,6 +44,9 @@ class RoomListVC: UIViewController {
     private var listHeaderContainer: UIView!
     private var filterButton: UIButton!
     private let filterButtonWidth: CGFloat = 44
+    // The white funnel icons, recoloured once (see UIImage.tinted).
+    private lazy var funnelImage = UIImage(named: "Funnel")?.tinted(Palette.accent)
+    private lazy var funnelClearImage = UIImage(named: "FunnelX")?.tinted(Palette.accent)
     // The header starts scrolled just out of sight, Mail-style: it stays part of
     // the table's content, so pulling the list down brings it back and no scroll
     // observing is needed. One-shot — once we've had a go at hiding it, it is
@@ -95,18 +98,18 @@ class RoomListVC: UIViewController {
         title = "Chats"
         view.backgroundColor = .white
 
-        // Account button (user-circle icon). The bundled PNG is now white (iOS 6
-        // draws the bar-button image as-is), so no tint override is set — the button
-        // otherwise renders exactly as before. Tapping opens the account menu.
-        let accountItem = UIBarButtonItem(image: UIImage(named: "UserCircle"),
-                                          style: .plain, target: self, action: #selector(accountTapped))
+        // Account button (user-circle icon), recoloured to the accent — see
+        // UIBarButtonItem(accentImage:) for why it isn't a plain image item.
+        // Tapping opens Settings.
+        let accountItem = UIBarButtonItem(accentImage: UIImage(named: "UserCircle"),
+                                          target: self, action: #selector(accountTapped))
         navigationItem.leftBarButtonItem = accountItem
 
-        // Compose (new conversation) button — same white-icon bar-button style as
-        // the account button. Falls back to a "+" title if the image is missing.
+        // Compose (new conversation) button — same accent-icon style as the
+        // account button. Falls back to a "+" title if the image is missing.
         let composeItem: UIBarButtonItem
         if let plus = UIImage(named: "Plus") {
-            composeItem = UIBarButtonItem(image: plus, style: .plain,
+            composeItem = UIBarButtonItem(accentImage: plus,
                                           target: self, action: #selector(composeTapped))
         } else {
             composeItem = UIBarButtonItem(title: "+", style: .plain,
@@ -118,24 +121,27 @@ class RoomListVC: UIViewController {
         tableView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         tableView.dataSource = self
         tableView.delegate = self
+        // Rows draw their own hairlines (see ListCell).
+        tableView.separatorStyle = .none
         view.addSubview(tableView)
 
         // Search bar as the table header — filters the conversation list by name.
         searchBar = UISearchBar()
         searchBar.delegate = self
         searchBar.placeholder = "Search conversations"
-        // Match the (teal) navigation bar. On the iOS 6 runtime `tintColor`
-        // colours the bar itself (pre-iOS-7 semantics), same as the nav bar in
-        // AppDelegate; `barStyle = .black` keeps the field/glyphs light like the
-        // nav bar's white title.
-        searchBar.barStyle = .black
-        searchBar.tintColor = UIColor(red: 0.13, green: 0.55, blue: 0.60, alpha: 1.0)
+        // Flat white bar with a rounded grey field. Both images (iOS 5+) replace
+        // the iOS 6 gradient and the iOS 7+ bar tint alike. `tintColor` then only
+        // colours the caret and Cancel on iOS 7+; iOS 6 styles Cancel through
+        // the bar-button appearance in Palette.
+        searchBar.backgroundImage = Palette.image(of: .white)
+        searchBar.setSearchFieldBackgroundImage(Palette.image(of: Palette.searchField, height: 28, cornerRadius: 5),
+                                                for: .normal)
+        searchBar.tintColor = Palette.accent
         searchBar.sizeToFit()
 
         // Host the search bar in a header container beside a real funnel button.
         // A UISearchBar bookmark button overlapped the field on this runtime, so
-        // the filter gets its own tappable button on a teal background (matching
-        // the bar) that keeps the white funnel icon visible.
+        // the filter gets its own tappable button, with the funnel in the accent.
         let barH = searchBar.frame.height
         let container = UIView(frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: barH))
         container.autoresizingMask = [.flexibleWidth]
@@ -147,7 +153,6 @@ class RoomListVC: UIViewController {
         filterButton.frame = CGRect(x: container.bounds.width - filterButtonWidth, y: 0,
                                     width: filterButtonWidth, height: barH)
         filterButton.autoresizingMask = [.flexibleLeftMargin, .flexibleHeight]
-        filterButton.backgroundColor = UIColor(red: 0.13, green: 0.55, blue: 0.60, alpha: 1.0)
         filterButton.imageView?.contentMode = .scaleAspectFit
         filterButton.addTarget(self, action: #selector(filterButtonTapped), for: .touchUpInside)
         container.addSubview(filterButton)
@@ -735,7 +740,7 @@ class RoomListVC: UIViewController {
         searchBar.frame = CGRect(x: 0, y: 0,
                                  width: full.width - filterButtonWidth, height: full.height)
         let active = selectedFilterId != nil
-        if let img = UIImage(named: active ? "FunnelX" : "Funnel") {
+        if let img = active ? funnelClearImage : funnelImage {
             filterButton.setImage(img, for: .normal)
         }
     }
@@ -820,15 +825,15 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
     // Taller rows than the stock ~44pt so the avatar + two lines of text aren't
     // cramped and adjacent conversations get some breathing room.
     func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
-        return indexPath.section == inviteSection ? 44 : 66
+        return indexPath.section == inviteSection ? 44 : 72
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         if indexPath.section == inviteSection {
             let cell = tableView.dequeueReusableCell(withIdentifier: inviteCellId) ??
-                UITableViewCell(style: .value1, reuseIdentifier: inviteCellId)
+                ListCell(style: .value1, reuseIdentifier: inviteCellId)
             cell.textLabel?.text = "Invitations"
-            cell.textLabel?.textColor = UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
+            cell.textLabel?.textColor = Palette.accent
             cell.detailTextLabel?.text = "\(invitations.count)"
             cell.accessoryType = .disclosureIndicator
             return cell
@@ -839,8 +844,6 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
         guard let room = roomsById[displayedRoomIds[indexPath.row]] else { return cell }
         cell.textLabel?.text = room.name
         cell.detailTextLabel?.text = room.lastMessage
-        cell.detailTextLabel?.textColor = .gray
-        cell.accessoryType = .disclosureIndicator
         cell.timeLabel.text = TimeFormat.listStamp(msSinceEpoch: room.lastMessageTimestamp)
         cell.setUnreadCount(room.unreadCount)
         cell.setAvatar(mxc: room.avatarMxc, name: room.name)
@@ -908,22 +911,59 @@ extension RoomListVC: UISearchBarDelegate {
     }
 }
 
+// A list row with a flat grey highlight and its own hairline along the bottom,
+// starting at `separatorLeft`. The table's separators are off because their
+// inset (separatorInset) is iOS 7+, so on iOS 6 they could only run full width.
+private class ListCell: UITableViewCell {
+    var separatorLeft: CGFloat = 0
+    private let separator = UIView()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectedBackgroundView = UIView()
+        selectedBackgroundView?.backgroundColor = Palette.rowHighlight
+        // iOS 6 turns the stock labels white while highlighted, to sit on its
+        // blue selection; nil keeps their own colour on the grey one.
+        textLabel?.highlightedTextColor = nil
+        detailTextLabel?.highlightedTextColor = nil
+        separator.backgroundColor = Palette.separator
+        addSubview(separator)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let height = 1 / UIScreen.main.scale
+        separator.frame = CGRect(x: separatorLeft, y: bounds.height - height,
+                                 width: bounds.width - separatorLeft, height: height)
+    }
+}
+
 // Custom cell so the time label and unread badge can be positioned reliably in
 // layoutSubviews() (relative to the stock textLabel/detailTextLabel frames)
 // instead of the previous viewWithTag hack with a hardcoded y-offset, which
 // didn't track the actual row layout and looked misaligned.
-private class RoomCell: UITableViewCell {
+private class RoomCell: ListCell {
     let timeLabel = UILabel()
     private let badgeBackground = UIView()
     private let badgeLabel = UILabel()
     private let avatarView = AvatarView()
     // Left gutter for the room avatar: margin + circle + gap before the text.
-    private let avatarSize: CGFloat = 40
-    private let avatarMargin: CGFloat = 12
+    private let avatarSize: CGFloat = 52
+    private let avatarMargin: CGFloat = 10
+    private var textLeft: CGFloat { return avatarMargin + avatarSize + 12 }
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
         contentView.addSubview(avatarView)
+        // The hairline runs under the text, not under the avatar.
+        separatorLeft = textLeft
+
+        // Medium-weight name by font name: systemFont(ofSize:weight:) is iOS 8.2+.
+        textLabel?.font = UIFont(name: "HelveticaNeue-Medium", size: 16) ?? UIFont.boldSystemFont(ofSize: 16)
+        detailTextLabel?.font = UIFont.systemFont(ofSize: 14)
+        detailTextLabel?.textColor = Palette.secondaryText
 
         // iOS 6 runtime: UILabel defaults to an opaque WHITE background. For the
         // badge this was fatal — badgeLabel's white bg filled the blue badge
@@ -931,17 +971,17 @@ private class RoomCell: UITableViewCell {
         // badge looked absent entirely (this, not the count, was why it never
         // showed). Every label here must be explicitly cleared.
         timeLabel.backgroundColor = .clear
-        timeLabel.font = UIFont.systemFont(ofSize: 12)
-        timeLabel.textColor = .lightGray
+        timeLabel.font = UIFont.systemFont(ofSize: 13)
+        timeLabel.textColor = Palette.secondaryText
         timeLabel.textAlignment = .right
         contentView.addSubview(timeLabel)
 
-        badgeBackground.backgroundColor = UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
+        badgeBackground.backgroundColor = Palette.accent
         badgeBackground.isHidden = true
         contentView.addSubview(badgeBackground)
 
         badgeLabel.backgroundColor = .clear
-        badgeLabel.font = UIFont.boldSystemFont(ofSize: 11)
+        badgeLabel.font = UIFont.boldSystemFont(ofSize: 12)
         badgeLabel.textColor = .white
         badgeLabel.textAlignment = .center
         badgeBackground.addSubview(badgeLabel)
@@ -971,9 +1011,6 @@ private class RoomCell: UITableViewCell {
         let avatarY = (contentView.bounds.height - avatarSize) / 2
         avatarView.frame = CGRect(x: avatarMargin, y: avatarY, width: avatarSize, height: avatarSize)
 
-        // Everything to the right of the avatar starts here.
-        let textLeft = avatarMargin + avatarSize + 12
-
         // Time label, right-aligned on the top line.
         timeLabel.sizeToFit()
         let timeY = (textLabel?.frame.midY ?? contentView.bounds.midY / 2) - timeLabel.frame.height / 2
@@ -991,12 +1028,15 @@ private class RoomCell: UITableViewCell {
             tl.frame.size.width = max(0, right - textLeft)
         }
 
-        // Badge (unread count), bottom-right.
-        let badgeHeight: CGFloat = 18
+        // Badge (unread count), right-aligned on the preview's line — or mid-row
+        // when there's no preview to line up with.
+        let badgeHeight: CGFloat = 20
         if !badgeBackground.isHidden {
             badgeLabel.sizeToFit()
             let badgeWidth = max(badgeHeight, badgeLabel.frame.width + 10)
-            let badgeY = contentView.bounds.height - badgeHeight - 10
+            var lineY = contentView.bounds.midY
+            if let dl = detailTextLabel, dl.frame.height > 0 { lineY = dl.frame.midY }
+            let badgeY = lineY - badgeHeight / 2
             badgeBackground.frame = CGRect(x: contentView.bounds.width - badgeWidth - margin, y: badgeY,
                                             width: badgeWidth, height: badgeHeight)
             badgeBackground.layer.cornerRadius = badgeHeight / 2

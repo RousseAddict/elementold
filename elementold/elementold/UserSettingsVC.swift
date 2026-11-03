@@ -406,7 +406,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
                 UITableViewCell(style: .default, reuseIdentifier: cellId)
             cell.textLabel?.text = indexPath.row == 2 ? "Reset Cache" : "Delete Downloads"
-            cell.textLabel?.textColor = UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
+            cell.textLabel?.textColor = Palette.accent
             cell.textLabel?.textAlignment = .center
             cell.selectionStyle = .default
             cell.accessoryType = .none
@@ -453,7 +453,7 @@ extension UserSettingsVC: UITableViewDataSource, UITableViewDelegate {
             let cell = tableView.dequeueReusableCell(withIdentifier: cellId) ??
                 UITableViewCell(style: .default, reuseIdentifier: cellId)
             cell.textLabel?.text = "Copy crash log"
-            cell.textLabel?.textColor = UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)
+            cell.textLabel?.textColor = Palette.accent
             cell.textLabel?.textAlignment = .center
             cell.selectionStyle = .default
             cell.accessoryType = .none

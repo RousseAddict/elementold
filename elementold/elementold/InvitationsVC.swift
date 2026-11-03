@@ -123,7 +123,7 @@ private class InvitationCell: UITableViewCell {
 
         acceptButton.setTitle("Accept", for: .normal)
         acceptButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 15)
-        acceptButton.setTitleColor(UIColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0), for: .normal)
+        acceptButton.setTitleColor(Palette.accent, for: .normal)
         acceptButton.addTarget(self, action: #selector(acceptTapped), for: .touchUpInside)
         contentView.addSubview(acceptButton)
 
