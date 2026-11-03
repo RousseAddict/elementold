@@ -49,6 +49,10 @@ enum Palette {
     static let separator = UIColor(red: 0.78, green: 0.78, blue: 0.80, alpha: 1.0)
     static let rowHighlight = UIColor(white: 0.85, alpha: 1.0)
     static let searchField = UIColor(white: 0.90, alpha: 1.0)
+    /// Chat screen: the canvas behind the bubbles, and other people's bubbles
+    /// on it (ours use the accent).
+    static let chatBackground = UIColor(red: 0.91, green: 0.92, blue: 0.94, alpha: 1.0)
+    static let incomingBubble = UIColor.white
 
     /// Light navigation bar with accent-coloured buttons on every runtime.
     static func applyBarAppearance() {

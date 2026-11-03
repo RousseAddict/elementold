@@ -314,11 +314,9 @@ class RoomTimelineVC: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         title = room.name
-        // A pure-white canvas (.white) left the "other" bubble color below
-        // (0.92 white) almost indistinguishable from the background — no
-        // visible bubble edge, just a flat white screen. A slightly off-white
-        // canvas gives every bubble real contrast to sit on top of.
-        view.backgroundColor = UIColor(white: 0.95, alpha: 1.0)
+        // A light blue-grey canvas, so other people's white bubbles and the
+        // white date pills have an edge to sit against.
+        view.backgroundColor = Palette.chatBackground
 
         // Seed the member directory from what the room already knew, so sender
         // avatars/names render on first paint (updated live from /sync after).
@@ -2912,16 +2910,9 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         switch rows[indexPath.row] {
         case .date(let text):
-            let cell = tableView.dequeueReusableCell(withIdentifier: dateCellId) ??
-                UITableViewCell(style: .default, reuseIdentifier: dateCellId)
-            cell.backgroundColor = .clear
-            cell.contentView.backgroundColor = .clear
-            cell.textLabel?.backgroundColor = .clear   // iOS 6: labels default to white bg
-            cell.selectionStyle = .none
-            cell.textLabel?.font = UIFont.boldSystemFont(ofSize: 12)
-            cell.textLabel?.textColor = .gray
-            cell.textLabel?.textAlignment = .center
-            cell.textLabel?.text = text
+            let cell = (tableView.dequeueReusableCell(withIdentifier: dateCellId) as? DateCell) ??
+                DateCell(style: .default, reuseIdentifier: dateCellId)
+            cell.configure(text: text)
             return cell
 
         case .receipt(let text):
@@ -3078,9 +3069,52 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
     }
 }
 
+// Day separator: the date in a small white pill, centred on the canvas. The
+// row is EventCell.dateRowHeight tall; the pill is sized to its text.
+private class DateCell: UITableViewCell {
+    private let pill = UIView()
+    private let label = UILabel()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+
+        pill.backgroundColor = .white
+        pill.layer.cornerRadius = 10
+        contentView.addSubview(pill)
+
+        label.backgroundColor = .clear   // iOS 6: labels default to white bg
+        label.font = UIFont.boldSystemFont(ofSize: 12)
+        label.textColor = Palette.secondaryText
+        label.textAlignment = .center
+        pill.addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(text: String) {
+        label.text = text
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let bounds = contentView.bounds
+        let height: CGFloat = 20
+        let padding: CGFloat = 8
+        label.sizeToFit()
+        let width = min(label.frame.width + padding * 2, bounds.width - EventCell.outerMargin * 2)
+        pill.frame = CGRect(x: ((bounds.width - width) / 2).rounded(), y: ((bounds.height - height) / 2).rounded(),
+                            width: width, height: height)
+        label.frame = pill.bounds.insetBy(dx: padding, dy: 0)
+    }
+}
+
 // Chat-bubble cell (stoatold-style meta grouping): a colored, rounded rect
 // message body, aligned right/blue for the local user's own messages and
-// left/gray for everyone else's. A meta header line (sender name + time) sits
+// left/white for everyone else's. A meta header line (sender name + time) sits
 // *above* the bubble, but only on the first message of a consecutive same-
 // sender group — subsequent messages in the run drop the header and hug the
 // one above with a tighter top margin. The bubble is sized to its content
@@ -3181,7 +3215,7 @@ private class EventCell: UITableViewCell {
         // background (not clear) — leaving it unset painted a white rectangle
         // over the colored bubble behind each label, which is the "white content
         // inside the bubble" bug. (Same gotcha noted in cAI's MessageCell.)
-        // The meta label sits on the table's off-white canvas, above the bubble.
+        // The meta label sits on the table's blue-grey canvas, above the bubble.
         metaLabel.backgroundColor = .clear
         metaLabel.font = UIFont.systemFont(ofSize: 11)
         metaLabel.textColor = .gray
@@ -3242,7 +3276,7 @@ private class EventCell: UITableViewCell {
                                      : UIColor(white: 0.35, alpha: 1.0)
         bodyLabel.text = body
         bodyLabel.textColor = isOwn ? .white : .black
-        bubble.backgroundColor = isOwn ? Palette.accent : UIColor(white: 0.85, alpha: 1.0)
+        bubble.backgroundColor = isOwn ? Palette.accent : Palette.incomingBubble
         statusLabel.isHidden = status == nil
         statusLabel.text = status
         // A failure has to stand out against the blue bubble, so it's drawn in
@@ -3590,7 +3624,7 @@ private class AudioEventCell: UITableViewCell {
         self.mxc = mxc
         declaredDuration = Double(durationMs) / 1000.0
 
-        bubble.backgroundColor = isOwn ? Palette.accent : UIColor(white: 0.85, alpha: 1.0)
+        bubble.backgroundColor = isOwn ? Palette.accent : Palette.incomingBubble
         let fg: UIColor = isOwn ? .white : .black
         durationLabel.textColor = fg
 
@@ -3780,12 +3814,12 @@ private class FileEventCell: UITableViewCell, AttachmentProgressCell {
         chipLabel.text = FileEventCell.typeTag(filename: filename, mimeType: mimeType)
         setProgress(nil)
 
-        bubble.backgroundColor = isOwn ? Palette.accent : UIColor(white: 0.85, alpha: 1.0)
+        bubble.backgroundColor = isOwn ? Palette.accent : Palette.incomingBubble
         nameLabel.textColor = isOwn ? .white : .black
         detailLabel.textColor = isOwn ? UIColor(white: 1.0, alpha: 0.75) : .darkGray
-        chip.backgroundColor = isOwn ? UIColor(white: 1.0, alpha: 0.22) : .white
+        chip.backgroundColor = isOwn ? UIColor(white: 1.0, alpha: 0.22) : Palette.chatBackground
         chipLabel.textColor = isOwn ? .white : UIColor(white: 0.3, alpha: 1.0)
-        progressView.progressTintColor = isOwn ? .white : UIColor(white: 0.35, alpha: 1.0)
+        progressView.progressTintColor = isOwn ? .white : Palette.accent
 
         let showAvatar = !isOwn && hasMeta
         avatarView.isHidden = !showAvatar
@@ -4264,7 +4298,7 @@ private class ReactionsCell: UITableViewCell {
             // Ours reads as "selected": tinted fill + matching border.
             button.backgroundColor = mine
                 ? UIColor(red: 0.85, green: 0.91, blue: 1.0, alpha: 1.0)
-                : UIColor(white: 0.90, alpha: 1.0)
+                : .white
             button.layer.borderColor = (mine
                 ? UIColor(red: 0.35, green: 0.6, blue: 0.95, alpha: 1.0)
                 : UIColor(white: 0.78, alpha: 1.0)).cgColor
