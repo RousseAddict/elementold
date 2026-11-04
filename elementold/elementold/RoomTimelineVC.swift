@@ -243,6 +243,28 @@ class RoomTimelineVC: UIViewController {
     }
     private var rows: [Row] = []
 
+    // Measured text-bubble heights — events by event id, queued messages by
+    // transaction id (the two can't collide, see newTxnId) — each kept with the
+    // inputs it was measured from. heightForRowAt runs for every row on every
+    // table update on this runtime, so an unchanged row costs a lookup instead
+    // of a text measurement; an input that moves (an edit, a quote target
+    // loading, regrouping, a failed send, a new width) re-measures just that row.
+    private struct BubbleHeight {
+        let width: CGFloat
+        let text: String
+        let hasQuote: Bool
+        let hasMeta: Bool
+        let hasStatus: Bool
+        let height: CGFloat
+    }
+    private var bubbleHeights: [String: BubbleHeight] = [:]
+    // Calendar-day key per event id. rebuildRows needs one for every event on
+    // every update, and each costs a DateFormatter call.
+    private var dayKeys: [String: String] = [:]
+    // Past this many changed rows updateTable gives up on a batch update and
+    // reloads, since a catch-up of that size isn't worth animating row by row.
+    private static let maxRowUpdate = 12
+
     // A message we've accepted from the composer but the homeserver hasn't
     // confirmed yet. Sending no longer blocks the input: the text leaves the
     // field immediately, appears as a provisional bubble, and is retired when
@@ -1327,7 +1349,7 @@ class RoomTimelineVC: UIViewController {
         if let rawEvents = timelineEvents {
             if memberSource.isEmpty { memberSource = rawEvents } else { memberSource += rawEvents }
         }
-        if !memberSource.isEmpty { updateMembers(from: memberSource) }
+        let membersChanged = !memberSource.isEmpty && updateMembers(from: memberSource)
 
         var newOnes: [RoomEvent] = []
         if let rawEvents = timelineEvents {
@@ -1372,7 +1394,9 @@ class RoomTimelineVC: UIViewController {
         if tableChanged || typingChanged {
             if !newOnes.isEmpty { retirePending(matching: newOnes) }
             if tableChanged {
-                reloadTable()
+                // A renamed or re-avatared member shows on rows already on
+                // screen, which a row diff can't see — redraw all of them then.
+                if membersChanged { reloadTable() } else { updateTable() }
                 updateStatusLabel()
                 if hasNewMessages { scrollToBottom(animated: true) }
             }
@@ -1390,19 +1414,24 @@ class RoomTimelineVC: UIViewController {
 
     // Merges join-member display name / avatar into the local member directory.
     // Keyed on state_key (the member the event is about) rather than sender.
-    private func updateMembers(from events: [[String: Any]]) {
+    // Returns true if a name or avatar actually changed.
+    private func updateMembers(from events: [[String: Any]]) -> Bool {
+        var changed = false
         for ev in events where ev["type"] as? String == "m.room.member" {
             guard let content = ev["content"] as? [String: Any],
                   content["membership"] as? String == "join" else { continue }
             let userId = (ev["state_key"] as? String) ?? (ev["sender"] as? String)
             guard let userId = userId else { continue }
-            if let dn = content["displayname"] as? String, !dn.isEmpty {
+            if let dn = content["displayname"] as? String, !dn.isEmpty, memberNames[userId] != dn {
                 memberNames[userId] = dn
+                changed = true
             }
-            if let av = content["avatar_url"] as? String, av.hasPrefix("mxc://") {
+            if let av = content["avatar_url"] as? String, av.hasPrefix("mxc://"), memberAvatars[userId] != av {
                 memberAvatars[userId] = av
+                changed = true
             }
         }
+        return changed
     }
 
     // Records which of our own events peers have read. m.receipt content is
@@ -1577,7 +1606,13 @@ class RoomTimelineVC: UIViewController {
             if redacted.contains(event.eventId) { continue }
             var dayChanged = false
             if event.timestamp > 0 {
-                let key = TimeFormat.dayKey(msSinceEpoch: event.timestamp)
+                let key: String
+                if let known = dayKeys[event.eventId] {
+                    key = known
+                } else {
+                    key = TimeFormat.dayKey(msSinceEpoch: event.timestamp)
+                    dayKeys[event.eventId] = key
+                }
                 if key != lastDayKey {
                     result.append(.date(TimeFormat.dateHeader(msSinceEpoch: event.timestamp)))
                     lastDayKey = key
@@ -1646,6 +1681,72 @@ class RoomTimelineVC: UIViewController {
         rebuildRows()
         tableView.reloadData()
         prefetchImageThumbnails()
+    }
+
+    // reloadTable for the updates that touch a few rows near the bottom: a
+    // message queued, failed, retried or swapped for its /sync echo, and new
+    // events arriving. The rows are rebuilt as usual, but the table is handed
+    // only the stretch that differs — everything before the first changed row
+    // and after the last one is left alone, so the bubbles already on screen
+    // are neither re-bound nor re-measured (Onegram updates its conversation the
+    // same way). A large change, or a table that isn't on screen, still reloads.
+    private func updateTable() {
+        let old = rows
+        rebuildRows()
+        prefetchImageThumbnails()
+        // The table must still hold exactly `old`, or the batch below would be
+        // computed against rows it never saw — an exception, not a glitch.
+        guard tableView.window != nil, !old.isEmpty,
+              tableView.numberOfRows(inSection: 0) == old.count else {
+            tableView.reloadData()
+            return
+        }
+        let shorter = min(old.count, rows.count)
+        var head = 0
+        while head < shorter && rowsMatch(old[head], rows[head]) { head += 1 }
+        var tail = 0
+        while tail < shorter - head && rowsMatch(old[old.count - 1 - tail], rows[rows.count - 1 - tail]) {
+            tail += 1
+        }
+        let removed = (head ..< old.count - tail).map { IndexPath(row: $0, section: 0) }
+        let added = (head ..< rows.count - tail).map { IndexPath(row: $0, section: 0) }
+        if removed.isEmpty && added.isEmpty { return }
+        guard removed.count + added.count <= RoomTimelineVC.maxRowUpdate else {
+            tableView.reloadData()
+            return
+        }
+        // Pure additions fade in. A row replaced in place (sending -> failed, or
+        // a queued bubble -> its echoed event) swaps without a crossfade, so the
+        // bubble doesn't blink.
+        let animation: UITableView.RowAnimation = removed.isEmpty ? .fade : .none
+        tableView.beginUpdates()
+        tableView.deleteRows(at: removed, with: animation)
+        tableView.insertRows(at: added, with: animation)
+        tableView.endUpdates()
+    }
+
+    // Whether two rows draw identically, which is what lets updateTable leave
+    // one alone. Member names and avatars aren't compared: handleSync reloads
+    // the whole table when those change.
+    private func rowsMatch(_ a: Row, _ b: Row) -> Bool {
+        switch (a, b) {
+        case (.date(let x), .date(let y)), (.receipt(let x), .receipt(let y)):
+            return x == y
+        case (.event(let x), .event(let y)):
+            return x.event.eventId == y.event.eventId && x.showMeta == y.showMeta
+                && x.editedBody == y.editedBody
+        case (.reactions(let x), .reactions(let y)):
+            return x.targetEventId == y.targetEventId && x.isOwn == y.isOwn
+                && x.items.elementsEqual(y.items) {
+                    $0.key == $1.key && $0.count == $1.count && $0.mineEventId == $1.mineEventId
+                }
+        case (.pending(let x), .pending(let y)):
+            // The event id a send response fills in isn't drawn, so a
+            // confirmed send changes nothing on screen.
+            return x.txnId == y.txnId && x.state == y.state
+        default:
+            return false
+        }
     }
 
     // Updates the typing strip text + shows/hides it (animating the table resize).
@@ -1736,7 +1837,7 @@ class RoomTimelineVC: UIViewController {
         pending.append(PendingMessage(txnId: newTxnId(), body: text, replyTo: replyTarget,
                                       timestamp: Int64(Date().timeIntervalSince1970 * 1000),
                                       state: .sending, eventId: nil))
-        reloadTable()
+        updateTable()
         scrollToBottom(animated: true)
         pumpSendQueue()
     }
@@ -1781,7 +1882,7 @@ class RoomTimelineVC: UIViewController {
                     // and let /sync render the message as an ordinary event.
                     self.pending.remove(at: current)
                 }
-                self.reloadTable()
+                self.updateTable()
             }
             // No alert on failure: the bubble itself says it didn't send, and a
             // queue drained while offline would otherwise stack up one alert per
@@ -1792,7 +1893,7 @@ class RoomTimelineVC: UIViewController {
 
     // Drops any queued message the homeserver has now echoed back to us, matching
     // on the transaction id it returns on our own events (or on the event id the
-    // send response gave us, for a server that omits one). The caller reloads the
+    // send response gave us, for a server that omits one). The caller updates the
     // table either way, since it only runs when new events arrived. Main thread.
     private func retirePending(matching newEvents: [RoomEvent]) {
         guard !pending.isEmpty else { return }
@@ -1836,7 +1937,7 @@ class RoomTimelineVC: UIViewController {
         pendingActionTxnId = nil
         pending[index].state = .sending
         pending[index].errorText = nil
-        reloadTable()
+        updateTable()
         pumpSendQueue()
     }
 
@@ -1844,7 +1945,7 @@ class RoomTimelineVC: UIViewController {
         guard let txnId = pendingActionTxnId else { return }
         pendingActionTxnId = nil
         pending.removeAll { $0.txnId == txnId }
-        reloadTable()
+        updateTable()
     }
 
     // Toggles the "an upload is in flight" UI state across the whole input bar.
@@ -2739,32 +2840,19 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         case .reactions(let reactionRow):
             return ReactionsCell.height(items: reactionRow.items, width: width)
         case .pending(let message):
-            // Measured exactly like an own text bubble, plus the status line —
-            // the same shared-constants discipline as every other branch here,
-            // since it's drawn by the same EventCell.
-            let maxBubbleWidth = width * EventCell.bubbleWidthFraction
-            let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
-            let bodyHeight = textHeight(message.body, font: EventCell.bodyFont, width: bodyWidth)
-            let quoteBlock: CGFloat = pendingQuote(for: message) != nil
-                ? EventCell.quoteHeight + EventCell.quoteGap : 0
-            let statusBlock = EventCell.statusHeight + EventCell.statusGap
-            let bubbleHeight = quoteBlock + bodyHeight + statusBlock + EventCell.innerPadding * 2
-            // Own messages never draw a meta header, so no meta block here.
-            return EventCell.groupedTopMargin + bubbleHeight + EventCell.bottomMargin
+            // Measured exactly like an own text bubble, since it's drawn by the
+            // same EventCell. Own messages never draw a meta header, and only a
+            // failed send has a status line — while sending, the bubble is the
+            // size its echoed event will be, so the swap doesn't move anything.
+            return bubbleRowHeight(id: message.txnId, text: message.body,
+                                   hasQuote: hasPendingQuote(message), hasMeta: false,
+                                   hasStatus: message.state == .failed, width: width)
         case .event(let eventRow):
             switch eventRow.event.kind {
             case .message:
-                let text = bodyText(for: eventRow)
-                let maxBubbleWidth = width * EventCell.bubbleWidthFraction
-                let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
-                let bodyHeight = textHeight(text, font: EventCell.bodyFont, width: bodyWidth)
-                let quoteBlock: CGFloat = replyPreview(for: eventRow.event) != nil
-                    ? EventCell.quoteHeight + EventCell.quoteGap : 0
-                let bubbleHeight = quoteBlock + bodyHeight + EventCell.innerPadding * 2
-                let hasMeta = hasMetaHeader(eventRow)
-                let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
-                let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
-                return topMargin + metaBlock + bubbleHeight + EventCell.bottomMargin
+                return bubbleRowHeight(id: eventRow.event.eventId, text: bodyText(for: eventRow),
+                                       hasQuote: hasReplyQuote(eventRow.event),
+                                       hasMeta: hasMetaHeader(eventRow), hasStatus: false, width: width)
             case .image(_, _, _, let w, let h):
                 let maxBubbleWidth = width * EventCell.bubbleWidthFraction
                 let imageSize = ImageEventCell.displaySize(imageWidth: w, imageHeight: h, maxWidth: maxBubbleWidth)
@@ -2807,12 +2895,18 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
     // (the former are obviously the local user's; the latter name the sender
     // inline in the body).
     private func metaText(sender: String, isOwn: Bool, isEmote: Bool) -> String? {
-        if isOwn || isEmote { return nil }
+        guard RoomTimelineVC.drawsMeta(isOwn: isOwn, isEmote: isEmote) else { return nil }
         // Show the member's display name (from m.room.member state/timeline,
         // seeded into memberNames), falling back to the localpart of the Matrix
         // ID ("@alice:server" -> "alice") when we have no display name yet —
         // never the raw Matrix identifier.
         return memberNames[sender] ?? shortName(sender)
+    }
+
+    // When metaText returns a header at all. Split out so rowHeight can ask
+    // without building the name string for every row on every update.
+    private static func drawsMeta(isOwn: Bool, isEmote: Bool) -> Bool {
+        return !isOwn && !isEmote
     }
 
     // Whether the row actually draws a meta header. The cells lay themselves out
@@ -2824,14 +2918,12 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         guard eventRow.showMeta else { return false }
         switch eventRow.event.kind {
         case .message(let sender, _, let isEmote):
-            return metaText(sender: sender, isOwn: sender == MatrixSession.userId,
-                            isEmote: isEmote) != nil
+            return RoomTimelineVC.drawsMeta(isOwn: sender == MatrixSession.userId, isEmote: isEmote)
         case .image(let sender, _, _, _, _),
              .audio(let sender, _, _, _),
              .file(let sender, _, _, _, _),
              .video(let sender, _):
-            return metaText(sender: sender, isOwn: sender == MatrixSession.userId,
-                            isEmote: false) != nil
+            return RoomTimelineVC.drawsMeta(isOwn: sender == MatrixSession.userId, isEmote: false)
         case .membership, .reaction, .redaction, .edit:
             return false
         }
@@ -2877,6 +2969,23 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         return "\(memberNames[sender] ?? shortName(sender)): \(text)"
     }
 
+    // replyPreview(for:) != nil and pendingQuote(for:) != nil, without building
+    // the strings: rowHeight only needs to know whether a quote line is drawn.
+    // Each mirrors its counterpart's nil cases exactly.
+    private func hasReplyQuote(_ event: RoomEvent) -> Bool {
+        guard let target = event.replyTo else { return false }
+        if let source = eventsById[target], RoomTimelineVC.senderOf(source) != nil,
+           RoomTimelineVC.previewText(for: source) != nil {
+            return true
+        }
+        return event.replyQuote != nil
+    }
+
+    private func hasPendingQuote(_ message: PendingMessage) -> Bool {
+        guard let target = message.replyTo, let source = eventsById[target] else { return false }
+        return RoomTimelineVC.senderOf(source) != nil && RoomTimelineVC.previewText(for: source) != nil
+    }
+
     // One-line description of a message for a reply quote: its own text, or a
     // short label standing in for a non-text attachment. Shared by the in-bubble
     // quote line and the composer's reply strip so they always agree.
@@ -2891,19 +3000,41 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         }
     }
 
-    // UITableView asks for every row's height on every reloadData (there's no
-    // estimatedRowHeight before iOS 7, and we couldn't use it anyway), and a /sync
-    // carrying one new message reloads the whole table. In a room with a few
-    // hundred messages that meant a few hundred UILabel allocations and a few
-    // hundred text layout passes on the main thread per sync — the "typing feels
-    // laggy" symptom, since a keystroke's typing notification round-trips through
-    // /sync and lands work back on main.
+    // UITableView asks for every row's height on every reloadData and every
+    // batch update (there's no estimatedRowHeight before iOS 7, and we couldn't
+    // use it anyway). In a room with a few hundred messages that meant a few
+    // hundred UILabel allocations and a few hundred text layout passes on the
+    // main thread per sync — the "typing feels laggy" symptom, since a
+    // keystroke's typing notification round-trips through /sync and lands work
+    // back on main. bubbleRowHeight's per-row memo now answers almost all of them.
     //
-    // Both are answered by EventCell.measureBody, which owns the one reused
+    // A miss is answered by EventCell.measureBody, which owns the one reused
     // sizing label and the one memo table — so the height reserved here and the
     // size the cell lays itself out to come from the same measurement.
     private func textHeight(_ text: String, font: UIFont, width: CGFloat) -> CGFloat {
         return ceil(EventCell.measureBody(text, font: font, width: width).height)
+    }
+
+    // A text bubble row's height, from bubbleHeights when none of the inputs it
+    // was measured from has moved since.
+    private func bubbleRowHeight(id: String, text: String, hasQuote: Bool, hasMeta: Bool,
+                                 hasStatus: Bool, width: CGFloat) -> CGFloat {
+        if let known = bubbleHeights[id], known.width == width, known.hasQuote == hasQuote,
+           known.hasMeta == hasMeta, known.hasStatus == hasStatus, known.text == text {
+            return known.height
+        }
+        let maxBubbleWidth = width * EventCell.bubbleWidthFraction
+        let bodyWidth = maxBubbleWidth - EventCell.innerPadding * 2
+        let bodyHeight = textHeight(text, font: EventCell.bodyFont, width: bodyWidth)
+        let quoteBlock: CGFloat = hasQuote ? EventCell.quoteHeight + EventCell.quoteGap : 0
+        let statusBlock: CGFloat = hasStatus ? EventCell.statusHeight + EventCell.statusGap : 0
+        let bubbleHeight = quoteBlock + bodyHeight + statusBlock + EventCell.innerPadding * 2
+        let metaBlock: CGFloat = hasMeta ? EventCell.metaHeight + EventCell.metaGap : 0
+        let topMargin = hasMeta ? EventCell.topMargin : EventCell.groupedTopMargin
+        let height = topMargin + metaBlock + bubbleHeight + EventCell.bottomMargin
+        bubbleHeights[id] = BubbleHeight(width: width, text: text, hasQuote: hasQuote,
+                                         hasMeta: hasMeta, hasStatus: hasStatus, height: height)
+        return height
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -2940,12 +3071,16 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         case .pending(let message):
             let cell = (tableView.dequeueReusableCell(withIdentifier: cellId) as? EventCell) ??
                 EventCell(style: .default, reuseIdentifier: cellId)
+            // Only a failure gets a status line. While sending, the dimmed bubble
+            // is the whole indicator, and it's exactly the size of the event that
+            // will replace it — the echo then just brightens it, like Onegram's
+            // clock turning into a check mark.
             let failed = message.state == .failed
             cell.configure(meta: nil, quote: pendingQuote(for: message), body: message.body,
                            time: TimeFormat.shortTime(msSinceEpoch: Double(message.timestamp)),
                            isOwn: true, avatarMxc: nil, senderName: "",
-                           status: failed ? "Not sent \u{2014} tap to retry" : "Sending\u{2026}",
-                           statusIsError: failed)
+                           status: failed ? "Not sent \u{2014} tap to retry" : nil,
+                           statusIsError: failed, isProvisional: true)
             cell.setRevealOffset(revealOffset)
             return cell
 
@@ -3186,8 +3321,8 @@ private class EventCell: UITableViewCell {
     // The message being replied to, drawn as one truncated line at the top of
     // the bubble. Hidden unless this message is a reply.
     private let quoteLabel = UILabel()
-    // "Sending…" / "Not sent" for a message still in the outgoing queue, as one
-    // line under the body. Hidden for every event the server has confirmed.
+    // "Not sent" for a queued message whose send failed, as one line under the
+    // body. Hidden while sending and for every event the server has confirmed.
     private let statusLabel = UILabel()
     // Small circular sender avatar, shown at the group-start of others' messages.
     private let avatarView = AvatarView()
@@ -3257,11 +3392,12 @@ private class EventCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    // `status` is only passed for a message still in the outgoing queue; every
-    // confirmed event leaves it nil and the line isn't drawn at all.
+    // `isProvisional` marks a message still in the outgoing queue, and `status`
+    // is only passed when its send failed; every confirmed event leaves both
+    // off and the status line isn't drawn at all.
     func configure(meta: String?, quote: String?, body: String, time: String, isOwn: Bool,
                    avatarMxc: String?, senderName: String,
-                   status: String? = nil, statusIsError: Bool = false) {
+                   status: String? = nil, statusIsError: Bool = false, isProvisional: Bool = false) {
         isOwnMessage = isOwn
         hasMeta = meta != nil
         metaLabel.isHidden = !hasMeta
@@ -3279,10 +3415,10 @@ private class EventCell: UITableViewCell {
         statusLabel.isHidden = status == nil
         statusLabel.text = status
         // A failure has to stand out against the blue bubble, so it's drawn in
-        // full white while "Sending…" stays dimmed like the quote line.
+        // full white; any other status stays dimmed like the quote line.
         statusLabel.textColor = statusIsError ? .white : UIColor(white: 1.0, alpha: 0.75)
         // An unconfirmed message reads as provisional rather than sent.
-        bubble.alpha = status == nil ? 1.0 : 0.7
+        bubble.alpha = isProvisional ? 0.7 : 1.0
         revealTimeLabel.text = time
         // Avatar only on others' group-start rows (own messages need no avatar;
         // grouped continuations align under the group-start bubble via the gutter).
