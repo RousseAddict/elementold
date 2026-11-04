@@ -79,26 +79,43 @@ enum TimeFormat {
     // plain numeric date beyond that — so a row's age reads at a glance instead
     // of every row showing an hour that means a different day on each line.
     //
-    // Days are matched by comparing day-key strings against fixed 24h steps back
-    // from now, which keeps this free of any NSCalendar component API. A daylight
-    // saving change can make one of those steps land on a day already matched,
-    // in which case the oldest weekday falls through to the numeric date — a day
-    // early, twice a year, on a label that is only ever a rough marker.
+    // Runs for every visible row on each list refresh, so how many days back a
+    // stamp is comes from local day numbers (localtime_r, still no NSCalendar
+    // component API) rather than from formatting dates to compare as strings.
+    // That used to cost up to eight DateFormatter passes a row, against seven
+    // boundary days that were the same for every row; now a row costs at most
+    // one, and none for a weekday already named. Day numbers also follow a
+    // daylight saving change exactly, which the old fixed 24h steps did not.
     static func listStamp(msSinceEpoch: Double) -> String {
         guard msSinceEpoch > 0 else { return "" }
-        let date = Date(timeIntervalSince1970: msSinceEpoch / 1000)
-        let key = dayKeyFormatter.string(from: date)
-        if key == dayKeyFormatter.string(from: Date()) {
+        let day = localDay(time_t(msSinceEpoch / 1000))
+        let daysAgo = localDay(time(nil)).number - day.number
+        if daysAgo == 0 {
             return shortTime(msSinceEpoch: msSinceEpoch)
         }
-        for daysAgo in 1...6 {
-            let past = Date(timeIntervalSinceNow: -86400 * Double(daysAgo))
-            if key == dayKeyFormatter.string(from: past) {
-                return weekdayFormatter.string(from: date)
-            }
+        let date = Date(timeIntervalSince1970: msSinceEpoch / 1000)
+        if (1...6).contains(daysAgo) {
+            if let name = weekdayNames[day.weekday] { return name }
+            let name = weekdayFormatter.string(from: date)
+            weekdayNames[day.weekday] = name
+            return name
         }
         // dayKeyFormatter is already yyyy-MM-dd, which is the wanted short date.
-        return key
+        return dayKeyFormatter.string(from: date)
+    }
+
+    // Weekday names by tm_wday, filled in as listStamp first needs each one.
+    // Main thread only, like the room list that is its one caller.
+    private static var weekdayNames: [Int: String] = [:]
+
+    // The local calendar day a moment falls on, numbered from the epoch, and its
+    // weekday (0 = Sunday). tm_gmtoff is the offset in force at that moment, so
+    // days start at local midnight on either side of a daylight saving change.
+    private static func localDay(_ seconds: time_t) -> (number: Int, weekday: Int) {
+        var t = seconds
+        var parts = tm()
+        localtime_r(&t, &parts)
+        return ((t + parts.tm_gmtoff) / 86400, Int(parts.tm_wday))
     }
 }
 

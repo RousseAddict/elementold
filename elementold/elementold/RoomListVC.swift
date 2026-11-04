@@ -392,6 +392,10 @@ class RoomListVC: UIViewController {
         var orderChanged = false     // room set, or a sort key (lastMessageTimestamp)
         var contentChanged = false   // anything RoomCell draws
         var filtersChanged = false   // anything rebuildFilters buckets on
+        // The rooms whose row draws differently now, and the list as the table
+        // shows it, so refreshRows can update just those rows in place.
+        var redrawIds = Set<String>()
+        let shownIds = displayedRoomIds
         if let join = rooms?["join"] as? [String: Any] {
             for (roomId, rawRoom) in join {
                 guard let roomJSON = rawRoom as? [String: Any] else { continue }
@@ -402,6 +406,7 @@ class RoomListVC: UIViewController {
                 roomsById[roomId] = updated
                 guard let before = existing else {
                     orderChanged = true; contentChanged = true; filtersChanged = true
+                    redrawIds.insert(roomId)
                     continue
                 }
                 if before.lastMessageTimestamp != updated.lastMessageTimestamp { orderChanged = true }
@@ -409,6 +414,7 @@ class RoomListVC: UIViewController {
                     || before.unreadCount != updated.unreadCount || before.avatarMxc != updated.avatarMxc
                     || before.lastMessageTimestamp != updated.lastMessageTimestamp {
                     contentChanged = true
+                    redrawIds.insert(roomId)
                 }
                 if before.roomType != updated.roomType || before.bridgeNetwork != updated.bridgeNetwork
                     || before.spaceChildren != updated.spaceChildren {
@@ -465,7 +471,11 @@ class RoomListVC: UIViewController {
         lastErrorText = nil
         finishRefresh()
         if needsReload {
-            tableView.reloadData()
+            // The invitation banner and the first sync of a launch are rare
+            // enough that a full reload is the simplest way to get them right.
+            if firstSync || invitesChanged || !refreshRows(from: shownIds, redrawing: redrawIds) {
+                tableView.reloadData()
+            }
             hideListHeaderIfNeeded()
             updateStatusLabel()
             updateFilterControl()
@@ -473,6 +483,57 @@ class RoomListVC: UIViewController {
         if let totalUnread = totalUnread {
             UIApplication.shared.applicationIconBadgeNumber = totalUnread
         }
+    }
+
+    // Brings the table up to date after a /sync without reloadData, which
+    // rebuilt every visible cell — date stamp, avatar, labels and all — whenever
+    // any one room changed. Most syncs change one room: its row is redrawn in
+    // place and, when its new message lifts it up the list, moved there on its
+    // own. Returns false for anything bigger (rooms joined or left, several
+    // reordered, a filter emptied) or when the list is off screen behind a
+    // room, and the caller reloads instead.
+    private func refreshRows(from shownIds: [String], redrawing redrawIds: Set<String>) -> Bool {
+        guard tableView.window != nil,
+              tableView.numberOfRows(inSection: roomSection) == shownIds.count else { return false }
+        if displayedRoomIds != shownIds {
+            guard let move = RoomListVC.singleMove(from: shownIds, to: displayedRoomIds) else { return false }
+            // Unanimated, as the reload was: only the cost changes, not the look.
+            UIView.setAnimationsEnabled(false)
+            tableView.beginUpdates()
+            tableView.moveRow(at: IndexPath(row: move.from, section: roomSection),
+                              to: IndexPath(row: move.to, section: roomSection))
+            tableView.endUpdates()
+            UIView.setAnimationsEnabled(true)
+            tableView.layoutIfNeeded()
+        }
+        // A changed row that's off screen gets drawn by cellForRowAt when it
+        // scrolls in, so only the visible ones need touching.
+        for indexPath in tableView.indexPathsForVisibleRows ?? []
+            where indexPath.section == roomSection && indexPath.row < displayedRoomIds.count {
+            let roomId = displayedRoomIds[indexPath.row]
+            guard redrawIds.contains(roomId), let room = roomsById[roomId],
+                  let cell = tableView.cellForRow(at: indexPath) as? RoomCell else { continue }
+            configure(cell, with: room)
+        }
+        return true
+    }
+
+    // The one row move that turns `old` into `new`, if that is all that tells
+    // them apart: one room changed place and the rest kept their order. Found
+    // from the first and last positions that differ, which must be the moved
+    // room's old and new places with everything between shifted by one.
+    private static func singleMove(from old: [String], to new: [String]) -> (from: Int, to: Int)? {
+        guard old.count == new.count,
+              let first = old.indices.first(where: { old[$0] != new[$0] }),
+              let last = old.indices.last(where: { old[$0] != new[$0] }),
+              first < last else { return nil }
+        if new[first] == old[last] && new[(first + 1)...last] == old[first..<last] {
+            return (from: last, to: first)   // moved up, the usual case
+        }
+        if old[first] == new[last] && old[(first + 1)...last] == new[first..<last] {
+            return (from: first, to: last)   // moved down
+        }
+        return nil
     }
 
     // Sum of every joined room's unread count — drives the app icon badge.
@@ -846,12 +907,19 @@ extension RoomListVC: UITableViewDataSource, UITableViewDelegate {
         let cell = (tableView.dequeueReusableCell(withIdentifier: cellId) as? RoomCell) ??
             RoomCell(style: .subtitle, reuseIdentifier: cellId)
         guard let room = roomsById[displayedRoomIds[indexPath.row]] else { return cell }
+        configure(cell, with: room)
+        return cell
+    }
+
+    // Shared by cellForRowAt and refreshRows' in-place redraw. setUnreadCount
+    // ends in setNeedsLayout, which an already-visible cell needs so the stock
+    // labels are re-fitted to their new text.
+    private func configure(_ cell: RoomCell, with room: Room) {
         cell.textLabel?.text = room.name
         cell.detailTextLabel?.text = room.lastMessage
         cell.timeLabel.text = TimeFormat.listStamp(msSinceEpoch: room.lastMessageTimestamp)
         cell.setUnreadCount(room.unreadCount)
         cell.setAvatar(mxc: room.avatarMxc, name: room.name)
-        return cell
     }
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
