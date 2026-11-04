@@ -552,7 +552,14 @@ class RoomTimelineVC: UIViewController {
         guard let spinner = backfillSpinner else { return }
         if reachedHistoryStart {
             spinner.stopAnimating()
-            if tableView.tableHeaderView != nil { tableView.tableHeaderView = nil }
+            if let header = tableView.tableHeaderView {
+                // Detaching it moves every row up by its height. Move the offset
+                // with them, or the newest message rises off the input bar and
+                // leaves a 44pt gap below it.
+                let offsetY = tableView.contentOffset.y - header.frame.height
+                tableView.tableHeaderView = nil
+                tableView.contentOffset = CGPoint(x: 0, y: max(-tableView.contentInset.top, offsetY))
+            }
             return
         }
         if active {
@@ -1784,6 +1791,11 @@ class RoomTimelineVC: UIViewController {
     // delta to keep the rows the user was looking at in place. Animations are
     // off for the batch: otherwise the kept cells would slide down to their new
     // positions while the offset change below snaps them straight back.
+    //
+    // That offset is capped at the bottom. A room opened with a few buffered
+    // messages shows them from the top, since they don't fill the screen, and
+    // keeping them in place after the page landed left them stranded mid-screen
+    // over a blank gap; the cap puts the newest message on the input bar.
     private func prependTable() {
         let oldContentHeight = tableView.contentSize.height
         let oldOffsetY = tableView.contentOffset.y
@@ -1802,7 +1814,9 @@ class RoomTimelineVC: UIViewController {
         }
         tableView.layoutIfNeeded()
         let newContentHeight = tableView.contentSize.height
-        tableView.contentOffset = CGPoint(x: 0, y: oldOffsetY + (newContentHeight - oldContentHeight))
+        let maxOffsetY = max(-tableView.contentInset.top,
+                             newContentHeight - tableView.bounds.height + tableView.contentInset.bottom)
+        tableView.contentOffset = CGPoint(x: 0, y: min(oldOffsetY + (newContentHeight - oldContentHeight), maxOffsetY))
     }
 
     // The rows that differ between `old` and the freshly rebuilt `rows`: the
