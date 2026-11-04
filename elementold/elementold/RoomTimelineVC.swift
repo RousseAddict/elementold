@@ -134,7 +134,6 @@ class RoomTimelineVC: UIViewController {
     private var backfillFrom: String?
     private var reachedHistoryStart = false
     // Top-of-table "loading older messages" spinner (shown during backfill).
-    private var backfillHeader: UIView?
     private var backfillSpinner: UIActivityIndicatorView?
 
     // Text queued for copying by the long-press → UIMenuController "Copy" action.
@@ -296,7 +295,16 @@ class RoomTimelineVC: UIViewController {
         // a rejection (a size limit, M_FORBIDDEN) would be indistinguishable
         // from a dropped connection.
         var errorText: String? = nil
+        // The last attempt never got an answer from the homeserver (no
+        // connection, a timeout) rather than being refused by it. Only those
+        // are sent again on their own once /sync gets through — see
+        // resendAfterReconnect, which counts its attempts in autoResends.
+        var connectionLost = false
+        var autoResends = 0
     }
+    // Past this many automatic resends a message waits for a tap, so one that
+    // keeps failing while /sync gets through can't be retried forever.
+    private static let maxAutoResends = 3
     // Strictly main-thread. That holds without any explicit hop: CurlFetcher
     // marshals every completion to main, so both the send callbacks and the
     // /sync listener fan-out that retires these entries already run there.
@@ -508,9 +516,15 @@ class RoomTimelineVC: UIViewController {
         tableView.addGestureRecognizer(longPress)
 
         // "Loading older messages" spinner, docked at the very top of the table
-        // (i.e. above the oldest row, where backfill prepends). It's shown only
-        // while a backfill request is in flight and removed for good once we hit
-        // the start of history — so no empty gap lingers at the top.
+        // (i.e. above the oldest row, where backfill prepends). It spins only
+        // while a backfill request is in flight and is removed for good once we
+        // hit the start of history — so no empty gap lingers at the top.
+        //
+        // Attached from the start rather than when the first request goes out.
+        // That request now waits for viewDidAppear, after the scroll to the
+        // newest message, and attaching 44pt above the rows at that point pushed
+        // everything down by as much: the newest message ended up under the
+        // input bar.
         let header = UIView(frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 44))
         header.autoresizingMask = [.flexibleWidth]
         let spinner = UIActivityIndicatorView(style: .gray)
@@ -519,7 +533,15 @@ class RoomTimelineVC: UIViewController {
         spinner.autoresizingMask = [.flexibleLeftMargin, .flexibleRightMargin]
         header.addSubview(spinner)
         backfillSpinner = spinner
-        backfillHeader = header
+        tableView.tableHeaderView = header
+
+        // Tapping the conversation puts the keyboard away. It doesn't cancel the
+        // touch and runs alongside the bubbles' own taps (see the delegate
+        // below), so rows and media stay tappable.
+        let dismissTap = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
+        dismissTap.cancelsTouchesInView = false
+        dismissTap.delegate = self
+        tableView.addGestureRecognizer(dismissTap)
 
         view.insertSubview(tableView, belowSubview: inputBar)
     }
@@ -527,7 +549,7 @@ class RoomTimelineVC: UIViewController {
     // Shows/hides the top backfill spinner. When history-start is reached the
     // header is detached entirely so it doesn't leave a blank strip.
     private func setBackfillSpinner(active: Bool) {
-        guard let header = backfillHeader, let spinner = backfillSpinner else { return }
+        guard let spinner = backfillSpinner else { return }
         if reachedHistoryStart {
             spinner.stopAnimating()
             if tableView.tableHeaderView != nil { tableView.tableHeaderView = nil }
@@ -535,10 +557,16 @@ class RoomTimelineVC: UIViewController {
         }
         if active {
             spinner.startAnimating()
-            if tableView.tableHeaderView == nil { tableView.tableHeaderView = header }
         } else {
             spinner.stopAnimating()
         }
+    }
+
+    // There was no way to put the keyboard away in a conversation other than
+    // side effects (the attach sheet, voice mode, the long-press menu). Tapping
+    // the conversation or starting to drag it now does it, like other messengers.
+    @objc private func dismissKeyboard() {
+        messageField.resignFirstResponder()
     }
 
     // MARK: - Long-press menu (Reply / Copy / React / Delete)
@@ -1242,7 +1270,22 @@ class RoomTimelineVC: UIViewController {
         }
 
         if isViewLoaded, tableView != nil {
-            tableView.frame.size.height = barY - replyH - uploadH - typingH
+            let newHeight = barY - replyH - uploadH - typingH
+            if tableView.frame.height != newHeight {
+                // The table resizes from its bottom edge (keyboard, the strips, a
+                // growing field), which on its own leaves the offset where it
+                // was: a shrink slid the newest message under the keyboard or the
+                // typing strip, and a grow left a blank gap below it. Keep the
+                // newest message in view if it was; otherwise only keep the
+                // offset in range.
+                let pinned = isScrolledToBottom()
+                tableView.frame.size.height = newHeight
+                let maxOffsetY = max(-tableView.contentInset.top,
+                                     tableView.contentSize.height - newHeight + tableView.contentInset.bottom)
+                if pinned || tableView.contentOffset.y > maxOffsetY {
+                    tableView.contentOffset = CGPoint(x: 0, y: maxOffsetY)
+                }
+            }
         }
     }
 
@@ -1342,6 +1385,10 @@ class RoomTimelineVC: UIViewController {
         // response can carry ONLY ephemeral data (someone typing, a read
         // receipt) or member-profile updates with no new messages, and those
         // still need to update the UI.
+        //
+        // Any response at all proves the connection works, whether or not it
+        // mentions this room, so failed sends are picked up before the guard.
+        resendAfterReconnect()
         guard let rooms = json["rooms"] as? [String: Any],
               let join = rooms["join"] as? [String: Any],
               let roomJSON = join[room.roomId] as? [String: Any] else { return }
@@ -1408,11 +1455,15 @@ class RoomTimelineVC: UIViewController {
         if tableChanged || typingChanged {
             if !newOnes.isEmpty { retirePending(matching: newOnes) }
             if tableChanged {
+                // Read before the update: a "Seen" marker or a reaction added
+                // under the newest message grows the table below the view, and
+                // it should stay in view if the newest message was.
+                let wasAtBottom = isScrolledToBottom()
                 // A renamed or re-avatared member shows on rows already on
                 // screen, which a row diff can't see — redraw all of them then.
                 if membersChanged { reloadTable() } else { updateTable() }
                 updateStatusLabel()
-                if hasNewMessages { scrollToBottom(animated: true) }
+                if hasNewMessages || wasAtBottom { scrollToBottom(animated: true) }
             }
             if typingChanged { updateTypingIndicator() }
         }
@@ -1856,6 +1907,13 @@ class RoomTimelineVC: UIViewController {
         tableView.setContentOffset(CGPoint(x: 0, y: y), animated: animated)
     }
 
+    // Whether the newest row is in view, give or take a few points: the
+    // condition for keeping it in view when something changes around it.
+    private func isScrolledToBottom() -> Bool {
+        let maxOffsetY = tableView.contentSize.height - tableView.bounds.height + tableView.contentInset.bottom
+        return tableView.contentOffset.y >= maxOffsetY - 8
+    }
+
     // MARK: - Sending
 
     // Accepts the composed text into the outgoing queue and returns immediately.
@@ -1921,6 +1979,9 @@ class RoomTimelineVC: UIViewController {
                 if let error = error {
                     self.pending[current].state = .failed
                     self.pending[current].errorText = "\(error)"
+                    // A MatrixError is the homeserver answering; anything else
+                    // is HTTPClient reporting that no answer came at all.
+                    self.pending[current].connectionLost = !(error is MatrixAPIClient.MatrixError)
                 } else if let eventId = json?["event_id"] as? String {
                     // Confirmed. The row stays until /sync brings the real event,
                     // so the bubble doesn't blink out and back in; recording the
@@ -1964,8 +2025,9 @@ class RoomTimelineVC: UIViewController {
     // Tapping a failed bubble offers to send it again or throw it away. Retrying
     // reuses the original transaction id, so if the server actually did receive
     // the first attempt this can't produce a duplicate. Deliberately no automatic
-    // retry: a homeserver that's rejecting us (M_FORBIDDEN, a size limit) would
-    // otherwise be retried forever.
+    // retry of a refusal: a homeserver that's rejecting us (M_FORBIDDEN, a size
+    // limit) would otherwise be retried forever. A lost connection is the one
+    // exception, retried once /sync gets through (resendAfterReconnect).
     private func handlePendingTap(_ txnId: String) {
         guard let message = pending.first(where: { $0.txnId == txnId }), message.state == .failed else { return }
         pendingActionTxnId = txnId
@@ -1995,6 +2057,25 @@ class RoomTimelineVC: UIViewController {
         pendingActionTxnId = nil
         pending.removeAll { $0.txnId == txnId }
         updateTable()
+    }
+
+    // A /sync just got through, so the connection is back: send again whatever
+    // failed only for want of one. A tap on "Try Again" made before the network
+    // is usable again fails the same way, and the message then sat there until
+    // tapped once more. Messages the homeserver refused stay put until tapped
+    // (see handlePendingTap for why those are never retried on their own).
+    private func resendAfterReconnect() {
+        var resent = false
+        for i in pending.indices where pending[i].state == .failed && pending[i].connectionLost
+            && pending[i].autoResends < RoomTimelineVC.maxAutoResends {
+            pending[i].state = .sending
+            pending[i].errorText = nil
+            pending[i].autoResends += 1
+            resent = true
+        }
+        guard resent else { return }
+        updateTable()
+        pumpSendQueue()
     }
 
     // Toggles the "an upload is in flight" UI state across the whole input bar.
@@ -3245,6 +3326,16 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         if indexPath.row == 0 && hasAppeared {
             loadBackfill()
         }
+    }
+
+    // Dragging the conversation puts the keyboard away (the tap recognizer in
+    // buildTableView covers taps). Only a user drag lands here, never a
+    // programmatic scroll such as scrollToBottom. A sideways drag is left alone:
+    // that's the swipe to reply, which wants the keyboard up.
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        let t = scrollView.panGestureRecognizer.translation(in: scrollView)
+        guard abs(t.y) >= abs(t.x) else { return }
+        dismissKeyboard()
     }
 
     // Let the reveal pan run alongside the table's own scroll pan; the handler
