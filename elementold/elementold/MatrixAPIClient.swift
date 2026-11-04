@@ -17,6 +17,13 @@ class MatrixAPIClient {
     var homeserverBaseURL: String   // e.g. "http://matrix.whispyy.xyz:8008" — no trailing slash
     var accessToken: String?
 
+    // Responses are decoded here rather than on the main thread. CurlFetcher
+    // hands every body over on main, and a /sync body — the initial one, or the
+    // catch-up after hours away — runs to megabytes, so decoding it there froze
+    // the UI for as long as that took. Serial, so completions still reach main
+    // in the order the responses arrived, exactly as before.
+    private static let parseQueue = DispatchQueue(label: "com.jellyold.matrix.parse")
+
     init(homeserverBaseURL: String, accessToken: String? = nil) {
         self.homeserverBaseURL = homeserverBaseURL
         self.accessToken = accessToken
@@ -107,22 +114,28 @@ class MatrixAPIClient {
     // {errcode, error} error body (returned with a non-2xx HTTP status, which
     // HTTPClient/CurlFetcher already turn into a nil-data connection error —
     // so this mostly protects against homeservers that return errcode/error
-    // with a 200) into a MatrixError.
+    // with a 200) into a MatrixError. The decoding happens on parseQueue; the
+    // completion is still called on the main thread, which every caller assumes.
+    // Failures take the same route, so they can't overtake an earlier response.
     private func parse(_ data: Data?, _ error: Error?, completion: @escaping ([String: Any]?, Error?) -> Void) {
+        MatrixAPIClient.parseQueue.async {
+            let (json, failure) = MatrixAPIClient.decode(data, error)
+            DispatchQueue.main.async { completion(json, failure) }
+        }
+    }
+
+    private static func decode(_ data: Data?, _ error: Error?) -> ([String: Any]?, Error?) {
         if let error = error {
-            completion(nil, error)
-            return
+            return (nil, error)
         }
         guard let data = data,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            completion(nil, MatrixError(errcode: "M_UNKNOWN", error: "Invalid or empty JSON response"))
-            return
+            return (nil, MatrixError(errcode: "M_UNKNOWN", error: "Invalid or empty JSON response"))
         }
         if let errcode = json["errcode"] as? String {
             let message = json["error"] as? String ?? "Unknown Matrix error"
-            completion(nil, MatrixError(errcode: errcode, error: message))
-            return
+            return (nil, MatrixError(errcode: errcode, error: message))
         }
-        completion(json, nil)
+        return (json, nil)
     }
 }
