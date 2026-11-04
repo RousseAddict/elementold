@@ -118,6 +118,13 @@ class RoomTimelineVC: UIViewController {
     private var ownEventIds = Set<String>()
     private var isLoadingBackfill = false
     private var hasLoadedInitial = false
+    // Latches in the first viewDidAppear. History requests, and an empty room's
+    // first page, wait for it so nothing re-lays the table while the push
+    // animation slides it in.
+    private var hasAppeared = false
+    // An empty room's first page landed before the push finished; viewDidAppear
+    // lays it out.
+    private var firstPageAwaitsAppear = false
     private var isSending = false
     // Backfill pagination: `backfillFrom` starts at the room's prev_batch and
     // then advances to each /messages response's `end` token, so repeated
@@ -360,25 +367,40 @@ class RoomTimelineVC: UIViewController {
             self?.handleSync(json)
         }
 
-        // Only kick off the initial history fetch here if we truly have
-        // nothing to show yet (brand new room, or opened before any /sync
-        // response arrived). Otherwise let the normal `willDisplay` hook for
-        // row 0 load older history lazily on scroll-up, like a normal
-        // messaging app — firing it unconditionally here used to compete
-        // with seedInitialEvents()'s scroll-to-bottom and could visibly
-        // yank the viewport back up while the initial backfill landed.
+        // A room with nothing buffered (brand new, or quiet since launch — the
+        // buffer isn't persisted) asks for its newest page straight away: there
+        // is nothing else to show, so the request may as well overlap the push.
+        // A seeded room already shows its newest messages, and the page of older
+        // history it fetches on open waits for viewDidAppear.
         if events.isEmpty {
             loadBackfill()
         } else {
             markInitialLoadDone()
-            // Also pull ONE page of immediately-older history on open. A dormant
-            // room's recent images often sit just beyond the /sync-buffered
-            // window that seeded this view (that buffer only captures events
-            // that arrived in a /sync while the session was running), so without
-            // this they'd never load until the user manually scrolled to the top.
-            // The non-empty backfill branch compensates contentOffset by the
-            // prepended height, so the viewport stays pinned at the bottom where
-            // seedInitialEvents() just left it — no visible jump.
+        }
+    }
+
+    // Opening a seeded room pulls ONE page of immediately-older history. A
+    // dormant room's recent images often sit just beyond the /sync-buffered
+    // window that seeded this view (that buffer only captures events that
+    // arrived in a /sync while the session was running), so without it they'd
+    // never load until the user manually scrolled to the top.
+    //
+    // It's requested here rather than in viewDidLoad because a page landing
+    // mid-push re-measured and re-laid the table while it slid in, which is
+    // what made opening a room stutter. Onegram holds its history request back
+    // until the conversation has appeared for the same reason.
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard !hasAppeared else { return }
+        hasAppeared = true
+        if firstPageAwaitsAppear {
+            firstPageAwaitsAppear = false
+            reloadTable()
+            scrollToBottom(animated: false)
+        }
+        // An empty room asked in viewDidLoad, and has a cursor once that page
+        // lands — so this is a seeded room that hasn't paged back yet.
+        if !events.isEmpty && backfillFrom == nil {
             loadBackfill()
         }
     }
@@ -1286,21 +1308,13 @@ class RoomTimelineVC: UIViewController {
             let wasEmpty = self.events.isEmpty
             self.events.insert(contentsOf: newOnes, at: 0)
             DispatchQueue.main.async {
-                if wasEmpty {
+                if !wasEmpty {
+                    self.prependTable()
+                } else if self.hasAppeared {
                     self.reloadTable()
                     self.scrollToBottom(animated: false)
                 } else {
-                    // Prepending rows changes contentSize, which by default
-                    // yanks the viewport back to the same *offset* (now
-                    // pointing at different content, visually a jump toward
-                    // the top). Compensate contentOffset by the height delta
-                    // so the rows the user was looking at stay in place.
-                    let oldContentHeight = self.tableView.contentSize.height
-                    let oldOffsetY = self.tableView.contentOffset.y
-                    self.reloadTable()
-                    self.tableView.layoutIfNeeded()
-                    let newContentHeight = self.tableView.contentSize.height
-                    self.tableView.contentOffset = CGPoint(x: 0, y: oldOffsetY + (newContentHeight - oldContentHeight))
+                    self.firstPageAwaitsAppear = true
                 }
             }
         }
@@ -1694,13 +1708,60 @@ class RoomTimelineVC: UIViewController {
         let old = rows
         rebuildRows()
         prefetchImageThumbnails()
-        // The table must still hold exactly `old`, or the batch below would be
-        // computed against rows it never saw — an exception, not a glitch.
-        guard tableView.window != nil, !old.isEmpty,
-              tableView.numberOfRows(inSection: 0) == old.count else {
+        guard let change = rowChanges(from: old),
+              change.removed.count + change.added.count <= RoomTimelineVC.maxRowUpdate else {
             tableView.reloadData()
             return
         }
+        if change.removed.isEmpty && change.added.isEmpty { return }
+        // Pure additions fade in. A row replaced in place (sending -> failed, or
+        // a queued bubble -> its echoed event) swaps without a crossfade, so the
+        // bubble doesn't blink.
+        let animation: UITableView.RowAnimation = change.removed.isEmpty ? .fade : .none
+        tableView.beginUpdates()
+        tableView.deleteRows(at: change.removed, with: animation)
+        tableView.insertRows(at: change.added, with: animation)
+        tableView.endUpdates()
+    }
+
+    // reloadTable for a page of older history landing above what's on screen.
+    // The page goes in as one batch with no size limit, so the cells on screen
+    // (all below the insertion) are kept rather than rebuilt; only the new rows
+    // are measured. Inserting still moves contentSize, which would leave the
+    // viewport at the same *offset* (now pointing at different content,
+    // visually a jump toward the top), so contentOffset is moved by the height
+    // delta to keep the rows the user was looking at in place. Animations are
+    // off for the batch: otherwise the kept cells would slide down to their new
+    // positions while the offset change below snaps them straight back.
+    private func prependTable() {
+        let oldContentHeight = tableView.contentSize.height
+        let oldOffsetY = tableView.contentOffset.y
+        let old = rows
+        rebuildRows()
+        prefetchImageThumbnails()
+        if let change = rowChanges(from: old) {
+            UIView.setAnimationsEnabled(false)
+            tableView.beginUpdates()
+            tableView.deleteRows(at: change.removed, with: .none)
+            tableView.insertRows(at: change.added, with: .none)
+            tableView.endUpdates()
+            UIView.setAnimationsEnabled(true)
+        } else {
+            tableView.reloadData()
+        }
+        tableView.layoutIfNeeded()
+        let newContentHeight = tableView.contentSize.height
+        tableView.contentOffset = CGPoint(x: 0, y: oldOffsetY + (newContentHeight - oldContentHeight))
+    }
+
+    // The rows that differ between `old` and the freshly rebuilt `rows`: the
+    // stretch between their longest matching head and longest matching tail.
+    // Nil when the table doesn't still hold exactly `old` (or isn't on screen),
+    // since a batch computed against rows it never saw is an exception, not a
+    // glitch.
+    private func rowChanges(from old: [Row]) -> (removed: [IndexPath], added: [IndexPath])? {
+        guard tableView.window != nil, !old.isEmpty,
+              tableView.numberOfRows(inSection: 0) == old.count else { return nil }
         let shorter = min(old.count, rows.count)
         var head = 0
         while head < shorter && rowsMatch(old[head], rows[head]) { head += 1 }
@@ -1710,19 +1771,7 @@ class RoomTimelineVC: UIViewController {
         }
         let removed = (head ..< old.count - tail).map { IndexPath(row: $0, section: 0) }
         let added = (head ..< rows.count - tail).map { IndexPath(row: $0, section: 0) }
-        if removed.isEmpty && added.isEmpty { return }
-        guard removed.count + added.count <= RoomTimelineVC.maxRowUpdate else {
-            tableView.reloadData()
-            return
-        }
-        // Pure additions fade in. A row replaced in place (sending -> failed, or
-        // a queued bubble -> its echoed event) swaps without a crossfade, so the
-        // bubble doesn't blink.
-        let animation: UITableView.RowAnimation = removed.isEmpty ? .fade : .none
-        tableView.beginUpdates()
-        tableView.deleteRows(at: removed, with: animation)
-        tableView.insertRows(at: added, with: animation)
-        tableView.endUpdates()
+        return (removed, added)
     }
 
     // Whether two rows draw identically, which is what lets updateTable leave
@@ -3189,8 +3238,11 @@ extension RoomTimelineVC: UITableViewDataSource, UITableViewDelegate, UIGestureR
         }
     }
 
+    // Scrolling up to the top row pages back. Not before the screen has
+    // appeared: a short room shows row 0 in its very first layout, and that
+    // page would land mid-push (see viewDidAppear).
     func tableView(_ tableView: UITableView, willDisplay cell: UITableViewCell, forRowAt indexPath: IndexPath) {
-        if indexPath.row == 0 {
+        if indexPath.row == 0 && hasAppeared {
             loadBackfill()
         }
     }
