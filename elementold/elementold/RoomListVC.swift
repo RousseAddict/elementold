@@ -364,6 +364,10 @@ class RoomListVC: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        // LoginVC hides the bar and can't restore it as it leaves (see its
+        // viewWillAppear), so the list owns its bar. A no-op on every other
+        // appearance, where the bar is already showing.
+        navigationController?.setNavigationBarHidden(false, animated: animated)
         // Fires both on first appearance (harmless, already nil) and when
         // popping back from RoomTimelineVC — from that point on, new messages
         // in that room should start counting as unread again.

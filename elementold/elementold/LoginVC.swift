@@ -66,17 +66,14 @@ class LoginVC: UIViewController {
     }
 
     // No navigation bar here: the logo already heads the form, so the bar would
-    // only repeat the app's name above it. Login is always the root (it is
-    // swapped in with setViewControllers), so the bar is simply back for
-    // whatever replaces it.
+    // only repeat the app's name above it. It can't be put back from here on
+    // the way out: login is always replaced with setViewControllers, which
+    // detaches this controller before its viewWillDisappear runs, so
+    // navigationController is already nil there. RoomListVC, the screen that
+    // replaces it, shows the bar again in its own viewWillAppear.
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         navigationController?.setNavigationBarHidden(true, animated: animated)
-    }
-
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        navigationController?.setNavigationBarHidden(false, animated: animated)
     }
 
     override func viewDidAppear(_ animated: Bool) {
